@@ -116,6 +116,8 @@ Specify the task, expected result and target paths to the main agent.
 
 `/child` toggles between parent and child views.
 `/child first`, `/child next` and `/child prev` select a child to read.
+`/child list` opens the member list, including all depths in swarm mode.
+`/child <session_id>` opens a specific member.
 Viewing a child session does not take over execution or change the active parent session.
 Continuing an ended child session requires explicit takeover by the main agent.
 

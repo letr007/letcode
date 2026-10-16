@@ -89,6 +89,12 @@ pub fn select_child_navigation_index(
             .position(|child| child.child_session_id == child_session_id)
     });
     Some(match navigation {
+        ChildNavigation::List => return None,
+        ChildNavigation::Session(session_id) => {
+            return children
+                .iter()
+                .position(|child| child.child_session_id == session_id);
+        }
         ChildNavigation::Toggle | ChildNavigation::First => 0,
         ChildNavigation::Next => current_index
             .map(|index| (index + 1) % children.len())
@@ -160,10 +166,7 @@ pub fn project_child_session_view_from_file(
 ) -> Result<Option<ChildViewProjection>> {
     let sessions_dir = sessions_dir.as_ref();
     let parent_session_id = parent_session_id.into();
-    let parent_path = sessions_dir.join(format!("{parent_session_id}.jsonl"));
-    let children =
-        project_child_session_summaries_from_file(&child_sessions_dir(sessions_dir), &parent_path)?;
-    let children = SubagentPool::child_sessions_from_summaries(children);
+    let children = project_session_members(sessions_dir, &parent_session_id)?;
     project_child_session_view_with_children(
         sessions_dir,
         parent_session_id,
@@ -172,6 +175,38 @@ pub fn project_child_session_view_from_file(
         anchor_child_session_id,
         live_text,
     )
+}
+
+pub(crate) fn project_session_members(
+    sessions_dir: &Path,
+    root_session_id: &str,
+) -> Result<Vec<ChildSessionSummary>> {
+    let parent_path = sessions_dir.join(format!("{root_session_id}.jsonl"));
+    let records = crate::transcript::read_records_allow_partial_tail(&parent_path)?;
+    if crate::transcript::restore_subagents_policy(&records)?.mode
+        == crate::config::SubagentMode::Swarm
+    {
+        let snapshot = crate::subagent::swarm::project(sessions_dir, &records)?;
+        return Ok(snapshot
+            .latest_jobs()
+            .into_iter()
+            .filter_map(|job| {
+                Some(ChildSessionSummary {
+                    parent_session_id: job.parent_session_id?,
+                    parent_run_id: job.run_id?,
+                    child_session_id: job.child_session_id?,
+                    agent_name: job.role,
+                    status: job.status,
+                    summary: String::new(),
+                    timestamp_ms: 0,
+                    pool_ordinal: job.pool_ordinal?,
+                })
+            })
+            .collect());
+    }
+    let children =
+        project_child_session_summaries_from_file(&child_sessions_dir(sessions_dir), &parent_path)?;
+    Ok(SubagentPool::child_sessions_from_summaries(children))
 }
 
 fn project_child_session_view_with_children(
@@ -189,8 +224,6 @@ fn project_child_session_view_with_children(
     let child = &children[index];
     let records =
         read_child_session_records_allow_partial_tail(sessions_dir, &child.child_session_id)?;
-    // Child sessions cannot own nested subagents today. Project their transcript
-    // once instead of performing the parent restore path's two-pass child lookup.
     let snapshot = project_runtime_restore_snapshot(
         child.child_session_id.clone(),
         records,

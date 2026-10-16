@@ -365,6 +365,7 @@ pub enum DialogKind {
     FakePicker,
     LanguagePicker,
     SessionPicker,
+    ChildPicker,
     SessionDeleteConfirm,
     HistoryTree,
     ContextPicker,
@@ -383,6 +384,7 @@ impl DialogKind {
             Self::ModelPicker
                 | Self::ExpertModelPicker(_)
                 | Self::SessionPicker
+                | Self::ChildPicker
                 | Self::HistoryTree
                 | Self::ContextPicker
                 | Self::McpPicker
@@ -2725,7 +2727,12 @@ impl TuiState {
             active.replace_clean_snapshot(records, context, in_progress_assistant_text.as_deref());
             self.active_session = true;
             self.clear_input();
-            self.close_dialog();
+            if !self
+                .dialog()
+                .is_some_and(|dialog| dialog.kind == DialogKind::ChildPicker)
+            {
+                self.close_dialog();
+            }
             self.reset_slash_panel();
             self.transcript_view = TranscriptViewState::Child {
                 parent_session_id,

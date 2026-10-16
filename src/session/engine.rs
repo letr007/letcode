@@ -1020,15 +1020,17 @@ fn apply_engine_view_child(
             crate::command::ChildNavigation::Toggle => crate::command::ChildNavigation::First,
             other => other,
         };
-        *visible_child_session_id = crate::session::SessionCoordinator::emit_view_child(
+        if let Some(child_session_id) = crate::session::SessionCoordinator::emit_view_child(
             transcript,
             session_transport_tx,
             sessions_dir,
             effective_nav,
             anchor_child_session_id,
             child_live_text,
-        );
-        *visible_child_view_state = None;
+        ) {
+            *visible_child_session_id = Some(child_session_id);
+            *visible_child_view_state = None;
+        }
     }
 }
 
@@ -1052,28 +1054,19 @@ fn journal_fingerprint(path: &std::path::Path) -> Option<JournalFingerprint> {
     })
 }
 
-/// Where the visible child sits among its parent's children.
 #[derive(Debug, Clone)]
 struct VisibleChildViewResolution {
     parent_session_id: String,
     index: usize,
     total: usize,
     child: ChildSessionSummary,
+    member_session_ids: Vec<String>,
 }
 
-/// What the poll keeps from the last pass that reached a resolution. It stays
-/// valid while both journals keep the same size and modification time, because
-/// an unchanged parent journal lists the same children in the same order: a
-/// child's transcript file is created before its parent records the start, and a
-/// live parent holds the writer lock that archiving a session family needs.
-///
-/// It is written before the runtime context is projected, so once a view has
-/// been sent, a projection that fails is not retried until one of the two
-/// journals moves.
 #[derive(Debug, Clone)]
 struct VisibleChildViewCache {
-    child_journal: Option<JournalFingerprint>,
     parent_journal: Option<JournalFingerprint>,
+    member_journals: Vec<(String, Option<JournalFingerprint>)>,
     resolution: VisibleChildViewResolution,
 }
 
@@ -1082,24 +1075,13 @@ fn resolve_visible_child_view(
     sessions_dir: &std::path::Path,
     child_session_id: &str,
 ) -> Result<Option<VisibleChildViewResolution>> {
-    let (parent_session_id, parent_path) = {
-        let recorder = transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        (
-            recorder.session_id().to_string(),
-            recorder.path().to_path_buf(),
-        )
-    };
-    // Same shaped scan the navigation path uses: the poll only needs the child
-    // list, and decoding every parent record costs several times more (measured
-    // 70 ms against 12 ms on a 21 MB journal).
-    let children = SubagentPool::child_sessions_from_summaries(
-        transcript_projection::project_child_session_summaries_from_file(
-            &crate::transcript::child_sessions_dir(sessions_dir),
-            &parent_path,
-        )?,
-    );
+    let parent_session_id = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
+        .session_id()
+        .to_string();
+    let children =
+        crate::session::child_view::project_session_members(sessions_dir, &parent_session_id)?;
     Ok(children
         .iter()
         .enumerate()
@@ -1109,6 +1091,10 @@ fn resolve_visible_child_view(
             index,
             total: children.len(),
             child: child.clone(),
+            member_session_ids: children
+                .iter()
+                .map(|child| child.child_session_id.clone())
+                .collect(),
         }))
 }
 
@@ -1124,17 +1110,31 @@ async fn refresh_visible_child_session_view(
     let Some(child_session_id) = visible_child_session_id.as_deref() else {
         return;
     };
-    let child_journal = journal_fingerprint(&crate::transcript::child_session_path(
-        sessions_dir,
-        child_session_id,
-    ));
+    let member_journals: Vec<_> = visible_child_view_cache
+        .as_ref()
+        .map(|cache| {
+            cache
+                .member_journals
+                .iter()
+                .map(|(session_id, _)| {
+                    (
+                        session_id.clone(),
+                        journal_fingerprint(&crate::transcript::child_session_path(
+                            sessions_dir,
+                            session_id,
+                        )),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let parent_journal = transcript
         .lock()
         .ok()
         .and_then(|recorder| journal_fingerprint(recorder.path()));
     let settled = visible_child_view_cache.as_ref().is_some_and(|cache| {
         cache.resolution.child.child_session_id == child_session_id
-            && cache.child_journal == child_journal
+            && cache.member_journals == member_journals
             && cache.parent_journal == parent_journal
     });
     // A cleared view state is still owed a full pass.
@@ -1157,6 +1157,7 @@ async fn refresh_visible_child_session_view(
     let resolution = match visible_child_view_cache.as_ref().filter(|cache| {
         cache.resolution.child.child_session_id == child_session_id
             && cache.parent_journal == parent_journal
+            && cache.member_journals == member_journals
     }) {
         Some(cache) => Some(cache.resolution.clone()),
         None => match resolve_visible_child_view(transcript, sessions_dir, child_session_id) {
@@ -1178,8 +1179,18 @@ async fn refresh_visible_child_session_view(
         total: resolution.total,
     };
     *visible_child_view_cache = Some(VisibleChildViewCache {
-        child_journal,
         parent_journal,
+        member_journals: resolution
+            .member_session_ids
+            .iter()
+            .map(|session_id| {
+                let fingerprint = member_journals
+                    .iter()
+                    .find(|(id, _)| id == session_id)
+                    .and_then(|(_, fingerprint)| *fingerprint);
+                (session_id.clone(), fingerprint)
+            })
+            .collect(),
         resolution: resolution.clone(),
     });
     if visible_child_view_state.is_some_and(|state| state == view_state) {
@@ -1590,7 +1601,7 @@ async fn run_engine_loop(
                             &transcript,
                             &session_transport_tx,
                             Some(config.sessions_dir.as_path()),
-                            *navigation,
+                            navigation.clone(),
                             anchor_child_session_id.as_deref(),
                             &mut visible_child_session_id,
                             &mut visible_child_view_state,
@@ -3762,6 +3773,140 @@ base_url = "http://127.0.0.1:1"
             .2,
             3
         );
+
+        let root = parent_transcript(&sessions_dir);
+        root.lock()
+            .unwrap()
+            .record_subagents_policy(&crate::config::SubagentsConfig {
+                mode: crate::config::SubagentMode::Swarm,
+                ..Default::default()
+            })
+            .unwrap();
+        let root_id = root.lock().unwrap().session_id().to_string();
+        let member = |parent: &Arc<StdMutex<TranscriptRecorder>>, run_id: &str, ordinal, depth| {
+            let parent_id = parent.lock().unwrap().session_id().to_string();
+            let child_id = add_child(parent, &sessions_dir, run_id, ordinal);
+            let mut child = TranscriptRecorder::open(
+                crate::transcript::child_sessions_dir(&sessions_dir),
+                child_id.clone(),
+            )
+            .unwrap();
+            child
+                .record_subagent_started(
+                    run_id,
+                    &parent_id,
+                    "turn-1",
+                    &child_id,
+                    "explorer",
+                    "inspect child",
+                    ordinal,
+                )
+                .unwrap();
+            child
+                .record_subagent_activation(
+                    run_id.into(),
+                    crate::subagent::SwarmMember {
+                        root_session_id: root_id.clone(),
+                        parent_session_id: parent_id,
+                        child_session_id: child_id,
+                        depth,
+                        agent_name: "explorer".into(),
+                        pool_ordinal: ordinal,
+                    },
+                )
+                .unwrap();
+            Arc::new(StdMutex::new(child))
+        };
+        let branch = member(&root, "swarm-1", 1, 1);
+        let visible = member(&root, "swarm-2", 2, 1);
+        let visible_id = visible.lock().unwrap().session_id().to_string();
+        visible_child_session_id = Some(visible_id.clone());
+        view_state = None;
+        cache = None;
+        let live_text = crate::session::child_view::ChildLiveText::default();
+        for _ in 0..2 {
+            refresh_visible_child_session_view(
+                &root,
+                &tx,
+                &sessions_dir,
+                &mut visible_child_session_id,
+                &mut view_state,
+                &mut cache,
+                &live_text,
+            )
+            .await;
+        }
+        assert_eq!(
+            child_view_event(rx.try_recv().unwrap()),
+            (visible_id.clone(), 1, 2)
+        );
+        assert!(rx.try_recv().is_err());
+        let root_fingerprint = journal_fingerprint(root.lock().unwrap().path());
+        let visible_fingerprint = journal_fingerprint(visible.lock().unwrap().path());
+        let nested = member(&branch, "swarm-3", 3, 2);
+        let deepest = member(&nested, "swarm-4", 4, 3);
+        let deepest_id = deepest.lock().unwrap().session_id().to_string();
+        assert_eq!(
+            journal_fingerprint(root.lock().unwrap().path()),
+            root_fingerprint
+        );
+        assert_eq!(
+            journal_fingerprint(visible.lock().unwrap().path()),
+            visible_fingerprint
+        );
+        refresh_visible_child_session_view(
+            &root,
+            &tx,
+            &sessions_dir,
+            &mut visible_child_session_id,
+            &mut view_state,
+            &mut cache,
+            &live_text,
+        )
+        .await;
+        assert_eq!(child_view_event(rx.try_recv().unwrap()), (visible_id, 1, 4));
+        let members =
+            crate::session::child_view::project_session_members(&sessions_dir, &root_id).unwrap();
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.pool_ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        let crate::command::CommandIntent::Child(navigation) =
+            crate::command::parse_command(&format!("/child {deepest_id}")).unwrap()
+        else {
+            panic!("expected child navigation");
+        };
+        apply_engine_view_child(
+            &root,
+            &tx,
+            Some(&sessions_dir),
+            navigation,
+            None,
+            &mut visible_child_session_id,
+            &mut view_state,
+            &live_text,
+        );
+        assert_eq!(
+            child_view_event(rx.try_recv().unwrap()),
+            (deepest_id.clone(), 3, 4)
+        );
+        assert_eq!(
+            visible_child_session_id.as_deref(),
+            Some(deepest_id.as_str())
+        );
+        let view = crate::session::child_view::project_child_session_view_from_file(
+            &sessions_dir,
+            &root_id,
+            crate::command::ChildNavigation::Prev,
+            Some(&deepest_id),
+            &live_text,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((view.pool_ordinal, view.index, view.total), (3, 2, 4));
     }
 
     fn child_terminal(child_session_id: &str) -> SessionTransportEvent {

@@ -13,12 +13,14 @@ pub struct CommandMetadata {
     pub visible_in_summary: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildNavigation {
     Toggle,
     First,
     Next,
     Prev,
+    List,
+    Session(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -511,7 +513,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/child",
         insert_text: "/child",
         description_key: "command.child",
-        usage: "/child [first|next|prev]",
+        usage: "/child [list|first|next|prev|session_id]",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -778,12 +780,14 @@ fn parse_child_navigation(parts: &[&str]) -> Result<CommandIntent, CommandParseE
             "first" => Ok(CommandIntent::Child(ChildNavigation::First)),
             "next" => Ok(CommandIntent::Child(ChildNavigation::Next)),
             "prev" | "previous" => Ok(CommandIntent::Child(ChildNavigation::Prev)),
-            other => Err(CommandParseError::with_args(
-                "parse.unknown_child_navigation",
-                [("value", other)],
-            )),
+            "list" => Ok(CommandIntent::Child(ChildNavigation::List)),
+            _ => Ok(CommandIntent::Child(ChildNavigation::Session(
+                (*value).into(),
+            ))),
         },
-        ["/child", ..] => Err(CommandParseError::new("Usage: /child [first|next|prev]")),
+        ["/child", ..] => Err(CommandParseError::new(
+            "Usage: /child [list|first|next|prev|session_id]",
+        )),
         _ => unreachable!(),
     }
 }
@@ -1024,11 +1028,10 @@ mod tests {
             Err(CommandParseError::unknown_command("/parent"))
         );
         assert_eq!(
-            parse_command("/child sideways"),
-            Err(CommandParseError::with_args(
-                "parse.unknown_child_navigation",
-                [("value", "sideways")]
-            ))
+            parse_command("/child Session-Id"),
+            Ok(CommandIntent::Child(ChildNavigation::Session(
+                "Session-Id".into()
+            )))
         );
         assert_eq!(
             parse_command("/reasoning absurd"),

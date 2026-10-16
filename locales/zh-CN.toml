@@ -22,7 +22,7 @@ new = "开始新会话"
 context = "浏览上下文详情"
 mcp = "浏览 MCP 工具"
 skill = "浏览本地技能"
-child = "切换子代理视图"
+child = "用 /child list 查看成员或切换子代理视图"
 config = "查看或编辑配置"
 
 [config]
@@ -171,6 +171,9 @@ session_delete_body = "将永久删除“{session}”及其子会话，无法恢
 session_delete_confirm = "删除"
 
 [runtime]
+child_members = "会话成员"
+child_members_hint = "选择会话查看 · /child list"
+root_session = "根会话"
 context_item_unavailable = "上下文项目不可用"
 answer_all_questions = "请先回答所有问题"
 no_question_pending = "当前没有待处理的问题"

@@ -419,6 +419,7 @@ fn render_picker_body(
                         render_model_row(frame, row, theme, item, selected, item.checked)
                     }
                     DialogKind::SessionPicker
+                    | DialogKind::ChildPicker
                     | DialogKind::HistoryTree
                     | DialogKind::ContextPicker
                     | DialogKind::SkillPicker

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures_util::future::join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 use std::future::Future;
 use std::sync::Mutex;
@@ -529,8 +530,6 @@ impl SubagentBatchRecord {
         self.completion.span()
     }
 
-    /// Completes the span only after this record has finished its model-ordered
-    /// lifecycle, history, evidence, and cancellation reconciliation.
     pub(super) fn finish(&self, reconciliation: &Result<()>) {
         match reconciliation {
             Ok(()) => self.completion.finish(Ok(self.record.clone())),
@@ -547,14 +546,12 @@ fn finish_subagent_batch_spans_error(preflight: &[(ToolSpanCompletion, SubagentP
     }
 }
 
-/// Preflights a contiguous model-ordered subagent batch, then polls admitted
-/// delegate futures together without retaining mutable Agent or callback borrows.
 pub(super) async fn execute_subagent_tool_call_batch<E, A, Efut, Afut>(
     agent: &mut Agent,
     calls: &[HistoryToolCall],
     on_event: &mut E,
     approve: &mut A,
-) -> Result<Vec<SubagentBatchRecord>>
+) -> Result<()>
 where
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
@@ -606,59 +603,77 @@ where
         }
     }
 
-    // All admitted futures have only shared Agent borrows. They are fully
-    // consumed before state and callbacks are mutably borrowed for reconciliation.
-    let outputs = {
-        let futures = preflight
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (completion, entry))| {
-                let SubagentPreflight::Admitted(args) = entry else {
-                    return None;
-                };
-                let call = &calls[index];
-                Some(
-                    async {
-                        agent
-                            .execute_subagent_tool_for_call(
-                                &call.name,
-                                args,
-                                Some(call.call_id.clone()),
-                            )
-                            .await
-                    }
-                    .instrument(completion.span()),
-                )
-            });
-        join_all(futures).await
-    };
-
-    let mut outputs = outputs.into_iter();
-    let mut records = Vec::with_capacity(calls.len());
-    for ((completion, entry), call) in preflight.into_iter().zip(calls) {
-        let record = match entry {
-            SubagentPreflight::Admitted(args) => {
-                let output = outputs.next().expect("admitted output is present");
-                ToolExecutionRecord::new(
-                    call,
-                    Some(args),
-                    permission_class_for_tool_call(&agent.tools, &call.name),
-                    ToolExecutionStatus::Executed,
-                    None,
-                    output,
-                )
-            }
-            SubagentPreflight::Rejected(record) => record,
+    let mut pending = FuturesUnordered::new();
+    for (index, ((completion, entry), call)) in preflight.into_iter().zip(calls).enumerate() {
+        let span = completion.span();
+        let execution = match &entry {
+            SubagentPreflight::Admitted(args) => Some(span.in_scope(|| {
+                agent.start_subagent_tool_for_call(&call.name, args, Some(call.call_id.clone()))
+            })),
+            SubagentPreflight::Rejected(_) => None,
         };
-        records.push(SubagentBatchRecord { record, completion });
+        let call = call.clone();
+        let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
+        pending.push(
+            async move {
+                let record = match entry {
+                    SubagentPreflight::Admitted(args) => {
+                        let output = execution.expect("admitted execution is present").await;
+                        ToolExecutionRecord::new(
+                            &call,
+                            Some(args),
+                            permission_class,
+                            ToolExecutionStatus::Executed,
+                            None,
+                            output,
+                        )
+                    }
+                    SubagentPreflight::Rejected(record) => record,
+                };
+                (index, SubagentBatchRecord { record, completion })
+            }
+            .instrument(span),
+        );
     }
 
-    Ok(records)
+    let mut unfinished = calls
+        .iter()
+        .map(|call| (call.call_id.clone(), call.name.clone()))
+        .collect::<Vec<_>>();
+    let mut cancellation = None;
+    while let Some((index, batch_record)) = pending.next().await {
+        let call = &calls[index];
+        unfinished.retain(|(call_id, _)| call_id != &call.call_id);
+        let result = async {
+            finalize_subagent_tool_call(agent, call, &batch_record.record, on_event).await?;
+            agent
+                .record_tool_call_result(call, batch_record.record.clone(), on_event)
+                .await
+        }
+        .instrument(batch_record.span())
+        .await;
+        match result {
+            Ok(ToolCallRecordOutcome::Completed) => batch_record.finish(&Ok(())),
+            Ok(ToolCallRecordOutcome::Cancelled) => {
+                batch_record.finish(&Ok(()));
+                if cancellation.is_none() {
+                    cancellation = Some(anyhow!("{} cancelled", call.name));
+                }
+            }
+            Err(error) => {
+                batch_record.finish(&Err(anyhow!("subagent reconciliation failed")));
+                drop(pending);
+                cancel_parallel_calls_best_effort(unfinished, on_event).await;
+                return Err(error);
+            }
+        }
+    }
+    match cancellation {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
-/// Finalizes one completed subagent record in model order. Callers must record
-/// its history, token projection, evidence, and cancellation before finalizing
-/// the next record.
 pub(super) async fn finalize_subagent_tool_call<E, Efut>(
     agent: &mut Agent,
     call: &HistoryToolCall,

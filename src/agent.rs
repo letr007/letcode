@@ -564,12 +564,12 @@ pub trait SubagentDelegate: Send + Sync {
         Ok(Vec::new())
     }
 
-    fn run_named<'a>(
-        &'a self,
-        parent: &'a Agent,
-        agent_name: &'a str,
+    fn run_named(
+        &self,
+        parent: &Agent,
+        agent_name: &str,
         invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>;
 
     fn control<'a>(
         &'a self,
@@ -3475,32 +3475,42 @@ impl Agent {
             };
         }
 
-        let input = match normalize_subagent_input(tool_name, args) {
-            Ok(input) => input,
-            Err(error) => return ToolResult::err(tool_name, error.to_string()),
-        };
+        self.start_subagent_tool_for_call(tool_name, args, parent_tool_call_id)
+            .await
+    }
 
-        let task = self.render_subagent_prompt(tool_name, &input);
-        let model = match input.model.as_deref().map(ModelRoute::parse).transpose() {
-            Ok(model) => model,
-            Err(error) => return ToolResult::err(tool_name, error.to_string()),
-        };
-        let invocation = SubagentInvocation {
-            input,
-            model,
-            prompt: task,
-            parent_tool_call_id,
-        };
-        let Some(agent_name) = agent_name_for_subagent_tool(tool_name) else {
-            return ToolResult::err(tool_name, format!("unknown subagent tool: {tool_name}"));
-        };
-
-        let result = delegate.run_named(self, agent_name, invocation).await;
-
-        match result {
-            Ok(result) => result,
-            Err(error) => ToolResult::err(tool_name, error.to_string()),
-        }
+    fn start_subagent_tool_for_call(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        parent_tool_call_id: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = ToolResult> + Send>> {
+        let prepared = (|| -> Result<_> {
+            let delegate = self.subagent_delegate.as_ref().ok_or_else(|| {
+                anyhow!("{tool_name} is unavailable outside a subagent-capable runtime")
+            })?;
+            let input = normalize_subagent_input(tool_name, args)?;
+            let prompt = self.render_subagent_prompt(tool_name, &input);
+            let model = input.model.as_deref().map(ModelRoute::parse).transpose()?;
+            let invocation = SubagentInvocation {
+                input,
+                model,
+                prompt,
+                parent_tool_call_id,
+            };
+            let agent_name = agent_name_for_subagent_tool(tool_name)
+                .ok_or_else(|| anyhow!("unknown subagent tool: {tool_name}"))?;
+            Ok(delegate.run_named(self, agent_name, invocation))
+        })();
+        let tool_name = tool_name.to_string();
+        Box::pin(async move {
+            match prepared {
+                Ok(completion) => completion
+                    .await
+                    .unwrap_or_else(|error| ToolResult::err(&tool_name, error.to_string())),
+                Err(error) => ToolResult::err(&tool_name, error.to_string()),
+            }
+        })
     }
 
     fn render_subagent_prompt(&self, tool_name: &str, input: &NormalizedSubagentInput) -> String {
@@ -3737,51 +3747,13 @@ impl Agent {
                     end += 1;
                 }
             }
-            let records = tool_execution::execute_subagent_tool_call_batch(
+            tool_execution::execute_subagent_tool_call_batch(
                 self,
                 &calls[index..end],
                 on_event,
                 approve,
             )
             .await?;
-            let mut cancellation = None;
-            let mut records = records.into_iter().enumerate();
-            while let Some((offset, batch_record)) = records.next() {
-                let call = &calls[index + offset];
-                let result = async {
-                    tool_execution::finalize_subagent_tool_call(
-                        self,
-                        call,
-                        &batch_record.record,
-                        on_event,
-                    )
-                    .await?;
-                    self.record_tool_call_result(call, batch_record.record.clone(), on_event)
-                        .await
-                }
-                .instrument(batch_record.span())
-                .await;
-                match result {
-                    Ok(ToolCallRecordOutcome::Completed) => batch_record.finish(&Ok(())),
-                    Ok(ToolCallRecordOutcome::Cancelled) => {
-                        batch_record.finish(&Ok(()));
-                        if cancellation.is_none() {
-                            cancellation = Some(anyhow!("{} cancelled", call.name));
-                        }
-                    }
-                    Err(error) => {
-                        batch_record.finish(&Err(anyhow!("subagent batch reconciliation failed")));
-                        for (_, remaining) in records {
-                            remaining
-                                .finish(&Err(anyhow!("subagent batch reconciliation aborted")));
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            if let Some(error) = cancellation {
-                return Err(error);
-            }
             index = end;
         }
         Ok(())

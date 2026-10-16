@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
+use futures_util::future::BoxFuture;
 use serde_json::json;
 
 use crate::agent::{
@@ -671,13 +672,16 @@ impl SubagentDelegate for RunnerSubagentDelegate {
         })
     }
 
-    fn run_named<'a>(
-        &'a self,
-        parent: &'a Agent,
-        agent_name: &'a str,
+    fn run_named(
+        &self,
+        parent: &Agent,
+        agent_name: &str,
         invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> BoxFuture<'static, Result<ToolResult>> {
+        let ready = |result| -> BoxFuture<'static, Result<ToolResult>> {
+            Box::pin(std::future::ready(Ok(result)))
+        };
+        let prepared = (|| -> Result<BoxFuture<'static, Result<ToolResult>>> {
             self.prepare(parent)?;
             let tool_name = subagent_tool_name_for_agent_name(agent_name)
                 .expect("runner dispatched unknown subagent agent name");
@@ -685,12 +689,12 @@ impl SubagentDelegate for RunnerSubagentDelegate {
             {
                 Ok(route) => route,
                 Err(error) => {
-                    return Ok(Self::hard_failure_result(
+                    return Ok(ready(Self::hard_failure_result(
                         tool_name,
                         agent_name,
                         invocation.input.target_child_session_id,
                         error.to_string(),
-                    ));
+                    )));
                 }
             };
             if !self
@@ -699,7 +703,11 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                 .copied()
                 .unwrap_or(false)
             {
-                return Ok(self.missing_api_key_result(tool_name, agent_name, route_display_name));
+                return Ok(ready(self.missing_api_key_result(
+                    tool_name,
+                    agent_name,
+                    route_display_name,
+                )));
             }
             let target_child_session_id = invocation.input.target_child_session_id.clone();
             let parent_session_id = match self.transcript.lock() {
@@ -715,7 +723,7 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                         "full_summary": summary,
                         "active": false,
                     });
-                    return Ok(ToolResult::err_with_data(tool_name, summary, data));
+                    return Ok(ready(ToolResult::err_with_data(tool_name, summary, data)));
                 }
             };
             let parent_turn_id = format!(
@@ -730,10 +738,10 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                 && self.background_control_tx.is_none()
                 && self.child_completions.is_none()
             {
-                return Ok(ToolResult::err(
+                return Ok(ready(ToolResult::err(
                     tool_name,
                     "background execution is unavailable in this runtime",
-                ));
+                )));
             }
             let parent_tool_call_id = invocation.parent_tool_call_id.clone();
             let started = self.runtime.start_named_governed(
@@ -757,19 +765,19 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                     if let Some(capacity) =
                         error.downcast_ref::<crate::subagent::SubagentCapacityExceeded>()
                     {
-                        return Ok(Self::capacity_result(
+                        return Ok(ready(Self::capacity_result(
                             tool_name,
                             Some(agent_name),
                             target_child_session_id,
                             capacity,
-                        ));
+                        )));
                     }
-                    return Ok(Self::hard_failure_result(
+                    return Ok(ready(Self::hard_failure_result(
                         tool_name,
                         agent_name,
                         target_child_session_id,
                         error.to_string(),
-                    ));
+                    )));
                 }
             };
 
@@ -784,76 +792,83 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                 let generation = runtime.swarm_generation(&parent_session_id);
                 let control_tx = self.background_control_tx.clone();
                 let child_completions = self.child_completions.clone();
-                tokio::spawn(async move {
-                    let result = runtime
-                        .complete_started_run(started)
-                        .await
-                        .map_err(|error| error.to_string());
-                    if let Some(queue) = child_completions {
-                        if let Ok(mut queue) = queue.lock() {
-                            queue.push(result);
+                return Ok(Box::pin(async move {
+                    tokio::spawn(async move {
+                        let result = runtime
+                            .complete_started_run(started)
+                            .await
+                            .map_err(|error| error.to_string());
+                        if let Some(queue) = child_completions {
+                            if let Ok(mut queue) = queue.lock() {
+                                queue.push(result);
+                            }
+                        } else if let Some(control_tx) = control_tx {
+                            let _ = control_tx.send(SessionEngineControl::Command(
+                                SessionEngineCommand::BackgroundSubagentCompleted {
+                                    generation,
+                                    parent_session_id,
+                                    parent_tool_call_id,
+                                    result,
+                                },
+                            ));
                         }
-                    } else if let Some(control_tx) = control_tx {
-                        let _ = control_tx.send(SessionEngineControl::Command(
-                            SessionEngineCommand::BackgroundSubagentCompleted {
-                                generation,
-                                parent_session_id,
-                                parent_tool_call_id,
-                                result,
-                            },
+                    });
+                    Ok(ToolResult::ok(
+                        tool_name,
+                        json!({
+                            "run_id": run_id,
+                            "child_session_id": receipt.child_session_id,
+                            "agent_name": receipt.agent_name,
+                            "status": SubagentStatus::Running.as_str(),
+                            "summary": receipt.summary,
+                            "active": true,
+                            "background": true,
+                        }),
+                    ))
+                }));
+            }
+
+            let runtime = self.runtime.clone();
+            let agent_name = agent_name.to_string();
+            Ok(Box::pin(async move {
+                let summary = runtime.complete_started_run(started).await;
+                let summary = match summary {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        return Ok(Self::hard_failure_result(
+                            tool_name,
+                            &agent_name,
+                            target_child_session_id,
+                            error.to_string(),
                         ));
                     }
+                };
+
+                let status = summary.status;
+                let failure_kind = summary.failure_kind;
+                let summary_text = summary.summary.clone();
+                let compact_summary = compact_subagent_summary(&summary.summary);
+
+                let data = json!({
+                    "run_id": summary.run_id,
+                    "child_session_id": summary.child_session_id,
+                    "agent_name": summary.agent_name,
+                    "status": status.as_str(),
+                    "failure_kind": failure_kind.map(|kind| kind.as_str()),
+                    "summary": compact_summary,
+                    "full_summary": summary.summary,
+                    "structured_result": summary.structured_result,
+                    "active": false,
                 });
-                return Ok(ToolResult::ok(
-                    tool_name,
-                    json!({
-                        "run_id": run_id,
-                        "child_session_id": receipt.child_session_id,
-                        "agent_name": receipt.agent_name,
-                        "status": SubagentStatus::Running.as_str(),
-                        "summary": receipt.summary,
-                        "active": true,
-                        "background": true,
-                    }),
-                ));
-            }
 
-            let summary = self.runtime.complete_started_run(started).await;
-            let summary = match summary {
-                Ok(summary) => summary,
-                Err(error) => {
-                    return Ok(Self::hard_failure_result(
-                        tool_name,
-                        agent_name,
-                        target_child_session_id,
-                        error.to_string(),
-                    ));
+                if status == SubagentStatus::Completed {
+                    Ok(ToolResult::ok(tool_name, data))
+                } else {
+                    Ok(ToolResult::err_with_data(tool_name, summary_text, data))
                 }
-            };
-
-            let status = summary.status;
-            let failure_kind = summary.failure_kind;
-            let summary_text = summary.summary.clone();
-            let compact_summary = compact_subagent_summary(&summary.summary);
-
-            let data = json!({
-                "run_id": summary.run_id,
-                "child_session_id": summary.child_session_id,
-                "agent_name": summary.agent_name,
-                "status": status.as_str(),
-                "failure_kind": failure_kind.map(|kind| kind.as_str()),
-                "summary": compact_summary,
-                "full_summary": summary.summary,
-                "structured_result": summary.structured_result,
-                "active": false,
-            });
-
-            if status == SubagentStatus::Completed {
-                Ok(ToolResult::ok(tool_name, data))
-            } else {
-                Ok(ToolResult::err_with_data(tool_name, summary_text, data))
-            }
-        })
+            }))
+        })();
+        Box::pin(async move { prepared?.await })
     }
 }
 

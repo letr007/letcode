@@ -22,7 +22,7 @@ new = "Start a new session"
 context = "Browse context details"
 mcp = "Browse MCP tools"
 skill = "Browse local skills"
-child = "Toggle child subagent view"
+child = "View members with /child list or switch subagent view"
 config = "Show or edit configuration"
 
 [config]
@@ -172,6 +172,9 @@ session_delete_body = "This permanently deletes \"{session}\" and its subagent s
 session_delete_confirm = "Delete"
 
 [runtime]
+child_members = "Session members"
+child_members_hint = "Select a session to view · /child list"
+root_session = "Root session"
 context_item_unavailable = "Context item unavailable"
 answer_all_questions = "Answer every question before confirming"
 no_question_pending = "No question pending"

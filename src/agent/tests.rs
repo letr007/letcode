@@ -2344,24 +2344,24 @@ struct CapturingSubagentDelegate {
 }
 
 impl SubagentDelegate for StaticSubagentDelegate {
-    fn run_named<'a>(
-        &'a self,
-        _parent: &'a Agent,
-        _agent_name: &'a str,
+    fn run_named(
+        &self,
+        _parent: &Agent,
+        _agent_name: &str,
         _invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> {
         let result = self.result.clone();
         Box::pin(async move { Ok(result) })
     }
 }
 
 impl SubagentDelegate for RecordingControlDelegate {
-    fn run_named<'a>(
-        &'a self,
-        _parent: &'a Agent,
-        agent_name: &'a str,
+    fn run_named(
+        &self,
+        _parent: &Agent,
+        agent_name: &str,
         _invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> {
         let calls = Arc::clone(&self.calls);
         let agent_name = agent_name.to_string();
         Box::pin(async move {
@@ -2385,12 +2385,12 @@ impl SubagentDelegate for RecordingControlDelegate {
 }
 
 impl SubagentDelegate for CapturingSubagentDelegate {
-    fn run_named<'a>(
-        &'a self,
-        _parent: &'a Agent,
-        agent_name: &'a str,
+    fn run_named(
+        &self,
+        _parent: &Agent,
+        agent_name: &str,
         invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> {
         match agent_name {
             "fixer" => self
                 .fixer_tasks
@@ -2412,6 +2412,7 @@ struct OverlapSubagentDelegate {
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
     started: Arc<Mutex<Vec<String>>>,
+    completion_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 struct PollCountingSubagentDelegate {
@@ -2424,12 +2425,12 @@ struct CountingSubagentDelegate {
 }
 
 impl SubagentDelegate for CountingSubagentDelegate {
-    fn run_named<'a>(
-        &'a self,
-        _parent: &'a Agent,
-        agent_name: &'a str,
+    fn run_named(
+        &self,
+        _parent: &Agent,
+        agent_name: &str,
         _invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> {
         let active = Arc::clone(&self.active);
         let max_active = Arc::clone(&self.max_active);
         let agent_name = agent_name.to_string();
@@ -2447,12 +2448,12 @@ impl SubagentDelegate for CountingSubagentDelegate {
 }
 
 impl SubagentDelegate for PollCountingSubagentDelegate {
-    fn run_named<'a>(
-        &'a self,
-        _parent: &'a Agent,
-        agent_name: &'a str,
+    fn run_named(
+        &self,
+        _parent: &Agent,
+        agent_name: &str,
         _invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> {
         let polls = Arc::clone(&self.polls);
         let agent_name = agent_name.to_string();
         Box::pin(async move {
@@ -2466,15 +2467,16 @@ impl SubagentDelegate for PollCountingSubagentDelegate {
 }
 
 impl SubagentDelegate for OverlapSubagentDelegate {
-    fn run_named<'a>(
-        &'a self,
-        _parent: &'a Agent,
-        agent_name: &'a str,
+    fn run_named(
+        &self,
+        _parent: &Agent,
+        agent_name: &str,
         _invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> {
         let active = Arc::clone(&self.active);
         let max_active = Arc::clone(&self.max_active);
         let started = Arc::clone(&self.started);
+        let completion_gate = self.completion_gate.clone();
         let agent_name = agent_name.to_string();
         Box::pin(async move {
             let current = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2484,11 +2486,20 @@ impl SubagentDelegate for OverlapSubagentDelegate {
                 .expect("started lock")
                 .push(agent_name.clone());
             tokio::task::yield_now().await;
+            if agent_name == "explorer"
+                && let Some(gate) = completion_gate
+            {
+                gate.notified().await;
+            }
             active.fetch_sub(1, Ordering::SeqCst);
-            Ok(ToolResult::ok(
-                format!("agent__{agent_name}"),
-                json!({"ok": true}),
-            ))
+            if agent_name == "oracle" {
+                Ok(ToolResult::err("agent__oracle", "review failed"))
+            } else {
+                Ok(ToolResult::ok(
+                    format!("agent__{agent_name}"),
+                    json!({"ok": true}),
+                ))
+            }
         })
     }
 }
@@ -2579,15 +2590,17 @@ async fn disabled_model_parallel_tool_calls_keep_subagents_sequential() {
 }
 
 #[tokio::test]
-async fn contiguous_different_role_subagents_overlap_and_return_in_model_order() {
+async fn contiguous_subagents_publish_results_independently() {
     let mut agent = test_agent();
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Mutex::new(Vec::new()));
+    let completion_gate = Arc::new(tokio::sync::Notify::new());
     agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
         active: Arc::clone(&active),
         max_active: Arc::clone(&max_active),
         started: Arc::clone(&started),
+        completion_gate: Some(completion_gate.clone()),
     }));
     let calls = vec![
         test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
@@ -2596,21 +2609,44 @@ async fn contiguous_different_role_subagents_overlap_and_return_in_model_order()
             r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
         ),
     ];
+    let mut calls = calls;
+    calls.push(test_tool_call("agent__oracle", r#"{"task":"review"}"#));
     agent
         .append_assistant_tool_calls("", &calls)
         .expect("append tool calls");
 
-    agent
-        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
-            Ok(PermissionApproval::AllowOnce)
-        })
-        .await
-        .expect("batch executes");
+    let mut finished = Vec::new();
+    let mut evidence_count = 0;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        agent.execute_tool_calls_and_record(
+            &calls,
+            &mut |event| {
+                if let AgentEvent::ToolCallFinished { call_id, ok, .. } = event {
+                    finished.push((call_id, ok));
+                } else if matches!(event, AgentEvent::EvidenceRecorded(_)) {
+                    evidence_count += 1;
+                    if evidence_count == 2 {
+                        assert_eq!(finished.len(), 2);
+                        assert!(finished.contains(&("call-agent__fixer".into(), true)));
+                        assert!(finished.contains(&("call-agent__oracle".into(), false)));
+                        completion_gate.notify_one();
+                    }
+                }
+                async { Ok(()) }
+            },
+            &mut |_| async { Ok(PermissionApproval::AllowOnce) },
+        ),
+    )
+    .await
+    .expect("completed results release the waiting delegate")
+    .expect("batch executes");
 
-    assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(max_active.load(Ordering::SeqCst), 3);
+    assert_eq!(evidence_count, 3);
     assert_eq!(
         *started.lock().expect("started lock"),
-        vec!["explorer", "fixer"]
+        vec!["explorer", "fixer", "oracle"]
     );
     let history = agent.history_for_test();
     let outputs = history
@@ -2620,7 +2656,10 @@ async fn contiguous_different_role_subagents_overlap_and_return_in_model_order()
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(outputs, vec!["call-agent__explore", "call-agent__fixer"]);
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(outputs[2], "call-agent__explore");
+    assert!(outputs[..2].contains(&"call-agent__fixer"));
+    assert!(outputs[..2].contains(&"call-agent__oracle"));
 }
 
 #[tokio::test]
@@ -2684,6 +2723,7 @@ async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
         active: Arc::new(AtomicUsize::new(0)),
         max_active: Arc::new(AtomicUsize::new(0)),
         started: Arc::clone(&started),
+        completion_gate: None,
     }));
     let calls = vec![
         test_tool_call("agent__explore", r#"{"task":"inspect"}"#),

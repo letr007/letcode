@@ -116,6 +116,8 @@ letcode
 
 `/child` 切换父会话和子会话视图。
 `/child first`、`/child next` 和 `/child prev` 选择要阅读的子会话。
+`/child list` 打开成员列表，swarm 模式包含全部深度成员。
+`/child <session_id>` 查看指定成员。
 查看子会话不会接管任务执行，也不改变当前主会话。
 继续已结束的子会话，需要主代理显式接管。
 

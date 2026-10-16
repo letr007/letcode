@@ -127,7 +127,7 @@ pub(crate) fn session_engine_command_as_session_command(
             navigation,
             anchor_child_session_id,
         } => Some(crate::session::SessionCommand::ViewChild {
-            navigation: *navigation,
+            navigation: navigation.clone(),
             anchor_child_session_id: anchor_child_session_id.clone(),
         }),
         SessionEngineCommand::BackgroundSubagentCompleted { .. }
@@ -532,7 +532,7 @@ fn manual_compaction_navigation(
             navigation,
             anchor_child_session_id,
         } => Some(ManualCompactionNavigation::ViewChild {
-            navigation: *navigation,
+            navigation: navigation.clone(),
             anchor_child_session_id: anchor_child_session_id.clone(),
         }),
         SessionEngineCommand::ViewParent => Some(ManualCompactionNavigation::ViewParent),

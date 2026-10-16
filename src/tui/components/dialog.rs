@@ -34,6 +34,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
             | DialogKind::AgentPicker
             | DialogKind::ExpertModelPicker(_)
             | DialogKind::SessionPicker
+            | DialogKind::ChildPicker
             | DialogKind::HistoryTree
             | DialogKind::ContextPicker
             | DialogKind::PermissionPicker

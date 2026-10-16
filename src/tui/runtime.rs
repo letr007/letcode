@@ -3242,7 +3242,10 @@ impl TuiRuntime {
                 navigation,
                 anchor_child_session_id,
             } => {
-                if navigation == SharedChildNavigation::Toggle
+                if navigation == SharedChildNavigation::List {
+                    self.show_child_members_dialog()?;
+                    Ok(Some(SubmittedCommand::LocalOnly))
+                } else if navigation == SharedChildNavigation::Toggle
                     && self.state.transcript_view.is_child()
                 {
                     self.state.restore_parent_timeline_view();
@@ -5021,6 +5024,43 @@ impl TuiRuntime {
         }
     }
 
+    fn show_child_members_dialog(&mut self) -> Result<()> {
+        let Some(root_session_id) = self.state.session_id.as_deref() else {
+            return Ok(());
+        };
+        let members = crate::session::child_view::project_session_members(
+            &self.sessions_dir,
+            root_session_id,
+        )?;
+        let mut items = vec![DialogItem::new(
+            root_session_id,
+            self.state.t("runtime.root_session"),
+            Some(root_session_id.to_string()),
+        )];
+        items.extend(members.into_iter().map(|member| {
+            DialogItem::new(
+                member.child_session_id.clone(),
+                format!("#{} {}", member.pool_ordinal, member.agent_name),
+                Some(format!("{} · {}", member.status, member.child_session_id)),
+            )
+        }));
+        let mut dialog = DialogState::new(
+            DialogKind::ChildPicker,
+            self.state.t("runtime.child_members"),
+            Some(self.state.t("runtime.child_members_hint")),
+            items,
+        );
+        if let Some(child_session_id) = child_navigation_anchor(&self.state) {
+            dialog.selected = dialog
+                .items
+                .iter()
+                .position(|item| item.id == child_session_id)
+                .unwrap_or(0);
+        }
+        self.state.open_dialog(dialog);
+        Ok(())
+    }
+
     fn open_history_tree_dialog(&mut self, entries: &[transcript_projection::SessionHistoryEntry]) {
         if entries.is_empty() {
             self.push_command_notice(self.state.t("runtime.no_transcript_entries"));
@@ -5398,6 +5438,18 @@ impl TuiRuntime {
                 match self.apply_fake_selection(client) {
                     SubmittedCommand::LocalOnly => Ok(None),
                     SubmittedCommand::Runtime(command) => Ok(Some(command)),
+                }
+            }
+            DialogKind::ChildPicker => {
+                self.state.close_dialog();
+                if self.state.session_id.as_deref() == Some(selected.id.as_str()) {
+                    self.state.restore_parent_timeline_view();
+                    Ok(Some(RuntimeCommand::ViewParent))
+                } else {
+                    Ok(Some(RuntimeCommand::ViewChild {
+                        navigation: SharedChildNavigation::Session(selected.id),
+                        anchor_child_session_id: None,
+                    }))
                 }
             }
             DialogKind::SessionPicker => {
