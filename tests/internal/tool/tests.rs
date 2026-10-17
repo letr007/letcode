@@ -131,30 +131,26 @@ fn subagent_path_scope_uses_platform_path_identity() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-    for (path, normalizes_parent) in [
-        (dir.path().join("missing/../outside"), true),
-        (file.path().join("child"), false),
+    let canonical_file = file.path().canonicalize().unwrap();
+    for (path, windows_target) in [
+        (dir.path().join("missing/../outside"), root.join("outside")),
+        (file.path().join("child"), canonical_file.join("child")),
         (
             std::path::PathBuf::from(format!("{}/", file.path().display())),
-            false,
+            canonical_file.clone(),
         ),
-        (file.path().join("."), false),
-        (dir.path().join("missing/./../outside/."), true),
+        (file.path().join("."), canonical_file),
+        (
+            dir.path().join("missing/./../outside/."),
+            root.join("outside"),
+        ),
     ] {
         let canonical =
             std::fs::canonicalize(&path).map_err(|error| (error.kind(), error.raw_os_error()));
         let metadata = std::fs::symlink_metadata(&path)
             .map(|metadata| metadata.is_dir())
             .map_err(|error| (error.kind(), error.raw_os_error()));
-        let expected = if cfg!(windows) {
-            if normalizes_parent {
-                Some(root.join("outside"))
-            } else {
-                canonical.as_ref().ok().cloned()
-            }
-        } else {
-            None
-        };
+        let expected = cfg!(windows).then_some(windows_target);
         for field in ["allowed_paths", "owned_paths", "forbidden_paths"] {
             let mut args = json!({"objective": "inspect"});
             if field == "forbidden_paths" {
