@@ -187,6 +187,48 @@ mod integration_tests {
     use super::*;
 
     #[test]
+    fn missing_owned_leaf_locks_conflict_only_with_overlapping_runs() {
+        let (dir, runtime, parent, recorder) = fixture(crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            ..Default::default()
+        });
+        let root = recorder.lock().unwrap().session_id().to_string();
+        let leaf = dir.path().join("new.txt");
+        let start_writer = |path: &Path| {
+            runtime.start_named_governed(
+                &parent,
+                "fixer",
+                invocation(serde_json::json!({"objective":"edit", "owned_paths":[path]})),
+                dir.path(),
+                root.clone(),
+                "turn-1".into(),
+                Some(recorder.clone()),
+                None,
+            )
+        };
+        let first = start_writer(&leaf).unwrap();
+        let expected = dir.path().canonicalize().unwrap().join("new.txt");
+        assert_eq!(
+            first
+                .run
+                .child_agent
+                .delegation_scope()
+                .unwrap()
+                .owned_roots(),
+            &[expected]
+        );
+        for overlapping in [&leaf, dir.path()] {
+            let error = start_writer(overlapping).err().unwrap();
+            assert!(error.to_string().contains("path lock conflict"), "{error}");
+        }
+        let neighbor = start_writer(&dir.path().join("neighbor.txt")).unwrap();
+        drop(neighbor);
+        assert!(!leaf.exists());
+        drop(first);
+        drop(start_writer(&leaf).unwrap());
+    }
+
+    #[test]
     fn terminal_members_release_capacity_and_restore_the_frozen_root_limit() {
         let (dir, runtime, mut parent, recorder) = fixture(crate::config::SubagentsConfig {
             mode: crate::config::SubagentMode::Swarm,

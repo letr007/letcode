@@ -342,6 +342,143 @@ fn use_resolved_runtime_catalog(agent: &mut Agent) {
 }
 
 #[test]
+fn expert_tool_model_descriptions_follow_allowed_models() {
+    let providers = indexmap::IndexMap::from([
+        (
+            "primary".into(),
+            test_provider(
+                "https://primary.example.invalid/v1",
+                "primary-secret-key",
+                ApiProtocol::Completions,
+                &["shared", "unselected"],
+            ),
+        ),
+        (
+            "expert".into(),
+            test_provider(
+                "https://expert.example.invalid/v1",
+                "expert-secret-key",
+                ApiProtocol::Completions,
+                &["shared", "special"],
+            ),
+        ),
+    ]);
+    let configured = [
+        (
+            "explorer",
+            vec![
+                ModelRoute::new("expert", "special"),
+                ModelRoute::new("primary", "shared"),
+            ],
+        ),
+        ("fixer", vec![ModelRoute::new("expert", "shared")]),
+    ];
+    let factory = ExpertRouteFactory::new_with_policies(
+        AgentTemplate::catalog().into_iter().map(|template| {
+            let models = configured
+                .iter()
+                .find(|(name, _)| *name == template.name)
+                .map(|(_, models)| models.clone())
+                .unwrap_or_default();
+            (
+                template.name,
+                Some(ModelRoute::new("primary", "shared")),
+                models,
+                None,
+            )
+        }),
+        &providers,
+        &RetryConfig::default(),
+    )
+    .unwrap();
+    let mut parent = test_agent();
+    parent.set_subagent_child_factory(Arc::new(factory));
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(Mutex::new(TranscriptRecorder::create(dir.path()).unwrap()));
+    install_delegate(&mut parent, &SubagentPool::new(), dir.path(), recorder);
+    let specs = parent.tool_definitions_for_test();
+    for agent_name in [
+        "explorer",
+        "fixer",
+        "oracle",
+        "designer",
+        "librarian",
+        "general",
+    ] {
+        let spec = specs
+            .iter()
+            .find(|spec| crate::agent::agent_name_for_subagent_tool(&spec.name) == Some(agent_name))
+            .unwrap();
+        let description = spec.parameters["properties"]["model"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("省略或传 null 使用默认路由"));
+        if let Some((_, allowed)) = configured.iter().find(|(name, _)| *name == agent_name) {
+            assert!(description.contains("首项为默认路由"));
+            assert_eq!(
+                description.lines().skip(1).collect::<Vec<_>>(),
+                allowed
+                    .iter()
+                    .map(ModelRoute::display_name)
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            assert!(description.contains("不能显式覆盖 model"));
+            assert!(!description.contains("primary/shared"));
+        }
+    }
+    let serialized = serde_json::to_string(&specs).unwrap();
+    for secret in [
+        "primary-secret-key",
+        "expert-secret-key",
+        "example.invalid",
+        "primary/unselected",
+    ] {
+        assert!(!serialized.contains(secret));
+    }
+    assert_eq!(
+        serialized,
+        serde_json::to_string(&parent.tool_definitions_for_test()).unwrap()
+    );
+
+    let replacement = ExpertRouteFactory::new_with_policies(
+        [(
+            "explorer".into(),
+            None,
+            vec![ModelRoute::new("expert", "shared")],
+            None,
+        )],
+        &providers,
+        &RetryConfig::default(),
+    )
+    .unwrap();
+    parent.set_subagent_child_factory(Arc::new(replacement));
+    let updated = parent.tool_definitions_for_test();
+    let explorer = updated
+        .iter()
+        .find(|spec| spec.name == "agent__explore")
+        .unwrap();
+    let description = explorer.parameters["properties"]["model"]["description"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        description.lines().skip(1).collect::<Vec<_>>(),
+        ["expert/shared"]
+    );
+    assert!(!description.contains("expert/special"));
+    let fixer = updated
+        .iter()
+        .find(|spec| spec.name == "agent__fixer")
+        .unwrap();
+    assert!(
+        fixer.parameters["properties"]["model"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("不能显式覆盖 model")
+    );
+}
+
+#[test]
 fn expert_policy_default_inherits_parent_without_allowing_implicit_override() {
     let providers = indexmap::IndexMap::from([(
         "primary".into(),
@@ -888,7 +1025,14 @@ mod integration_tests {
                         assert!(!body.to_string().contains("不要递归委派"));
                         assert!(!body.to_string().contains("不要继续委派"));
                         let tools = body["tools"].as_array().unwrap();
-                        assert!(tools.iter().any(|tool| tool["name"] == "agent__explore"));
+                        let explorer = tools.iter().find(|tool| tool["name"] == "agent__explore").unwrap();
+                        let description = explorer["parameters"]["properties"]["model"]["description"].as_str().unwrap();
+                        assert!(description.contains("省略或传 null 使用默认路由"));
+                        if sender_backed {
+                            assert_eq!(description.lines().skip(1).collect::<Vec<_>>(), ["test/model"]);
+                        } else {
+                            assert!(description.contains("不能显式覆盖 model"));
+                        }
                         assert!(!tools.iter().any(|tool| tool["name"] == "agent__fixer"));
                         assert!(tools.iter().any(|tool| tool["name"] == "agent__jobs"));
                         assert_eq!(expected_tools.get_or_insert_with(|| tools.clone()), tools);
@@ -953,7 +1097,12 @@ parallel_tool_calls = true
             parent.set_resolved_runtime_catalog(Some(catalog.clone()));
             if sender_backed {
                 let factory = ExpertRouteFactory::new_with_policies(
-                    [("explorer".into(), None, Vec::new(), None)],
+                    [(
+                        "explorer".into(),
+                        None,
+                        vec![ModelRoute::new("test", "model")],
+                        None,
+                    )],
                     &indexmap::IndexMap::from([(
                         "test".into(),
                         test_provider(

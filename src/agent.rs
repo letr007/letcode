@@ -306,6 +306,8 @@ impl LogicalRequestObservationTracker {
 }
 
 pub trait SubagentChildFactory: Send + Sync {
+    fn allowed_models(&self, agent_name: &str) -> &[ModelRoute];
+
     fn resolve_route(
         &self,
         parent: &Agent,
@@ -2098,7 +2100,7 @@ impl Agent {
         let mut tools = self.tools.specs();
         tools.retain(|spec| !is_subagent_tool_name(&spec.name));
         tools.extend(
-            subagent_tool_specs()
+            self.subagent_tool_specs()
                 .into_iter()
                 .filter(|spec| is_executable_tool(self, &spec.name)),
         );
@@ -3513,6 +3515,44 @@ impl Agent {
         input.render_for_delegate(tool_name)
     }
 
+    fn subagent_tool_specs(&self) -> Vec<crate::request_builder::ToolSpec> {
+        SUBAGENT_CATALOG
+            .iter()
+            .map(|entry| {
+                let mut parameters = subagent_parameters_schema(entry.task_description);
+                let allowed_models = self
+                    .subagent_child_factory
+                    .as_ref()
+                    .map(|factory| factory.allowed_models(entry.agent_name))
+                    .unwrap_or_default();
+                let routes_description = if allowed_models.is_empty() {
+                    "省略或传 null 使用默认路由。该专家的 allowed_models 为空，不能显式覆盖 model。"
+                        .to_string()
+                } else {
+                    format!(
+                        "省略或传 null 使用默认路由。仅可显式选择该专家的以下 provider/model 路由，首项为默认路由。\n{}",
+                        allowed_models
+                            .iter()
+                            .map(ModelRoute::display_name)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                };
+                let description = &mut parameters["properties"]["model"]["description"];
+                *description = Value::String(format!(
+                    "{} {routes_description}",
+                    description.as_str().expect("model description is a string")
+                ));
+                crate::request_builder::ToolSpec {
+                    name: entry.tool_name.to_string(),
+                    description: entry.tool_description.to_string(),
+                    parameters,
+                    strict: true,
+                }
+            })
+            .collect()
+    }
+
     fn tool_definitions(&self) -> Vec<crate::request_builder::ToolSpec> {
         let mut specs = self.tools.specs();
         // ToolRegistry retains a pair of subagent handlers for validation and
@@ -3520,7 +3560,7 @@ impl Agent {
         // is executable, exactly as they are checked at execution time.
         specs.retain(|spec| !is_subagent_tool_name(&spec.name));
         specs.extend(
-            subagent_tool_specs()
+            self.subagent_tool_specs()
                 .into_iter()
                 .filter(|spec| is_executable_tool(self, &spec.name)),
         );
@@ -4583,18 +4623,6 @@ fn subagent_run_id_schema() -> Value {
         "required": ["run_id"],
         "additionalProperties": false
     })
-}
-
-fn subagent_tool_specs() -> Vec<crate::request_builder::ToolSpec> {
-    SUBAGENT_CATALOG
-        .iter()
-        .map(|entry| crate::request_builder::ToolSpec {
-            name: entry.tool_name.to_string(),
-            description: entry.tool_description.to_string(),
-            parameters: subagent_parameters_schema(entry.task_description),
-            strict: true,
-        })
-        .collect()
 }
 
 fn classify_child_validation_entries(entries: &[String]) -> (usize, usize) {

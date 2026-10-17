@@ -2,7 +2,7 @@ use super::{NormalizedSubagentInput, SubagentPathScope, normalize_subagent_input
 use serde_json::json;
 
 #[test]
-fn subagent_path_scope_from_input_empty_or_unresolvable() {
+fn subagent_path_scope_authorizes_missing_roots() {
     let empty = NormalizedSubagentInput {
         objective: "x".into(),
         success_criteria: Vec::new(),
@@ -21,11 +21,255 @@ fn subagent_path_scope_from_input_empty_or_unresolvable() {
             .is_none()
     );
 
-    let bad = NormalizedSubagentInput {
-        owned_paths: vec!["/definitely/missing/letcode-scope-root".into()],
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let readable = root.join("readable");
+    let leaf = root.join("new.txt");
+    let tree = root.join("new-tree");
+    let forbidden = tree.join("private");
+    let input = NormalizedSubagentInput {
+        allowed_paths: vec![readable.to_string_lossy().into_owned()],
+        owned_paths: vec![
+            leaf.to_string_lossy().into_owned(),
+            tree.to_string_lossy().into_owned(),
+        ],
+        forbidden_paths: vec![forbidden.to_string_lossy().into_owned()],
         ..empty
     };
-    assert!(SubagentPathScope::from_input(&bad).is_err());
+    let scope = SubagentPathScope::from_input(&input).unwrap().unwrap();
+    assert!(scope.permits_read([readable.join("child").as_path()]));
+    assert!(!scope.permits_write([readable.join("child").as_path()]));
+    for (path, permitted) in [(&leaf, true), (&root.join("neighbor.txt"), false)] {
+        let path = path.to_str().unwrap();
+        let prepared = super::prepare_writable_leaf(path).unwrap();
+        assert_eq!(
+            super::delegation_scope_denial(
+                &scope,
+                "fs__write",
+                &json!({"path": path}),
+                Some(&prepared),
+                None,
+            )
+            .is_none(),
+            permitted
+        );
+    }
+    for (path, permitted) in [
+        (tree.join("child"), true),
+        (forbidden.join("child"), false),
+        (root.join("neighbor-tree"), false),
+    ] {
+        assert_eq!(
+            super::delegation_scope_denial(
+                &scope,
+                "fs__mkdir",
+                &json!({"path": path}),
+                None,
+                None,
+            )
+            .is_none(),
+            permitted
+        );
+    }
+    assert!(!scope.permits_read([forbidden.as_path()]));
+    assert!(!scope.permits_write([forbidden.as_path()]));
+    assert!(!leaf.exists());
+    assert!(!tree.exists());
+}
+
+#[test]
+fn subagent_path_scope_narrows_missing_roots_within_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let owned = root.join("owned");
+    let readable = root.join("readable");
+    let forbidden = owned.join("child/private");
+    let input = normalize_subagent_input(
+        "agent__fixer",
+        &json!({
+            "objective": "edit",
+            "allowed_paths": [readable],
+            "owned_paths": [owned],
+            "forbidden_paths": [forbidden],
+        }),
+    )
+    .unwrap();
+    let parent = SubagentPathScope::from_input(&input).unwrap().unwrap();
+    let child_input = normalize_subagent_input(
+        "agent__fixer",
+        &json!({"objective": "edit", "owned_paths": [owned.join("child")]}),
+    )
+    .unwrap();
+    let child = SubagentPathScope::from_input(&child_input)
+        .unwrap()
+        .unwrap()
+        .narrowed_from(&parent)
+        .unwrap();
+    assert!(child.permits_write([owned.join("child/new.txt").as_path()]));
+    assert!(!child.permits_write([owned.join("neighbor.txt").as_path()]));
+    assert!(!child.permits_read([forbidden.as_path()]));
+    for args in [
+        json!({"allowed_paths": [root.join("outside")]}),
+        json!({"owned_paths": [root.join("outside")]}),
+        json!({"owned_paths": [readable.join("new.txt")]}),
+        json!({"owned_paths": [forbidden.join("new.txt")]}),
+    ] {
+        let mut args = args;
+        args["objective"] = json!("inspect");
+        let input = normalize_subagent_input("agent__explore", &args).unwrap();
+        let error = SubagentPathScope::from_input(&input)
+            .unwrap()
+            .unwrap()
+            .narrowed_from(&parent)
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds parent scope"));
+    }
+}
+
+#[test]
+fn subagent_path_scope_rejects_unresolvable_parent_components() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    for path in [
+        dir.path().join("missing/../outside"),
+        file.path().join("child"),
+        std::path::PathBuf::from(format!("{}/", file.path().display())),
+        file.path().join("."),
+        dir.path().join("missing/./../outside/."),
+    ] {
+        for field in ["allowed_paths", "owned_paths", "forbidden_paths"] {
+            let mut args = json!({"objective": "inspect"});
+            args[field] = json!([path]);
+            let input = normalize_subagent_input("agent__explore", &args).unwrap();
+            let error = SubagentPathScope::from_input(&input).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("delegated path scope root cannot be resolved:")
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn subagent_path_scope_resolves_symlink_targets_with_missing_components() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let real = root.join("real/inner");
+    std::fs::create_dir_all(&real).unwrap();
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let dangling = root.join("dangling");
+    let target = root.join("new.txt");
+    std::os::unix::fs::symlink("new.txt", &dangling).unwrap();
+    let absolute = root.join("absolute");
+    std::os::unix::fs::symlink(&target, &absolute).unwrap();
+    let forbidden_input = normalize_subagent_input(
+        "agent__fixer",
+        &json!({"objective": "edit", "owned_paths": [root], "forbidden_paths": [dangling]}),
+    )
+    .unwrap();
+    let forbidden_scope = SubagentPathScope::from_input(&forbidden_input)
+        .unwrap()
+        .unwrap();
+    let owned_input = normalize_subagent_input(
+        "agent__fixer",
+        &json!({"objective": "edit", "owned_paths": [dangling]}),
+    )
+    .unwrap();
+    let owned_scope = SubagentPathScope::from_input(&owned_input)
+        .unwrap()
+        .unwrap();
+    for path in [&dangling, &absolute, &target] {
+        let path = path.to_str().unwrap();
+        let prepared = super::prepare_writable_leaf(path).unwrap();
+        assert_eq!(prepared.destination(), target);
+        assert!(owned_scope.permits_write([prepared.destination()]));
+        let denial = super::delegation_scope_denial(
+            &forbidden_scope,
+            "fs__write",
+            &json!({"path": path}),
+            Some(&prepared),
+            None,
+        )
+        .expect("symlink target is forbidden");
+        assert!(denial.contains("is forbidden"));
+    }
+    let directory_alias = root.join("directory-alias");
+    let directory_target = root.join("new-dir");
+    std::os::unix::fs::symlink("new-dir", &directory_alias).unwrap();
+    for (index, link_target) in ["directory-alias/", "directory-alias/."]
+        .into_iter()
+        .enumerate()
+    {
+        let link = root.join(format!("directory-chain-{index}"));
+        std::os::unix::fs::symlink(link_target, &link).unwrap();
+    }
+    for (relative, expected) in [
+        ("directory-alias/", directory_target.clone()),
+        ("directory-alias/.", directory_target.clone()),
+        ("./directory-alias//./", directory_target.clone()),
+        (
+            "directory-alias//./child//.",
+            directory_target.join("child"),
+        ),
+        ("directory-chain-0", directory_target.clone()),
+        ("directory-chain-1", directory_target.clone()),
+    ] {
+        let path = format!("{}/{relative}", root.display());
+        let input = normalize_subagent_input(
+            "agent__fixer",
+            &json!({"objective": "edit", "owned_paths": [root], "forbidden_paths": [path]}),
+        )
+        .unwrap();
+        let scope = SubagentPathScope::from_input(&input).unwrap().unwrap();
+        let denial = super::delegation_scope_denial(
+            &scope,
+            "fs__mkdir",
+            &json!({"path": expected}),
+            None,
+            None,
+        )
+        .expect("symlink directory target is forbidden");
+        assert!(denial.contains("is forbidden"));
+        let input = normalize_subagent_input(
+            "agent__fixer",
+            &json!({"objective": "edit", "owned_paths": [path]}),
+        )
+        .unwrap();
+        let scope = SubagentPathScope::from_input(&input).unwrap().unwrap();
+        assert_eq!(scope.owned_roots(), std::slice::from_ref(&expected));
+    }
+    let nested = root.join("nested-alias");
+    std::os::unix::fs::symlink("missing/parent", &nested).unwrap();
+    for (path, expected) in [
+        (alias.clone(), real.clone()),
+        (alias.join("new"), real.join("new")),
+        (alias.join("../new"), root.join("real/new")),
+        (dangling, target.clone()),
+        (absolute, target),
+        (nested.join("child"), root.join("missing/parent/child")),
+    ] {
+        let input = normalize_subagent_input(
+            "agent__fixer",
+            &json!({"objective": "edit", "owned_paths": [path]}),
+        )
+        .unwrap();
+        let scope = SubagentPathScope::from_input(&input).unwrap().unwrap();
+        assert_eq!(scope.owned_roots(), std::slice::from_ref(&expected));
+        assert!(scope.permits_write([expected.join("child").as_path()]));
+        assert!(!scope.permits_write([root.join("new/child").as_path()]));
+    }
+    let cycle = root.join("cycle");
+    std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+    let input = normalize_subagent_input(
+        "agent__fixer",
+        &json!({"objective": "edit", "owned_paths": [cycle]}),
+    )
+    .unwrap();
+    let error = SubagentPathScope::from_input(&input).unwrap_err();
+    assert!(format!("{error:#}").contains("too many symlink levels"));
 }
 
 #[test]

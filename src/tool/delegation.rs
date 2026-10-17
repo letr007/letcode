@@ -234,8 +234,8 @@ impl SubagentPathScope {
 fn canonicalize_scope_roots(paths: &[String]) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::with_capacity(paths.len());
     for path in paths {
-        let canonical = canonical_existing_path(path)
-            .ok_or_else(|| anyhow!("delegated path scope root cannot be resolved: {path}"))?;
+        let canonical = resolve_scope_destination(path)
+            .with_context(|| format!("delegated path scope root cannot be resolved: {path}"))?;
         roots.push(canonical);
     }
     Ok(roots)
@@ -388,15 +388,52 @@ fn resolve_scope_destination(path: &str) -> Result<PathBuf> {
     }
     let mut existing = candidate.clone();
     let mut suffix = Vec::new();
+    let mut symlink_levels = 0;
     loop {
-        if existing.exists() {
-            let mut resolved = existing
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize {}", existing.display()))?;
-            for part in suffix.iter().rev() {
-                resolved.push(part);
+        match std::fs::symlink_metadata(&existing) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::ensure!(
+                    symlink_levels < 40,
+                    "too many symlink levels while resolving scope destination: {}",
+                    candidate.display()
+                );
+                symlink_levels += 1;
+                let target = std::fs::read_link(&existing)
+                    .with_context(|| format!("failed to read symlink: {}", existing.display()))?;
+                existing = if target.is_absolute() {
+                    target
+                } else {
+                    existing
+                        .parent()
+                        .ok_or_else(|| anyhow!("path has no parent: {}", existing.display()))?
+                        .join(target)
+                };
+                continue;
             }
-            return Ok(resolved);
+            Ok(_) => {
+                let mut resolved = existing
+                    .canonicalize()
+                    .with_context(|| format!("failed to canonicalize {}", existing.display()))?;
+                for part in suffix.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let normalized: PathBuf = existing.components().collect();
+                if normalized.as_os_str() != existing.as_os_str() {
+                    existing = normalized;
+                    continue;
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect scope destination: {}",
+                        existing.display()
+                    )
+                });
+            }
         }
         let file_name = existing
             .file_name()

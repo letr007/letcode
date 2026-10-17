@@ -170,6 +170,13 @@ impl PrimaryRouteFactory for ExpertRouteFactory {
 }
 
 impl SubagentChildFactory for ExpertRouteFactory {
+    fn allowed_models(&self, agent_name: &str) -> &[ModelRoute] {
+        self.policies
+            .get(agent_name)
+            .map(|policy| policy.allowed_models.as_slice())
+            .unwrap_or_default()
+    }
+
     fn resolve_route(
         &self,
         parent: &Agent,

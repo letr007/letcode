@@ -1969,11 +1969,18 @@ fn parent_with_delegate_advertises_subagent_control_tools() {
         json!({"status": "completed"}),
     )));
 
-    let tools = agent
-        .tool_definitions_for_test()
-        .into_iter()
-        .map(|spec| spec.name)
-        .collect::<Vec<_>>();
+    let specs = agent.tool_definitions_for_test();
+    for spec in specs
+        .iter()
+        .filter(|spec| is_subagent_tool_name(&spec.name))
+    {
+        let description = spec.parameters["properties"]["model"]["description"]
+            .as_str()
+            .expect("model description");
+        assert!(description.contains("省略或传 null 使用默认路由"));
+        assert!(description.contains("不能显式覆盖 model"));
+    }
+    let tools = specs.into_iter().map(|spec| spec.name).collect::<Vec<_>>();
     for name in [
         "agent__jobs",
         "agent__status",
