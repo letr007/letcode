@@ -127,26 +127,91 @@ fn subagent_path_scope_narrows_missing_roots_within_parent() {
 }
 
 #[test]
-fn subagent_path_scope_rejects_unresolvable_parent_components() {
+fn subagent_path_scope_uses_platform_path_identity() {
     let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
     let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-    for path in [
-        dir.path().join("missing/../outside"),
-        file.path().join("child"),
-        std::path::PathBuf::from(format!("{}/", file.path().display())),
-        file.path().join("."),
-        dir.path().join("missing/./../outside/."),
+    for (path, normalizes_parent) in [
+        (dir.path().join("missing/../outside"), true),
+        (file.path().join("child"), false),
+        (
+            std::path::PathBuf::from(format!("{}/", file.path().display())),
+            false,
+        ),
+        (file.path().join("."), false),
+        (dir.path().join("missing/./../outside/."), true),
     ] {
+        let canonical =
+            std::fs::canonicalize(&path).map_err(|error| (error.kind(), error.raw_os_error()));
+        let metadata = std::fs::symlink_metadata(&path)
+            .map(|metadata| metadata.is_dir())
+            .map_err(|error| (error.kind(), error.raw_os_error()));
+        let expected = if cfg!(windows) {
+            if normalizes_parent {
+                Some(root.join("outside"))
+            } else {
+                canonical.as_ref().ok().cloned()
+            }
+        } else {
+            None
+        };
         for field in ["allowed_paths", "owned_paths", "forbidden_paths"] {
             let mut args = json!({"objective": "inspect"});
+            if field == "forbidden_paths" {
+                args["allowed_paths"] = json!([root]);
+                args["owned_paths"] = json!([root]);
+            }
             args[field] = json!([path]);
             let input = normalize_subagent_input("agent__explore", &args).unwrap();
-            let error = SubagentPathScope::from_input(&input).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .starts_with("delegated path scope root cannot be resolved:")
-            );
+            let result = SubagentPathScope::from_input(&input);
+            if let Some(target) = &expected {
+                let scope = result
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{field} {path:?}: canonicalize={canonical:?}, metadata={metadata:?}, scope={error:#}"
+                        )
+                    })
+                    .unwrap();
+                for target in [target.clone(), target.join("child")] {
+                    assert_eq!(
+                        scope.permits_read([target.as_path()]),
+                        field != "forbidden_paths"
+                    );
+                    assert_eq!(
+                        scope.permits_write([target.as_path()]),
+                        field == "owned_paths"
+                    );
+                }
+                let neighbor = root.join("neighbor");
+                assert_eq!(
+                    scope.permits_read([neighbor.as_path()]),
+                    field == "forbidden_paths"
+                );
+                assert_eq!(
+                    scope.permits_write([neighbor.as_path()]),
+                    field == "forbidden_paths"
+                );
+                match field {
+                    "allowed_paths" => {
+                        assert_eq!(scope.read_roots(), std::slice::from_ref(target));
+                    }
+                    "owned_paths" => {
+                        assert_eq!(scope.owned_roots(), std::slice::from_ref(target));
+                    }
+                    _ => {}
+                }
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{field} {path:?}: canonicalize={canonical:?}, metadata={metadata:?}, scope={result:?}"
+                );
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .starts_with("delegated path scope root cannot be resolved:")
+                );
+            }
         }
     }
 }
