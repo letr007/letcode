@@ -103,7 +103,7 @@ For detailed command-line options, see the [CLI & Batch Processing Guide](docs/c
 
 ## Technical Documentation
 
-Comprehensive architectural and component documentation is available in the [Technical Documentation Index](docs/index.md).
+Comprehensive architectural and component documentation is available in the [Technical Documentation Index](docs/index.md). For contributor and maintenance test workflows, see the [Testing Guide](docs/test/README.md) (in Chinese).
 
 ## External Dependencies
 
