@@ -133,16 +133,22 @@ fn subagent_path_scope_uses_platform_path_identity() {
     let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
     let canonical_file = file.path().canonicalize().unwrap();
     for (path, windows_target) in [
-        (dir.path().join("missing/../outside"), root.join("outside")),
-        (file.path().join("child"), canonical_file.join("child")),
+        (
+            dir.path().join("missing/../outside"),
+            Some(root.join("outside")),
+        ),
+        (
+            file.path().join("child"),
+            Some(canonical_file.join("child")),
+        ),
         (
             std::path::PathBuf::from(format!("{}/", file.path().display())),
-            canonical_file.clone(),
+            None,
         ),
-        (file.path().join("."), canonical_file),
+        (file.path().join("."), Some(canonical_file)),
         (
             dir.path().join("missing/./../outside/."),
-            root.join("outside"),
+            Some(root.join("outside")),
         ),
     ] {
         let canonical =
@@ -150,7 +156,7 @@ fn subagent_path_scope_uses_platform_path_identity() {
         let metadata = std::fs::symlink_metadata(&path)
             .map(|metadata| metadata.is_dir())
             .map_err(|error| (error.kind(), error.raw_os_error()));
-        let expected = cfg!(windows).then_some(windows_target);
+        let expected = if cfg!(windows) { windows_target } else { None };
         for field in ["allowed_paths", "owned_paths", "forbidden_paths"] {
             let mut args = json!({"objective": "inspect"});
             if field == "forbidden_paths" {
