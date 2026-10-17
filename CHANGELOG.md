@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [0.24.0] - 2026-10-17
 
 ### Added
 
@@ -594,7 +594,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/letr007/letcode/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/letr007/letcode/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/letr007/letcode/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/letr007/letcode/compare/v0.20.1...v0.21.0
