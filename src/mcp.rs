@@ -424,12 +424,8 @@ impl LocalMcpSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = ManagedChild::spawn(command).with_context(|| {
-            format!(
-                "failed to start MCP server command '{}': {:?}",
-                program, server.command
-            )
-        })?;
+        let mut child = ManagedChild::spawn(command)
+            .with_context(|| format!("failed to start MCP server command '{program}'"))?;
         let stdin = child
             .take_stdin()
             .ok_or_else(|| anyhow!("failed to open MCP server stdin"))?;
