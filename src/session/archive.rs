@@ -1160,7 +1160,7 @@ fn now_ms() -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
     use crate::transcript::TranscriptRecorder;
 

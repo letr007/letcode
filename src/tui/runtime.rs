@@ -6612,11 +6612,8 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 #[cfg(test)]
 mod git_branch_tests {
     use super::TuiRuntime;
-    use super::branch_poller::read_git_branch;
     use crate::tui::TuiState;
     use crate::tui::state::ToastKind;
-    use std::path::Path;
-    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
 
@@ -6628,20 +6625,6 @@ mod git_branch_tests {
                 .expect("time")
                 .as_nanos()
         ))
-    }
-
-    fn git(path: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     fn runtime() -> TuiRuntime {
@@ -6712,33 +6695,54 @@ mod git_branch_tests {
         assert!(runtime.update_check_rx.is_none());
     }
 
-    #[test]
-    fn reads_named_and_detached_git_branches() {
-        let path = temp_dir("repository");
-        std::fs::create_dir_all(&path).expect("create temp repository");
-        git(&path, &["init", "-q", "-b", "main"]);
-        git(&path, &["config", "user.email", "test@example.com"]);
-        git(&path, &["config", "user.name", "LetCode Test"]);
-        std::fs::write(path.join("file.txt"), "content").expect("write file");
-        git(&path, &["add", "file.txt"]);
-        git(&path, &["commit", "-q", "-m", "initial"]);
+    mod integration_tests {
+        use super::super::branch_poller::read_git_branch;
+        use super::*;
+        use std::path::Path;
+        use std::process::Command;
 
-        assert_eq!(read_git_branch(&path).as_deref(), Some("main"));
-        git(&path, &["checkout", "-q", "--detach", "HEAD"]);
-        let branch = read_git_branch(&path).expect("detached branch label");
-        assert!(branch.starts_with("detached@"), "{branch}");
+        fn git(path: &Path, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
 
-        let _ = std::fs::remove_dir_all(path);
-    }
+        #[test]
+        fn reads_named_and_detached_git_branches() {
+            let path = temp_dir("repository");
+            std::fs::create_dir_all(&path).expect("create temp repository");
+            git(&path, &["init", "-q", "-b", "main"]);
+            git(&path, &["config", "user.email", "test@example.com"]);
+            git(&path, &["config", "user.name", "LetCode Test"]);
+            std::fs::write(path.join("file.txt"), "content").expect("write file");
+            git(&path, &["add", "file.txt"]);
+            git(&path, &["commit", "-q", "-m", "initial"]);
 
-    #[test]
-    fn non_git_directory_has_no_branch() {
-        let path = temp_dir("non-repository");
-        std::fs::create_dir_all(&path).expect("create temp directory");
+            assert_eq!(read_git_branch(&path).as_deref(), Some("main"));
+            git(&path, &["checkout", "-q", "--detach", "HEAD"]);
+            let branch = read_git_branch(&path).expect("detached branch label");
+            assert!(branch.starts_with("detached@"), "{branch}");
 
-        assert_eq!(read_git_branch(&path), None);
+            let _ = std::fs::remove_dir_all(path);
+        }
 
-        let _ = std::fs::remove_dir_all(path);
+        #[test]
+        fn non_git_directory_has_no_branch() {
+            let path = temp_dir("non-repository");
+            std::fs::create_dir_all(&path).expect("create temp directory");
+
+            assert_eq!(read_git_branch(&path), None);
+
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 

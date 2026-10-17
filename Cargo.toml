@@ -76,6 +76,7 @@ windows-sys = { version = "0.61", features = [
 termwiz = { version = "0.23.3", default-features = false }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 termwiz = { version = "0.23.3", default-features = false }
 
 [profile.dev]

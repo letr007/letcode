@@ -326,7 +326,7 @@ pub fn cleanup_replaced_empty_session(old_path: PathBuf, new_path: &Path) -> Res
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
     use std::fs;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};

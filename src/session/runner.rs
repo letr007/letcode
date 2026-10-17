@@ -1642,127 +1642,6 @@ mod tests {
         assert!(recorded_error_message(&event).contains("Provider response:"));
     }
 
-    #[tokio::test]
-    async fn fast_mode_auto_disable_keeps_child_settings_out_of_parent_events() {
-        use crate::agent::{AgentFactory, AgentTemplate};
-        use crate::config::ModelRoute;
-        use crate::model_runtime::{ProtocolRegistry, RuntimeConfig};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::time::{Duration, timeout};
-
-        for child_session_id in [None, Some("child-session")] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                timeout(Duration::from_secs(5), async move {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    let mut request = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    loop {
-                        let read = stream.read(&mut chunk).await.unwrap();
-                        assert!(read > 0);
-                        request.extend_from_slice(&chunk[..read]);
-                        if let Some(at) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                            let headers = std::str::from_utf8(&request[..at]).unwrap();
-                            let length = headers.lines().find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().unwrap())
-                            }).unwrap();
-                            if request.len() >= at + 4 + length {
-                                break;
-                            }
-                        }
-                    }
-                    let body = concat!(
-                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
-                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n"
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream.write_all(response.as_bytes()).await.unwrap();
-                }).await.unwrap();
-            });
-            let catalog = RuntimeConfig::from_toml(&format!(
-                r#"active_provider = "test"
-[providers.test]
-protocol = "responses"
-default_model = "model"
-[providers.test.auth]
-type = "none"
-[providers.test.endpoints]
-base_url = "http://{address}"
-[providers.test.models.model.capabilities]
-tools = true
-parallel_tool_calls = true
-[providers.test.models.model.capabilities.generation]
-parallel_tool_calls = true
-"#
-            ))
-            .unwrap()
-            .resolve(&ProtocolRegistry::builtins())
-            .unwrap();
-            let route = Arc::new(catalog.route("test", "model").unwrap().clone());
-            let mode = crate::fast_mode::FastMode::load("letcode.toml", true);
-            let mut parent = Agent::new("gpt-test", 1, 1);
-            parent.set_fast_mode(mode.clone());
-            let mut agent = if child_session_id.is_some() {
-                AgentFactory::create_child(&parent, &AgentTemplate::explorer())
-            } else {
-                parent
-            };
-            agent.set_resolved_runtime_catalog(Some(catalog));
-            agent.set_model_route_authority(ModelRoute::new("test", "model"), route);
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut runner = AgentRunner::new(tx);
-            runner.child_session_id = child_session_id.map(str::to_owned);
-            let result = timeout(
-                Duration::from_secs(5),
-                runner.run_prompt(
-                    &mut agent,
-                    UserMessageSubmission::new("prompt", UserMessageContent::from("say ok")),
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(result, "ok");
-            server.await.unwrap();
-            assert!(!agent.fast_mode_enabled());
-            assert_eq!(mode.enabled(), child_session_id.is_some());
-
-            let mut settings_changes = 0;
-            let mut auto_disable_notice = false;
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    SessionTransportEvent::FastModeChanged { enabled } => {
-                        assert!(!enabled);
-                        settings_changes += 1;
-                    }
-                    SessionTransportEvent::ChildSessionEvent {
-                        child_session_id: id,
-                        event: SessionEvent::Notice(notice),
-                        ..
-                    } if notice.message.contains("Fast mode auto-disabled") => {
-                        assert_eq!(Some(id.as_str()), child_session_id);
-                        auto_disable_notice = true;
-                    }
-                    SessionTransportEvent::Notice(notice)
-                        if notice.message.contains("Fast mode auto-disabled") =>
-                    {
-                        assert!(child_session_id.is_none());
-                        auto_disable_notice = true;
-                    }
-                    _ => {}
-                }
-            }
-            assert_eq!(settings_changes, usize::from(child_session_id.is_none()));
-            assert!(auto_disable_notice);
-        }
-    }
-
     #[test]
     fn summarize_search_uses_aggregate_and_marks_folded() {
         assert_eq!(
@@ -1864,50 +1743,6 @@ parallel_tool_calls = true
         }
     }
 
-    async fn drive_tool_batch_events(
-        events: Vec<(AgentEvent, JournalEffect)>,
-    ) -> Vec<&'static str> {
-        let state = Arc::new(tokio::sync::Mutex::new(ToolBatchReconciliation::default()));
-        let mut trace = Vec::new();
-        for (event, journal_effect) in events {
-            let event_name = match &event {
-                AgentEvent::ToolCallFinished { .. } => "tool_finished",
-                AgentEvent::EvidenceRecorded(_) => "evidence",
-                AgentEvent::ToolCallBatchFinished => "batch_finished",
-                AgentEvent::ToolCallCancelled { .. } => "tool_cancelled",
-                _ => "other",
-            };
-            if journal_effect.persisted {
-                trace.push(match event_name {
-                    "tool_finished" => "persist:tool_finished",
-                    "evidence" => "persist:evidence",
-                    "batch_finished" => "persist:batch_finished",
-                    "tool_cancelled" => "persist:tool_cancelled",
-                    _ => "persist:other",
-                });
-            }
-            tokio::task::yield_now().await;
-            let action = {
-                let mut state = state.lock().await;
-                state.reconcile(&event, journal_effect)
-            };
-            match action {
-                ToolBatchReconciliationAction::ProjectEvidence => trace.push("project"),
-                ToolBatchReconciliationAction::FinishBatch(_) => {
-                    trace.push("boundary:batch_finished");
-                    trace.push("project");
-                    trace.push("ui:batch_finished");
-                }
-                ToolBatchReconciliationAction::None => match event_name {
-                    "tool_finished" => trace.push("ui:tool_finished"),
-                    "tool_cancelled" => trace.push("ui:tool_cancelled"),
-                    _ => {}
-                },
-            }
-        }
-        trace
-    }
-
     fn test_evidence() -> crate::evidence::EvidenceRecord {
         crate::evidence::EvidenceRecord {
             id: "evidence-1".into(),
@@ -1925,10 +1760,11 @@ parallel_tool_calls = true
         }
     }
 
-    #[tokio::test]
-    async fn tool_batch_event_orchestration_persists_before_ui_and_projects_once() {
+    #[test]
+    fn tool_batch_reconciliation_returns_actions_at_evidence_and_batch_boundaries() {
+        let mut reconciliation = ToolBatchReconciliation::default();
         let output = crate::tool::ToolResult::ok("shell__exec", json!({}));
-        let trace = drive_tool_batch_events(vec![
+        let actions: Vec<_> = [
             (
                 AgentEvent::ToolCallFinished {
                     call_id: "call-1".into(),
@@ -1958,21 +1794,28 @@ parallel_tool_calls = true
                     compaction_terminal: false,
                 },
             ),
-        ])
-        .await;
+            (
+                AgentEvent::EvidenceRecorded(test_evidence()),
+                JournalEffect {
+                    persisted: true,
+                    context_projection: ContextProjection::Advance,
+                    compaction_terminal: false,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(event, effect)| reconciliation.reconcile(&event, effect))
+        .collect();
 
         assert_eq!(
-            trace,
+            actions,
             vec![
-                "persist:tool_finished",
-                "ui:tool_finished",
-                "persist:evidence",
-                "boundary:batch_finished",
-                "project",
-                "ui:batch_finished",
+                ToolBatchReconciliationAction::None,
+                ToolBatchReconciliationAction::None,
+                ToolBatchReconciliationAction::FinishBatch(RuntimeContextDisposition::Advance),
+                ToolBatchReconciliationAction::ProjectEvidence,
             ]
         );
-        assert_eq!(trace.iter().filter(|entry| **entry == "project").count(), 1);
     }
 
     #[test]
@@ -2029,93 +1872,6 @@ parallel_tool_calls = true
         assert_eq!(event.origin_label.as_deref(), Some("fixer"));
     }
 
-    #[test]
-    fn tool_driven_invalid_override_is_reported_before_credential_lookup() {
-        let mut parent = Agent::new("shared", 1, 1);
-        parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
-        let selected = crate::config::ModelRoute::new("expert", "shared");
-        let delegate = credential_delegate(
-            &mut parent,
-            crate::config::ModelRoute::new("expert", "shared"),
-            Vec::new(),
-        );
-        let invocation = SubagentInvocation {
-            input: crate::tool::NormalizedSubagentInput {
-                objective: "inspect route credentials".into(),
-                success_criteria: Vec::new(),
-                allowed_paths: Vec::new(),
-                forbidden_paths: Vec::new(),
-                owned_paths: Vec::new(),
-                timeout_secs: None,
-                max_tool_calls: None,
-                model: Some(selected.display_name()),
-                target_child_session_id: None,
-                background: false,
-            },
-            model: Some(selected),
-            prompt: "inspect route credentials".into(),
-            parent_tool_call_id: Some("call-invalid".into()),
-        };
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("create runtime");
-        let output = runtime
-            .block_on(delegate.run_named(&parent, "explorer", invocation))
-            .expect("invalid route is a tool result");
-        let message = &output.error.as_ref().expect("route error").message;
-        assert!(message.contains("requested model route 'expert/shared' is not allowed"));
-        assert!(!message.contains("API key is not set"));
-    }
-
-    #[test]
-    fn tool_driven_expert_delegation_requires_its_route_credential() {
-        let mut parent = Agent::new("shared", 1, 1);
-        parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
-        let delegate = credential_delegate(
-            &mut parent,
-            crate::config::ModelRoute::new("expert", "shared"),
-            Vec::new(),
-        );
-        let invocation = SubagentInvocation {
-            input: crate::tool::NormalizedSubagentInput {
-                objective: "inspect route credentials".into(),
-                success_criteria: Vec::new(),
-                allowed_paths: Vec::new(),
-                forbidden_paths: Vec::new(),
-                owned_paths: Vec::new(),
-                timeout_secs: None,
-                max_tool_calls: None,
-                model: None,
-                target_child_session_id: None,
-                background: false,
-            },
-            model: None,
-            prompt: "inspect route credentials".into(),
-            parent_tool_call_id: Some("call-1".into()),
-        };
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("create runtime");
-        let output = runtime.block_on(delegate.run_named(&parent, "explorer", invocation));
-
-        let output = output.expect("credential denial is a tool result");
-        assert!(!output.ok);
-        assert!(matches!(
-            output.error.as_ref(),
-            Some(crate::tool::ToolError { message, .. })
-                if message == "API key is not set for the selected provider. Set EXPERT_API_KEY."
-        ));
-        let data = output
-            .data
-            .expect("credential denial includes route metadata");
-        assert_eq!(data.get("route"), Some(&json!("expert/shared")));
-        assert_eq!(data.get("agent_name"), Some(&json!("explorer")));
-    }
-
     fn temp_transcript() -> Arc<Mutex<TranscriptRecorder>> {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-runner-child-streaming-test-{}",
@@ -2128,5 +1884,217 @@ parallel_tool_calls = true
         Arc::new(Mutex::new(
             TranscriptRecorder::create(&base_dir).expect("transcript created"),
         ))
+    }
+
+    mod integration_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn fast_mode_auto_disable_keeps_child_settings_out_of_parent_events() {
+            use crate::agent::{AgentFactory, AgentTemplate};
+            use crate::config::ModelRoute;
+            use crate::model_runtime::{ProtocolRegistry, RuntimeConfig};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::time::{Duration, timeout};
+
+            for child_session_id in [None, Some("child-session")] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    timeout(Duration::from_secs(5), async move {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            let read = stream.read(&mut chunk).await.unwrap();
+                            assert!(read > 0);
+                            request.extend_from_slice(&chunk[..read]);
+                            if let Some(at) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                                let headers = std::str::from_utf8(&request[..at]).unwrap();
+                                let length = headers.lines().find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                }).unwrap();
+                                if request.len() >= at + 4 + length {
+                                    break;
+                                }
+                            }
+                        }
+                        let body = concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n"
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }).await.unwrap();
+                });
+                let catalog = RuntimeConfig::from_toml(&format!(
+                    r#"active_provider = "test"
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "none"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.models.model.capabilities]
+tools = true
+parallel_tool_calls = true
+[providers.test.models.model.capabilities.generation]
+parallel_tool_calls = true
+"#
+                ))
+                .unwrap()
+                .resolve(&ProtocolRegistry::builtins())
+                .unwrap();
+                let route = Arc::new(catalog.route("test", "model").unwrap().clone());
+                let mode = crate::fast_mode::FastMode::load("letcode.toml", true);
+                let mut parent = Agent::new("gpt-test", 1, 1);
+                parent.set_fast_mode(mode.clone());
+                let mut agent = if child_session_id.is_some() {
+                    AgentFactory::create_child(&parent, &AgentTemplate::explorer())
+                } else {
+                    parent
+                };
+                agent.set_resolved_runtime_catalog(Some(catalog));
+                agent.set_model_route_authority(ModelRoute::new("test", "model"), route);
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut runner = AgentRunner::new(tx);
+                runner.child_session_id = child_session_id.map(str::to_owned);
+                let result = timeout(
+                    Duration::from_secs(5),
+                    runner.run_prompt(
+                        &mut agent,
+                        UserMessageSubmission::new("prompt", UserMessageContent::from("say ok")),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(result, "ok");
+                server.await.unwrap();
+                assert!(!agent.fast_mode_enabled());
+                assert_eq!(mode.enabled(), child_session_id.is_some());
+
+                let mut settings_changes = 0;
+                let mut auto_disable_notice = false;
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        SessionTransportEvent::FastModeChanged { enabled } => {
+                            assert!(!enabled);
+                            settings_changes += 1;
+                        }
+                        SessionTransportEvent::ChildSessionEvent {
+                            child_session_id: id,
+                            event: SessionEvent::Notice(notice),
+                            ..
+                        } if notice.message.contains("Fast mode auto-disabled") => {
+                            assert_eq!(Some(id.as_str()), child_session_id);
+                            auto_disable_notice = true;
+                        }
+                        SessionTransportEvent::Notice(notice)
+                            if notice.message.contains("Fast mode auto-disabled") =>
+                        {
+                            assert!(child_session_id.is_none());
+                            auto_disable_notice = true;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(settings_changes, usize::from(child_session_id.is_none()));
+                assert!(auto_disable_notice);
+            }
+        }
+
+        #[test]
+        fn tool_driven_invalid_override_is_reported_before_credential_lookup() {
+            let mut parent = Agent::new("shared", 1, 1);
+            parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
+            let selected = crate::config::ModelRoute::new("expert", "shared");
+            let delegate = credential_delegate(
+                &mut parent,
+                crate::config::ModelRoute::new("expert", "shared"),
+                Vec::new(),
+            );
+            let invocation = SubagentInvocation {
+                input: crate::tool::NormalizedSubagentInput {
+                    objective: "inspect route credentials".into(),
+                    success_criteria: Vec::new(),
+                    allowed_paths: Vec::new(),
+                    forbidden_paths: Vec::new(),
+                    owned_paths: Vec::new(),
+                    timeout_secs: None,
+                    max_tool_calls: None,
+                    model: Some(selected.display_name()),
+                    target_child_session_id: None,
+                    background: false,
+                },
+                model: Some(selected),
+                prompt: "inspect route credentials".into(),
+                parent_tool_call_id: Some("call-invalid".into()),
+            };
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("create runtime");
+            let output = runtime
+                .block_on(delegate.run_named(&parent, "explorer", invocation))
+                .expect("invalid route is a tool result");
+            let message = &output.error.as_ref().expect("route error").message;
+            assert!(message.contains("requested model route 'expert/shared' is not allowed"));
+            assert!(!message.contains("API key is not set"));
+        }
+
+        #[test]
+        fn tool_driven_expert_delegation_requires_its_route_credential() {
+            let mut parent = Agent::new("shared", 1, 1);
+            parent.set_primary_route(crate::config::ModelRoute::new("primary", "shared"));
+            let delegate = credential_delegate(
+                &mut parent,
+                crate::config::ModelRoute::new("expert", "shared"),
+                Vec::new(),
+            );
+            let invocation = SubagentInvocation {
+                input: crate::tool::NormalizedSubagentInput {
+                    objective: "inspect route credentials".into(),
+                    success_criteria: Vec::new(),
+                    allowed_paths: Vec::new(),
+                    forbidden_paths: Vec::new(),
+                    owned_paths: Vec::new(),
+                    timeout_secs: None,
+                    max_tool_calls: None,
+                    model: None,
+                    target_child_session_id: None,
+                    background: false,
+                },
+                model: None,
+                prompt: "inspect route credentials".into(),
+                parent_tool_call_id: Some("call-1".into()),
+            };
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("create runtime");
+            let output = runtime.block_on(delegate.run_named(&parent, "explorer", invocation));
+
+            let output = output.expect("credential denial is a tool result");
+            assert!(!output.ok);
+            assert!(matches!(
+                output.error.as_ref(),
+                Some(crate::tool::ToolError { message, .. })
+                    if message == "API key is not set for the selected provider. Set EXPERT_API_KEY."
+            ));
+            let data = output
+                .data
+                .expect("credential denial includes route metadata");
+            assert_eq!(data.get("route"), Some(&json!("expert/shared")));
+            assert_eq!(data.get("agent_name"), Some(&json!("explorer")));
+        }
     }
 }

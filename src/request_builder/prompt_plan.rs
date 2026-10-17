@@ -1483,8 +1483,6 @@ mod tests {
     use crate::runtime_context::{RuntimeFrameProvenance, RuntimeSnapshot, SourceSpan};
     use crate::user_content::{UserImageAttachment, UserMessageContent};
 
-    /// Produces an ASCII-only canonical ToolResult with an exact serialized
-    /// byte count. The fixed framing is measured, never guessed.
     #[test]
     fn prompt_plan_marks_stable_prefix_boundary() {
         let plan = build_prompt_plan(PromptPlanBuildInput {

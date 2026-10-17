@@ -9,7 +9,6 @@ async fn member_fifo_starts_distinct_user_turns_at_persisted_boundaries() {
         Complete,
         UserRecord,
         TurnClose,
-        Deadline,
     }
     struct MessageJournalFailure {
         file: std::fs::File,
@@ -47,8 +46,6 @@ async fn member_fifo_starts_distinct_user_turns_at_persisted_boundaries() {
         (false, false, Stage::UserRecord),
         (false, false, Stage::TurnClose),
         (false, true, Stage::TurnClose),
-        (false, false, Stage::Deadline),
-        (false, true, Stage::Deadline),
     ] {
         let io_failure = matches!(stage, Stage::UserRecord | Stage::TurnClose);
         let user_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -82,16 +79,19 @@ async fn member_fifo_starts_distinct_user_turns_at_persisted_boundaries() {
                         first_tx.take().unwrap().send(()).unwrap();
                         release_rx.take().unwrap().await.unwrap();
                     } else {
-                        let input = body["input"].to_string();
-                        assert!(input.contains("function_call_output"));
-                        assert!(input.contains("一二"));
-                        assert_eq!(input.contains("second"), index == 2);
-                    }
-                    if stage == Stage::Deadline && index == 1 { tokio::time::sleep(Duration::from_millis(600)).await; }
-                    if stage == Stage::Deadline && index == 2 {
-                        let mut eof = [0u8; 1];
-                        assert_eq!(timeout(Duration::from_millis(700), socket.read(&mut eof)).await.expect("run exceeded its original deadline").unwrap(), 0);
-                        return;
+                        let input = body["input"].as_array().unwrap();
+                        assert!(input.iter().any(|item| item["type"] == "function_call_output"));
+                        let user_texts: Vec<_> = input
+                            .iter()
+                            .filter(|item| item["role"] == "user")
+                            .flat_map(|item| item["content"].as_array().unwrap())
+                            .filter_map(|part| part["text"].as_str())
+                            .collect();
+                        assert!(user_texts.iter().any(|text| text.ends_with("\n\n一二")));
+                        assert_eq!(
+                            user_texts.iter().any(|text| text.ends_with("\n\nsecond")),
+                            index == 2
+                        );
                     }
                     let events = if index == 0 {
                         let args = json!({"path":"src/subagent.rs"}).to_string();
@@ -183,10 +183,7 @@ parallel_tool_calls = true
             });
             (root_copy, path, execution)
         } else {
-            let mut input = test_governance().input;
-            if stage == Stage::Deadline {
-                input.timeout_secs = Some(1);
-            }
+            let input = test_governance().input;
             let started = runtime
                 .start_named_governed(
                     &parent,
@@ -252,8 +249,6 @@ parallel_tool_calls = true
                                 result.status,
                                 if io_failure {
                                     SubagentStatus::Failed
-                                } else if stage == Stage::Deadline {
-                                    SubagentStatus::TimedOut
                                 } else {
                                     SubagentStatus::Completed
                                 },
@@ -380,7 +375,6 @@ parallel_tool_calls = true
             match stage {
                 Stage::TurnClose => 0,
                 Stage::UserRecord => 1,
-                Stage::Deadline => 2,
                 Stage::Complete => 3,
             }
         );

@@ -577,9 +577,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[tokio::test]
-    async fn background_publication_preserves_new_work_and_uses_native_instructions() {
-        tokio::time::timeout(std::time::Duration::from_secs(120),async {
+    mod integration_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn background_publication_preserves_new_work_and_uses_native_instructions() {
+            tokio::time::timeout(std::time::Duration::from_secs(120),async {
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address=listener.local_addr().unwrap();
             let second_accepted=Arc::new(tokio::sync::Notify::new());
@@ -811,6 +814,7 @@ max_output_tokens=4096
             let cancelled_records=crate::transcript::read_records(recorder.lock().unwrap().path()).unwrap();
             assert_eq!(cancelled_records.iter().filter(|r|matches!(r.event,TranscriptEvent::HistoryPublished(_))).count(),2,"cancelled work must not publish late");
         }).await.expect("historian test timed out");
+        }
     }
 }
 
@@ -1252,11 +1256,14 @@ max_output_tokens=128
         }
     }
 
-    #[tokio::test]
-    async fn a_rejected_publication_is_repaired_and_both_attempts_are_recorded() {
-        // Driven to its terminal state by polling, so the test never waits on
-        // wall-clock time.
-        tokio::spawn(async move {
+    mod integration_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn a_rejected_publication_is_repaired_and_both_attempts_are_recorded() {
+            // Driven to its terminal state by polling, so the test never waits on
+            // wall-clock time.
+            tokio::spawn(async move {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -1490,162 +1497,159 @@ max_output_tokens=4096
         })
         .await
         .unwrap();
-    }
-
-    /// One historian call reads one chunk of the uncovered region. The region
-    /// here is far larger than any single call may read, so the prepared work
-    /// must cover a prefix of it rather than all of it.
-    #[tokio::test]
-    async fn one_historian_work_covers_a_bounded_chunk_of_the_uncovered_region() {
-        use crate::request_builder::HistoryToolCall;
-        let root = tempfile::tempdir().unwrap();
-        let (mut agent, recorder) = agent_with_recorder(root.path());
-        {
-            let mut recorder = recorder.lock().unwrap();
-            recorder
-                .record_turn_started(crate::agent::TurnStartedEvent { turn_id: 1 })
-                .unwrap();
-            recorder.record_user_message("Read every source").unwrap();
-            for index in 0..40 {
-                let call_id = format!("read-{index}");
-                recorder
-                    .record_assistant_tool_call_batch(
-                        None,
-                        None,
-                        None,
-                        vec![HistoryToolCall {
-                            call_id: call_id.clone(),
-                            name: "fs__read".into(),
-                            arguments_json: r#"{"path":"source.rs"}"#.into(),
-                        }],
-                    )
-                    .unwrap();
-                recorder
-                    .record_tool_call_finished(
-                        &call_id,
-                        "fs__read",
-                        true,
-                        crate::tool::ToolResult::ok(
-                            "fs__read",
-                            serde_json::json!({"content": "source detail ".repeat(3_000)}),
-                        ),
-                    )
-                    .unwrap();
-            }
         }
-        agent.turn.current_turn_start_index = Some(0);
-        agent.reload_runtime_snapshot_from_provider().unwrap();
-        let region = persisted_history_snapshot(&agent)
-            .unwrap()
-            .active_protocol_frames()
-            .len();
-        let prepared = work(&agent, true, None).unwrap().unwrap();
-        assert!(!prepared.source_ids.is_empty());
-        assert!(
-            prepared.source_ids.len() < region,
-            "one call must not read the whole region: {} of {region}",
-            prepared.source_ids.len()
-        );
-        let oldest = persisted_history_snapshot(&agent)
-            .unwrap()
-            .active_protocol_frames()[0]
-            .source_provenance
-            .as_ref()
-            .and_then(|provenance| provenance.source_id.clone());
-        assert_eq!(Some(prepared.source_ids[0].clone()), oldest);
-    }
 
-    #[tokio::test]
-    async fn persisted_sources_prepare_and_apply_while_live_appends_keep_request_identity() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut agent, recorder) = agent_with_recorder(root.path());
-        recorder
-            .lock()
-            .unwrap()
-            .record_user_message("Inspect source")
-            .unwrap();
-        recorder
-            .lock()
-            .unwrap()
-            .record_turn_started(TurnStartedEvent { turn_id: 1 })
-            .unwrap();
-        agent.turn.current_turn_start_index = Some(0);
-        agent
-            .append_history_item(HistoryItem::user("Inspect source"))
-            .unwrap();
-        append_live_group(&mut agent, &recorder, "first", 8);
-        assert!(
-            agent.active_protocol_frames().iter().all(|f| f
+        #[tokio::test]
+        async fn one_historian_work_covers_a_bounded_chunk_of_the_uncovered_region() {
+            use crate::request_builder::HistoryToolCall;
+            let root = tempfile::tempdir().unwrap();
+            let (mut agent, recorder) = agent_with_recorder(root.path());
+            {
+                let mut recorder = recorder.lock().unwrap();
+                recorder
+                    .record_turn_started(crate::agent::TurnStartedEvent { turn_id: 1 })
+                    .unwrap();
+                recorder.record_user_message("Read every source").unwrap();
+                for index in 0..40 {
+                    let call_id = format!("read-{index}");
+                    recorder
+                        .record_assistant_tool_call_batch(
+                            None,
+                            None,
+                            None,
+                            vec![HistoryToolCall {
+                                call_id: call_id.clone(),
+                                name: "fs__read".into(),
+                                arguments_json: r#"{"path":"source.rs"}"#.into(),
+                            }],
+                        )
+                        .unwrap();
+                    recorder
+                        .record_tool_call_finished(
+                            &call_id,
+                            "fs__read",
+                            true,
+                            crate::tool::ToolResult::ok(
+                                "fs__read",
+                                serde_json::json!({"content": "source detail ".repeat(3_000)}),
+                            ),
+                        )
+                        .unwrap();
+                }
+            }
+            agent.turn.current_turn_start_index = Some(0);
+            agent.reload_runtime_snapshot_from_provider().unwrap();
+            let region = persisted_history_snapshot(&agent)
+                .unwrap()
+                .active_protocol_frames()
+                .len();
+            let prepared = work(&agent, true, None).unwrap().unwrap();
+            assert!(!prepared.source_ids.is_empty());
+            assert!(
+                prepared.source_ids.len() < region,
+                "one call must not read the whole region: {} of {region}",
+                prepared.source_ids.len()
+            );
+            let oldest = persisted_history_snapshot(&agent)
+                .unwrap()
+                .active_protocol_frames()[0]
                 .source_provenance
                 .as_ref()
+                .and_then(|provenance| provenance.source_id.clone());
+            assert_eq!(Some(prepared.source_ids[0].clone()), oldest);
+        }
+
+        #[tokio::test]
+        async fn persisted_sources_prepare_and_apply_while_live_appends_keep_request_identity() {
+            let root = tempfile::tempdir().unwrap();
+            let (mut agent, recorder) = agent_with_recorder(root.path());
+            recorder
+                .lock()
                 .unwrap()
-                .source_id
-                .is_none())
-        );
-        let before = agent.runtime_snapshot.clone();
-        let frontier = agent.protocol_append_state.frontier_token();
-        let generation = agent.protocol_append_state.generation();
-        let prepared = work(&agent, true, None).unwrap().unwrap();
-        assert_eq!(
-            agent.runtime_snapshot, before,
-            "background preparation must not install a different runtime"
-        );
-        assert_eq!(agent.protocol_append_state.frontier_token(), frontier);
-        assert_eq!(agent.protocol_append_state.generation(), generation);
-        let canonical = persisted_history_snapshot(&agent).unwrap();
-        let expected: Vec<_> = canonical
-            .active_protocol_frames()
-            .iter()
-            .map(|f| {
-                f.source_provenance
+                .record_user_message("Inspect source")
+                .unwrap();
+            recorder
+                .lock()
+                .unwrap()
+                .record_turn_started(TurnStartedEvent { turn_id: 1 })
+                .unwrap();
+            agent.turn.current_turn_start_index = Some(0);
+            agent
+                .append_history_item(HistoryItem::user("Inspect source"))
+                .unwrap();
+            append_live_group(&mut agent, &recorder, "first", 8);
+            assert!(
+                agent.active_protocol_frames().iter().all(|f| f
+                    .source_provenance
                     .as_ref()
                     .unwrap()
                     .source_id
-                    .clone()
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(prepared.source_ids, expected);
-        assert_eq!(prepared.source_ids.len(), 10);
-        assert!(prepared.input.text.contains("unique body first-7"));
-        let mut publication = crate::historian::parse_publication(
+                    .is_none())
+            );
+            let before = agent.runtime_snapshot.clone();
+            let frontier = agent.protocol_append_state.frontier_token();
+            let generation = agent.protocol_append_state.generation();
+            let prepared = work(&agent, true, None).unwrap().unwrap();
+            assert_eq!(
+                agent.runtime_snapshot, before,
+                "background preparation must not install a different runtime"
+            );
+            assert_eq!(agent.protocol_append_state.frontier_token(), frontier);
+            assert_eq!(agent.protocol_append_state.generation(), generation);
+            let canonical = persisted_history_snapshot(&agent).unwrap();
+            let expected: Vec<_> = canonical
+                .active_protocol_frames()
+                .iter()
+                .map(|f| {
+                    f.source_provenance
+                        .as_ref()
+                        .unwrap()
+                        .source_id
+                        .clone()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(prepared.source_ids, expected);
+            assert_eq!(prepared.source_ids.len(), 10);
+            assert!(prepared.input.text.contains("unique body first-7"));
+            let mut publication = crate::historian::parse_publication(
             &prepared.id,
             &prepared.source_ids,
             "<episode><end>10</end><title>Inspected sources</title><importance>70</importance><detailed>Detailed result</detailed><compact>Result</compact><anchor>Sources</anchor></episode>",
         )
         .unwrap();
-        publication.project_path = Some(prepared.project_path);
-        recorder
-            .lock()
-            .unwrap()
-            .record_history_event(
-                TranscriptEvent::HistoryPublished(publication),
-                prepared.revision,
-            )
-            .unwrap();
-        append_live_group(&mut agent, &recorder, "second", 2);
-        let canonical = persisted_history_snapshot(&agent).unwrap();
-        let tail = canonical.active_protocol_frames()[10..].to_vec();
-        let application = pending_application(&agent, true).unwrap().unwrap();
-        assert_eq!(
-            application.first_kept_entry_id,
-            tail[0].source_provenance.as_ref().unwrap().source_id
-        );
-        recorder
-            .lock()
-            .unwrap()
-            .record_history_event(
-                TranscriptEvent::HistoryApplied(application),
-                prepared.revision,
-            )
-            .unwrap();
-        agent.reload_runtime_snapshot_from_provider().unwrap();
-        assert_eq!(
-            agent.active_history_items().last(),
-            Some(&tail.last().unwrap().item)
-        );
-        let second = work(&agent, true, None).unwrap().unwrap();
-        let publication = crate::historian::parse_publication(
+            publication.project_path = Some(prepared.project_path);
+            recorder
+                .lock()
+                .unwrap()
+                .record_history_event(
+                    TranscriptEvent::HistoryPublished(publication),
+                    prepared.revision,
+                )
+                .unwrap();
+            append_live_group(&mut agent, &recorder, "second", 2);
+            let canonical = persisted_history_snapshot(&agent).unwrap();
+            let tail = canonical.active_protocol_frames()[10..].to_vec();
+            let application = pending_application(&agent, true).unwrap().unwrap();
+            assert_eq!(
+                application.first_kept_entry_id,
+                tail[0].source_provenance.as_ref().unwrap().source_id
+            );
+            recorder
+                .lock()
+                .unwrap()
+                .record_history_event(
+                    TranscriptEvent::HistoryApplied(application),
+                    prepared.revision,
+                )
+                .unwrap();
+            agent.reload_runtime_snapshot_from_provider().unwrap();
+            assert_eq!(
+                agent.active_history_items().last(),
+                Some(&tail.last().unwrap().item)
+            );
+            let second = work(&agent, true, None).unwrap().unwrap();
+            let publication = crate::historian::parse_publication(
             &second.id,
             &second.source_ids,
             &format!(
@@ -1654,174 +1658,175 @@ max_output_tokens=4096
             ),
         )
         .unwrap();
-        recorder
-            .lock()
-            .unwrap()
-            .record_history_event(
-                TranscriptEvent::HistoryPublished(publication),
-                second.revision,
-            )
-            .unwrap();
-        let second_application = pending_application(&agent, true).unwrap().unwrap();
-        assert!(second_application.first_kept_entry_id.is_none());
-        recorder
-            .lock()
-            .unwrap()
-            .record_history_event(
-                TranscriptEvent::HistoryApplied(second_application),
-                second.revision,
-            )
-            .unwrap();
-        agent.reload_runtime_snapshot_from_provider().unwrap();
-        append_live_group(&mut agent, &recorder, "third", 1);
-        assert!(
-            agent
-                .active_protocol_frames()
-                .iter()
-                .filter(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
-                .all(|f| f.source_provenance.as_ref().unwrap().source_id.is_none())
-        );
-        let expected_tail: Vec<_> = persisted_history_snapshot(&agent)
-            .unwrap()
-            .active_protocol_frames()
-            .into_iter()
-            .filter(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
-            .map(|f| f.item)
-            .collect();
-        // Reapplying the frozen selection must retain the persisted raw boundary.
-        let application = pending_application(&agent, true).unwrap();
-        let observed = recorder.clone();
-        let mut events = move |event| {
-            std::future::ready(
-                crate::agent_event_journal::persist_agent_event(
-                    &mut observed.lock().unwrap(),
-                    &event,
-                )
-                .map(|_| ()),
-            )
-        };
-        if let Some(application) = application {
-            apply_history(&mut agent, application, false, &mut events)
-                .await
-                .unwrap();
-        }
-        let actual_tail: Vec<_> = agent
-            .active_history_items()
-            .into_iter()
-            .filter(|item| !matches!(item, HistoryItem::ContextSummary { .. }))
-            .collect();
-        assert_eq!(actual_tail, expected_tail);
-    }
-
-    #[test]
-    fn live_history_matches_the_journal_projection() {
-        // The live view may lead the journal, but it must never hold an item the
-        // journal cannot express: a restart projects this same history.
-        let root = tempfile::tempdir().unwrap();
-        let (mut agent, recorder) = agent_with_recorder(root.path());
-        recorder
-            .lock()
-            .unwrap()
-            .record_user_message("Inspect source")
-            .unwrap();
-        agent
-            .append_history_item(HistoryItem::user("Inspect source"))
-            .unwrap();
-        append_live_group(&mut agent, &recorder, "first", 2);
-
-        assert_eq!(
-            agent.active_history_items(),
-            persisted_history_snapshot(&agent)
+            recorder
+                .lock()
                 .unwrap()
-                .active_history_items()
-        );
-    }
-
-    #[test]
-    fn historian_sources_reject_a_different_persisted_scope() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut agent, _recorder) = agent_with_recorder(root.path());
-        let original = agent.runtime_snapshot.clone();
-        for field in ["session", "branch", "revision"] {
-            agent.runtime_snapshot = original.clone();
-            match field {
-                "session" => agent.runtime_snapshot.session_id = None,
-                "branch" => agent.runtime_snapshot.active_context.branch_id = "other".into(),
-                _ => agent.runtime_snapshot.context_scope_revision += 1,
-            }
-            let error = work(&agent, true, None)
-                .err()
-                .expect("scope mismatch")
-                .to_string();
-            assert!(error.contains("scope changed"), "{field}: {error}");
-            assert!(error.contains("active session="), "{error}");
-            assert!(error.contains("persisted session="), "{error}");
-        }
-    }
-
-    #[tokio::test]
-    async fn history_application_restates_workflow_state_after_compaction() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut agent, recorder) = agent_with_recorder(root.path());
-        recorder
-            .lock()
-            .unwrap()
-            .record_todo_snapshot(vec![
-                TodoItem {
-                    id: "open".into(),
-                    content: "finish parser".into(),
-                    status: TodoStatus::InProgress,
-                },
-                TodoItem {
-                    id: "done".into(),
-                    content: "scaffold module".into(),
-                    status: TodoStatus::Completed,
-                },
-            ])
-            .unwrap();
-        agent.reload_runtime_snapshot_from_provider().unwrap();
-
-        let application = HistoryApplication {
-            publication_ids: Vec::new(),
-            baseline: Vec::new(),
-            delta: Vec::new(),
-            baseline_fact_ids: Vec::new(),
-            delta_fact_ids: Vec::new(),
-            withdrawn_fact_ids: Vec::new(),
-            first_kept_entry_id: None,
-            legacy_summary: None,
-        };
-        let mut events = Vec::new();
-        {
-            let mut on_event = |event: AgentEvent| {
-                let result = crate::agent_event_journal::persist_agent_event(
-                    &mut recorder.lock().unwrap(),
-                    &event,
+                .record_history_event(
+                    TranscriptEvent::HistoryPublished(publication),
+                    second.revision,
                 )
-                .map(|_| ());
-                events.push(event);
-                std::future::ready(result)
-            };
-            apply_history(&mut agent, application, false, &mut on_event)
-                .await
                 .unwrap();
+            let second_application = pending_application(&agent, true).unwrap().unwrap();
+            assert!(second_application.first_kept_entry_id.is_none());
+            recorder
+                .lock()
+                .unwrap()
+                .record_history_event(
+                    TranscriptEvent::HistoryApplied(second_application),
+                    second.revision,
+                )
+                .unwrap();
+            agent.reload_runtime_snapshot_from_provider().unwrap();
+            append_live_group(&mut agent, &recorder, "third", 1);
+            assert!(
+                agent
+                    .active_protocol_frames()
+                    .iter()
+                    .filter(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
+                    .all(|f| f.source_provenance.as_ref().unwrap().source_id.is_none())
+            );
+            let expected_tail: Vec<_> = persisted_history_snapshot(&agent)
+                .unwrap()
+                .active_protocol_frames()
+                .into_iter()
+                .filter(|f| !matches!(f.item, HistoryItem::ContextSummary { .. }))
+                .map(|f| f.item)
+                .collect();
+            // Reapplying the frozen selection must retain the persisted raw boundary.
+            let application = pending_application(&agent, true).unwrap();
+            let observed = recorder.clone();
+            let mut events = move |event| {
+                std::future::ready(
+                    crate::agent_event_journal::persist_agent_event(
+                        &mut observed.lock().unwrap(),
+                        &event,
+                    )
+                    .map(|_| ()),
+                )
+            };
+            if let Some(application) = application {
+                apply_history(&mut agent, application, false, &mut events)
+                    .await
+                    .unwrap();
+            }
+            let actual_tail: Vec<_> = agent
+                .active_history_items()
+                .into_iter()
+                .filter(|item| !matches!(item, HistoryItem::ContextSummary { .. }))
+                .collect();
+            assert_eq!(actual_tail, expected_tail);
         }
 
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::InternalContinuation {
-                source: crate::transcript::InternalContinuationSource::CompactionReminder,
-                ..
-            })
-        ));
+        #[test]
+        fn live_history_matches_the_journal_projection() {
+            // The live view may lead the journal, but it must never hold an item the
+            // journal cannot express: a restart projects this same history.
+            let root = tempfile::tempdir().unwrap();
+            let (mut agent, recorder) = agent_with_recorder(root.path());
+            recorder
+                .lock()
+                .unwrap()
+                .record_user_message("Inspect source")
+                .unwrap();
+            agent
+                .append_history_item(HistoryItem::user("Inspect source"))
+                .unwrap();
+            append_live_group(&mut agent, &recorder, "first", 2);
 
-        // The reminder is durable, so a restart still shows the open work.
-        agent.reload_runtime_snapshot_from_provider().unwrap();
-        let history = agent.active_history_items();
-        let Some(HistoryItem::InternalContinuation { text }) = history.last() else {
-            panic!("expected the workflow reminder to survive the reload");
-        };
-        assert!(text.contains("finish parser"), "{text}");
-        assert!(!text.contains("scaffold module"), "{text}");
+            assert_eq!(
+                agent.active_history_items(),
+                persisted_history_snapshot(&agent)
+                    .unwrap()
+                    .active_history_items()
+            );
+        }
+
+        #[test]
+        fn historian_sources_reject_a_different_persisted_scope() {
+            let root = tempfile::tempdir().unwrap();
+            let (mut agent, _recorder) = agent_with_recorder(root.path());
+            let original = agent.runtime_snapshot.clone();
+            for field in ["session", "branch", "revision"] {
+                agent.runtime_snapshot = original.clone();
+                match field {
+                    "session" => agent.runtime_snapshot.session_id = None,
+                    "branch" => agent.runtime_snapshot.active_context.branch_id = "other".into(),
+                    _ => agent.runtime_snapshot.context_scope_revision += 1,
+                }
+                let error = work(&agent, true, None)
+                    .err()
+                    .expect("scope mismatch")
+                    .to_string();
+                assert!(error.contains("scope changed"), "{field}: {error}");
+                assert!(error.contains("active session="), "{error}");
+                assert!(error.contains("persisted session="), "{error}");
+            }
+        }
+
+        #[tokio::test]
+        async fn history_application_restates_workflow_state_after_compaction() {
+            let root = tempfile::tempdir().unwrap();
+            let (mut agent, recorder) = agent_with_recorder(root.path());
+            recorder
+                .lock()
+                .unwrap()
+                .record_todo_snapshot(vec![
+                    TodoItem {
+                        id: "open".into(),
+                        content: "finish parser".into(),
+                        status: TodoStatus::InProgress,
+                    },
+                    TodoItem {
+                        id: "done".into(),
+                        content: "scaffold module".into(),
+                        status: TodoStatus::Completed,
+                    },
+                ])
+                .unwrap();
+            agent.reload_runtime_snapshot_from_provider().unwrap();
+
+            let application = HistoryApplication {
+                publication_ids: Vec::new(),
+                baseline: Vec::new(),
+                delta: Vec::new(),
+                baseline_fact_ids: Vec::new(),
+                delta_fact_ids: Vec::new(),
+                withdrawn_fact_ids: Vec::new(),
+                first_kept_entry_id: None,
+                legacy_summary: None,
+            };
+            let mut events = Vec::new();
+            {
+                let mut on_event = |event: AgentEvent| {
+                    let result = crate::agent_event_journal::persist_agent_event(
+                        &mut recorder.lock().unwrap(),
+                        &event,
+                    )
+                    .map(|_| ());
+                    events.push(event);
+                    std::future::ready(result)
+                };
+                apply_history(&mut agent, application, false, &mut on_event)
+                    .await
+                    .unwrap();
+            }
+
+            assert!(matches!(
+                events.last(),
+                Some(AgentEvent::InternalContinuation {
+                    source: crate::transcript::InternalContinuationSource::CompactionReminder,
+                    ..
+                })
+            ));
+
+            // The reminder is durable, so a restart still shows the open work.
+            agent.reload_runtime_snapshot_from_provider().unwrap();
+            let history = agent.active_history_items();
+            let Some(HistoryItem::InternalContinuation { text }) = history.last() else {
+                panic!("expected the workflow reminder to survive the reload");
+            };
+            assert!(text.contains("finish parser"), "{text}");
+            assert!(!text.contains("scaffold module"), "{text}");
+        }
     }
 }

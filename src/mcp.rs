@@ -874,7 +874,7 @@ fn sanitize_tool_name_component(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
     use crate::tool::ToolRegistry;
     use std::fs;

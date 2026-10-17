@@ -152,8 +152,3 @@ fn sanitize_title(title: &str) -> String {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}

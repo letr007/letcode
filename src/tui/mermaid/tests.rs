@@ -13,6 +13,13 @@ mod tests {
     }
 
     fn assert_spans_exact(source: &str, rendered: &MermaidRender) {
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .flatten()
+                .any(|span| span.source.is_some())
+        );
         for line in &rendered.lines {
             for span in line {
                 if let Some(MermaidSourceSpan { start, end }) = span.source {

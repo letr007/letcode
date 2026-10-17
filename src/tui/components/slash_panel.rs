@@ -269,6 +269,10 @@ mod tests {
     #[test]
     fn completion_panel_is_hidden_in_child_read_only_view() {
         let mut state = TuiState::default();
+        state.set_input("/fa");
+        let parent = draw_panel(&state, 72, 6);
+        assert!(parent.contains("/fast"), "{parent}");
+
         state.replace_child_timeline_from_records(
             &[],
             "parent-session",

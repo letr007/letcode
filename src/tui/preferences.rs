@@ -166,101 +166,6 @@ mod tests {
     }
 
     #[test]
-    fn preferences_round_trip() {
-        let base = std::env::temp_dir().join(format!(
-            "letcode-tui-preferences-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-
-        let prefs = TuiPreferences {
-            tool_output_expanded: true,
-            transcript_scrollbar_visible: false,
-            sidebar_hidden: true,
-            sidebar_forced_open: false,
-            theme: "forest".into(),
-            thoughts_display: ThoughtsDisplayMode::Titles,
-            tools_display: ToolsDisplayMode::Compact,
-            language: Some("zh-CN".into()),
-            fake_installation_id: Some("fake-installation".into()),
-            fast_mode: true,
-        };
-        TuiPreferences::update_in_dir(&base, |current| *current = prefs.clone())
-            .expect("save preferences");
-
-        let loaded = TuiPreferences::load_from_dir(&base);
-        assert_eq!(loaded, prefs);
-    }
-
-    #[test]
-    fn replacement_failures_preserve_unique_sources() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = preferences_path(dir.path());
-        fs::create_dir(&path).unwrap();
-        let mut failed_sources = std::collections::BTreeMap::new();
-
-        for theme in ["forest", "sunset"] {
-            TuiPreferences::update_in_dir(dir.path(), |prefs| prefs.theme = theme.into())
-                .unwrap_err();
-            let sources: std::collections::BTreeMap<_, _> = fs::read_dir(dir.path())
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
-                .map(|source| {
-                    let bytes = fs::read(&source).unwrap();
-                    (source, bytes)
-                })
-                .collect();
-            assert_eq!(sources.len(), failed_sources.len() + 1);
-            for (source, bytes) in &failed_sources {
-                assert_eq!(sources.get(source), Some(bytes));
-            }
-            let expected = serde_json::to_vec_pretty(&TuiPreferences {
-                theme: theme.into(),
-                ..TuiPreferences::default()
-            })
-            .unwrap();
-            assert!(sources.values().any(|bytes| bytes == &expected));
-            failed_sources = sources;
-        }
-
-        fs::remove_dir(&path).unwrap();
-        TuiPreferences::update_in_dir(dir.path(), |prefs| prefs.theme = "forest".into()).unwrap();
-        assert_eq!(TuiPreferences::load_from_dir(dir.path()).theme, "forest");
-        for (source, bytes) in &failed_sources {
-            assert_eq!(&fs::read(source).unwrap(), bytes);
-        }
-        assert_eq!(
-            fs::read_dir(dir.path())
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
-                .count(),
-            failed_sources.len()
-        );
-    }
-
-    #[test]
-    fn malformed_preferences_fall_back_to_default() {
-        let base = std::env::temp_dir().join(format!(
-            "letcode-tui-preferences-bad-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&base).expect("create prefs dir");
-        fs::write(preferences_path(&base), "{not valid json").expect("write malformed prefs");
-
-        assert_eq!(
-            TuiPreferences::load_from_dir(&base),
-            TuiPreferences::default()
-        );
-    }
-
-    #[test]
     fn invalid_persisted_language_falls_back_to_system_locale() {
         let prefs: TuiPreferences = serde_json::from_str(
             r#"{"tool_output_expanded":false,"transcript_scrollbar_visible":true,"theme":"dark","language":"fr"}"#,
@@ -311,35 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn field_updates_preserve_other_process_changes() {
-        let base = std::env::temp_dir().join(format!(
-            "letcode-tui-preferences-update-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                TuiPreferences::update_in_dir(&base, |prefs| {
-                    prefs.theme = "forest".into();
-                })
-                .expect("write theme");
-            });
-            scope.spawn(|| {
-                TuiPreferences::update_in_dir(&base, |prefs| {
-                    prefs.language = Some("zh-CN".into());
-                })
-                .expect("write language");
-            });
-        });
-
-        let loaded = TuiPreferences::load_from_dir(&base);
-        assert_eq!(loaded.theme, "forest");
-        assert_eq!(loaded.language.as_deref(), Some("zh-CN"));
-    }
-
-    #[test]
     fn custom_theme_id_round_trips() {
         let prefs = TuiPreferences {
             tool_output_expanded: false,
@@ -356,5 +232,134 @@ mod tests {
         let json = serde_json::to_string(&prefs).expect("serialize");
         let loaded: TuiPreferences = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(loaded.theme, "sunset");
+    }
+
+    mod integration_tests {
+        use super::*;
+
+        #[test]
+        fn preferences_round_trip() {
+            let base = std::env::temp_dir().join(format!(
+                "letcode-tui-preferences-test-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time ok")
+                    .as_nanos()
+            ));
+
+            let prefs = TuiPreferences {
+                tool_output_expanded: true,
+                transcript_scrollbar_visible: false,
+                sidebar_hidden: true,
+                sidebar_forced_open: false,
+                theme: "forest".into(),
+                thoughts_display: ThoughtsDisplayMode::Titles,
+                tools_display: ToolsDisplayMode::Compact,
+                language: Some("zh-CN".into()),
+                fake_installation_id: Some("fake-installation".into()),
+                fast_mode: true,
+            };
+            TuiPreferences::update_in_dir(&base, |current| *current = prefs.clone())
+                .expect("save preferences");
+
+            let loaded = TuiPreferences::load_from_dir(&base);
+            assert_eq!(loaded, prefs);
+        }
+
+        #[test]
+        fn replacement_failures_preserve_unique_sources() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = preferences_path(dir.path());
+            fs::create_dir(&path).unwrap();
+            let mut failed_sources = std::collections::BTreeMap::new();
+
+            for theme in ["forest", "sunset"] {
+                TuiPreferences::update_in_dir(dir.path(), |prefs| prefs.theme = theme.into())
+                    .unwrap_err();
+                let sources: std::collections::BTreeMap<_, _> = fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+                    .map(|source| {
+                        let bytes = fs::read(&source).unwrap();
+                        (source, bytes)
+                    })
+                    .collect();
+                assert_eq!(sources.len(), failed_sources.len() + 1);
+                for (source, bytes) in &failed_sources {
+                    assert_eq!(sources.get(source), Some(bytes));
+                }
+                let expected = serde_json::to_vec_pretty(&TuiPreferences {
+                    theme: theme.into(),
+                    ..TuiPreferences::default()
+                })
+                .unwrap();
+                assert!(sources.values().any(|bytes| bytes == &expected));
+                failed_sources = sources;
+            }
+
+            fs::remove_dir(&path).unwrap();
+            TuiPreferences::update_in_dir(dir.path(), |prefs| prefs.theme = "forest".into())
+                .unwrap();
+            assert_eq!(TuiPreferences::load_from_dir(dir.path()).theme, "forest");
+            for (source, bytes) in &failed_sources {
+                assert_eq!(&fs::read(source).unwrap(), bytes);
+            }
+            assert_eq!(
+                fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|source| source.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+                    .count(),
+                failed_sources.len()
+            );
+        }
+
+        #[test]
+        fn malformed_preferences_fall_back_to_default() {
+            let base = std::env::temp_dir().join(format!(
+                "letcode-tui-preferences-bad-test-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time ok")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).expect("create prefs dir");
+            fs::write(preferences_path(&base), "{not valid json").expect("write malformed prefs");
+
+            assert_eq!(
+                TuiPreferences::load_from_dir(&base),
+                TuiPreferences::default()
+            );
+        }
+
+        #[test]
+        fn field_updates_preserve_other_process_changes() {
+            let base = std::env::temp_dir().join(format!(
+                "letcode-tui-preferences-update-test-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time ok")
+                    .as_nanos()
+            ));
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    TuiPreferences::update_in_dir(&base, |prefs| {
+                        prefs.theme = "forest".into();
+                    })
+                    .expect("write theme");
+                });
+                scope.spawn(|| {
+                    TuiPreferences::update_in_dir(&base, |prefs| {
+                        prefs.language = Some("zh-CN".into());
+                    })
+                    .expect("write language");
+                });
+            });
+
+            let loaded = TuiPreferences::load_from_dir(&base);
+            assert_eq!(loaded.theme, "forest");
+            assert_eq!(loaded.language.as_deref(), Some("zh-CN"));
+        }
     }
 }

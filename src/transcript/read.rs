@@ -80,8 +80,7 @@ mod tests {
     use crate::transcript::{
         JOURNAL_SCHEMA_VERSION, JournalRecordEnvelope, TranscriptAssistantTurn, TranscriptEvent,
         TranscriptRecord, TranscriptRecorder, journal_scope_for, read_records_allow_partial_tail,
-        read_resumable_records_with_fingerprint, record_is_session_content,
-        record_is_session_title, record_is_user_message, serialize_journal_record,
+        read_resumable_records_with_fingerprint, serialize_journal_record,
     };
 
     fn journal_line(session_id: &str, sequence: u64, event: TranscriptEvent) -> String {
@@ -222,161 +221,81 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Times the shaped read against the full read, and asserts they agree.
-    #[test]
-    #[ignore = "measurement harness: set LETCODE_BENCH_JOURNALS to colon-separated paths"]
-    fn ab_measure() {
-        use std::time::Instant;
+    mod integration_tests {
+        use super::*;
 
-        let list = std::env::var("LETCODE_BENCH_JOURNALS").expect("LETCODE_BENCH_JOURNALS");
-        let subjects: Vec<(&str, Box<dyn Fn(&TranscriptRecord) -> bool>)> = vec![
-            ("session content", Box::new(record_is_session_content)),
-            (
-                "prompt or title",
-                Box::new(|record: &TranscriptRecord| {
-                    record_is_user_message(record) || record_is_session_title(record)
-                }),
-            ),
-        ];
-        let median = |mut times: Vec<std::time::Duration>| {
-            times.sort();
-            times[times.len() / 2].as_secs_f64() * 1000.0
-        };
-
-        for raw in list.split(':') {
-            let path = PathBuf::from(raw);
-            if !path.is_file() {
-                println!("skip {raw}: not a file");
-                continue;
-            }
-            let size = fs::metadata(&path).expect("stat the journal").len();
-            let warm = read_records(&path).expect("warm read");
-            println!(
-                "\n### {} — {:.1} MB, {} records",
-                path.file_name().unwrap_or_default().to_string_lossy(),
-                size as f64 / 1048576.0,
-                warm.len()
+        /// A torn assistant tail is tolerated only by dropping the record entirely.
+        #[test]
+        fn incomplete_assistant_tail_is_rejected_strictly_and_dropped_by_the_live_reader() {
+            let dir = temp_dir();
+            fs::create_dir_all(&dir).expect("create temp dir");
+            let path = dir.join("s.jsonl");
+            let torn = assistant_line("s", 3, "unfinished");
+            let content = format!(
+                "{}\n{}\n{}",
+                user_line("s", 1),
+                user_line("s", 2),
+                &torn[..torn.len() - 2]
             );
-            drop(warm);
+            fs::write(&path, content).expect("write the journal");
 
-            for (name, predicate) in &subjects {
-                let mut full = Vec::new();
-                let mut shaped = Vec::new();
-                let mut answers = (false, false);
-                for round in 0..3 {
-                    for shaped_first in [round % 2 == 0, round % 2 != 0] {
-                        if shaped_first {
-                            let start = Instant::now();
-                            answers.1 = any_record_where(&path, |record| predicate(record))
-                                .expect("shaped");
-                            shaped.push(start.elapsed());
-                        } else {
-                            let start = Instant::now();
-                            answers.0 = read_records(&path).expect("full").iter().any(predicate);
-                            full.push(start.elapsed());
-                        }
-                    }
-                }
-                assert_eq!(answers.0, answers.1, "{name}: the two reads disagree");
-                let (full, shaped) = (median(full), median(shaped));
-                println!(
-                    "  {name:<16} full {full:8.1} ms   shaped {shaped:8.2} ms   {:>8.0}x",
-                    full / shaped.max(f64::MIN_POSITIVE)
-                );
-            }
-
-            // A parent journal read, against the stats that decide whether to do one.
-            let (mut full, mut stats) = (Vec::new(), Vec::new());
-            for _ in 0..3 {
-                let start = Instant::now();
-                let _ = read_records(&path).expect("full read");
-                full.push(start.elapsed());
-                let start = Instant::now();
-                for _ in 0..2 {
-                    let metadata = fs::metadata(&path).expect("stat the journal");
-                    let _ = (metadata.len(), metadata.modified());
-                }
-                stats.push(start.elapsed());
-            }
-            let (full, stats) = (median(full), median(stats));
-            println!(
-                "  {:<16} full {full:8.1} ms   stats  {stats:8.3} ms   {:>8.0}x",
-                "poll gate",
-                full / stats.max(f64::MIN_POSITIVE)
+            assert!(
+                read_records(&path).is_err(),
+                "a strict read reports the torn assistant tail"
             );
+            let live =
+                read_records_allow_partial_tail(&path).expect("live read drops the torn tail");
+            assert_eq!(
+                live.len(),
+                2,
+                "the incomplete message contributes no record"
+            );
+            assert!(
+                !live
+                    .iter()
+                    .any(|record| matches!(record.event, TranscriptEvent::AssistantTurn(_))),
+                "the dropped tail is not projected as an assistant turn"
+            );
+            let _ = fs::remove_dir_all(dir);
         }
-    }
 
-    /// A torn assistant tail is tolerated only by dropping the record entirely.
-    #[test]
-    fn incomplete_assistant_tail_is_rejected_strictly_and_dropped_by_the_live_reader() {
-        let dir = temp_dir();
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("s.jsonl");
-        let torn = assistant_line("s", 3, "unfinished");
-        let content = format!(
-            "{}\n{}\n{}",
-            user_line("s", 1),
-            user_line("s", 2),
-            &torn[..torn.len() - 2]
-        );
-        fs::write(&path, content).expect("write the journal");
+        /// A fully written record without its delimiter reads as finished; only append-open refuses it.
+        #[test]
+        fn undelimited_assistant_tail_is_read_but_blocks_resume_append() {
+            let dir = temp_dir();
+            fs::create_dir_all(&dir).expect("create temp dir");
+            let path = dir.join("s.jsonl");
+            let content = format!(
+                "{}\n{}",
+                user_line("s", 1),
+                assistant_line("s", 2, "answer")
+            );
+            fs::write(&path, content).expect("write the journal");
 
-        assert!(
-            read_records(&path).is_err(),
-            "a strict read reports the torn assistant tail"
-        );
-        let live = read_records_allow_partial_tail(&path).expect("live read drops the torn tail");
-        assert_eq!(
-            live.len(),
-            2,
-            "the incomplete message contributes no record"
-        );
-        assert!(
-            !live
-                .iter()
-                .any(|record| matches!(record.event, TranscriptEvent::AssistantTurn(_))),
-            "the dropped tail is not projected as an assistant turn"
-        );
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    /// A fully written record without its delimiter reads as finished; only append-open refuses it.
-    #[test]
-    fn undelimited_assistant_tail_is_read_but_blocks_resume_append() {
-        let dir = temp_dir();
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("s.jsonl");
-        let content = format!(
-            "{}\n{}",
-            user_line("s", 1),
-            assistant_line("s", 2, "answer")
-        );
-        fs::write(&path, content).expect("write the journal");
-
-        assert_eq!(
-            read_records(&path).expect("strict read").len(),
-            2,
-            "a complete record without its delimiter is still a record"
-        );
-        assert_eq!(
-            read_records_allow_partial_tail(&path)
-                .expect("live read")
-                .len(),
-            2
-        );
-        assert!(
-            read_resumable_records_with_fingerprint(&path).is_ok(),
-            "the resume load sees the complete record"
-        );
-        let error = match TranscriptRecorder::open_existing(&dir, "s") {
-            Ok(_) => panic!("append-open requires the delimiter"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("append delimiter"),
-            "unexpected error: {error}"
-        );
-        let _ = fs::remove_dir_all(dir);
+            assert_eq!(
+                read_records(&path).expect("strict read").len(),
+                2,
+                "a complete record without its delimiter is still a record"
+            );
+            assert_eq!(
+                read_records_allow_partial_tail(&path)
+                    .expect("live read")
+                    .len(),
+                2
+            );
+            assert!(
+                read_resumable_records_with_fingerprint(&path).is_ok(),
+                "the resume load sees the complete record"
+            );
+            let error = match TranscriptRecorder::open_existing(&dir, "s") {
+                Ok(_) => panic!("append-open requires the delimiter"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("append delimiter"),
+                "unexpected error: {error}"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }

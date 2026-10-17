@@ -2333,7 +2333,7 @@ where
 }
 
 #[cfg(test)]
-mod recovery_tests {
+mod integration_tests {
     use super::*;
     use crate::model_runtime::runtime::TurnDriver;
     use crate::model_runtime::{ContentPart, MessageRole, ProtocolRegistry, RuntimeConfig};

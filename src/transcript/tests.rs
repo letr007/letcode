@@ -117,23 +117,31 @@ fn journal_transaction_lines(
     lines
 }
 
-#[test]
-fn journal_v2_round_trips_and_writes_envelope() {
-    let base_dir = journal_test_dir("v2-roundtrip");
-    let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
-    recorder.record_user_message("hello").unwrap();
-    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
-    let raw = fs::read_to_string(&path).unwrap();
-    assert!(raw.contains("\"schema_version\":2"));
-    assert!(raw.contains("\"scope\":\"global\""));
-    assert!(raw.contains("\"base_revision\":0"));
-    assert!(raw.contains("\"resulting_revision\":1"));
-    let records = read_records(path).unwrap();
-    assert_eq!(records.len(), 1);
-    assert!(matches!(
-        records[0].event,
-        TranscriptEvent::UserMessage { .. }
-    ));
+mod journal_writes {
+    use super::*;
+
+    mod integration_tests {
+        use super::*;
+
+        #[test]
+        fn journal_v2_round_trips_and_writes_envelope() {
+            let base_dir = journal_test_dir("v2-roundtrip");
+            let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
+            recorder.record_user_message("hello").unwrap();
+            let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+            let raw = fs::read_to_string(&path).unwrap();
+            assert!(raw.contains("\"schema_version\":2"));
+            assert!(raw.contains("\"scope\":\"global\""));
+            assert!(raw.contains("\"base_revision\":0"));
+            assert!(raw.contains("\"resulting_revision\":1"));
+            let records = read_records(path).unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(
+                records[0].event,
+                TranscriptEvent::UserMessage { .. }
+            ));
+        }
+    }
 }
 
 #[test]
@@ -168,338 +176,351 @@ fn journal_reader_accepts_legacy_and_legacy_to_v1_records() {
     );
 }
 
-#[test]
-fn empty_transcript_is_not_resumable_or_appendable() {
-    let base_dir = journal_test_dir("empty-not-resumable");
-    fs::create_dir_all(&base_dir).unwrap();
+mod resume {
+    use super::*;
 
-    for (session_id, content) in [("empty", ""), ("whitespace", " \n\t\n")] {
-        let path = base_dir.join(format!("{session_id}.jsonl"));
-        fs::write(&path, content).unwrap();
+    mod integration_tests {
+        use super::*;
 
-        let error = read_resumable_records_with_fingerprint(&path)
-            .expect_err("a resumable transcript must contain a journal record");
-        assert!(error.to_string().contains("no resumable journal records"));
-        let error = match TranscriptRecorder::open_existing(&base_dir, session_id) {
-            Ok(_) => panic!("an empty transcript must not accept append"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("no resumable journal records"));
-    }
-}
+        #[test]
+        fn empty_transcript_is_not_resumable_or_appendable() {
+            let base_dir = journal_test_dir("empty-not-resumable");
+            fs::create_dir_all(&base_dir).unwrap();
 
-#[test]
-fn partial_tail_repair_open_allows_only_the_empty_recovery_frontier() {
-    let base_dir = journal_test_dir("partial-tail-recovery-open");
-    fs::create_dir_all(&base_dir).unwrap();
-    let path = base_dir.join("recoverable.jsonl");
-    fs::write(&path, "{\"partial\":").unwrap();
-    repair_partial_tail(&path).expect("repair first partial record to an empty frontier");
+            for (session_id, content) in [("empty", ""), ("whitespace", " \n\t\n")] {
+                let path = base_dir.join(format!("{session_id}.jsonl"));
+                fs::write(&path, content).unwrap();
 
-    let mut recorder = TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "recoverable")
-        .expect("the bounded partial-write recovery path may reopen an empty frontier");
-    recorder
-        .record_session_title("recovered")
-        .expect("write first complete v2 record");
-    let raw = fs::read_to_string(&path).unwrap();
-    assert!(raw.contains("\"schema_version\":2"));
+                let error = read_resumable_records_with_fingerprint(&path)
+                    .expect_err("a resumable transcript must contain a journal record");
+                assert!(error.to_string().contains("no resumable journal records"));
+                let error = match TranscriptRecorder::open_existing(&base_dir, session_id) {
+                    Ok(_) => panic!("an empty transcript must not accept append"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("no resumable journal records"));
+            }
+        }
 
-    let complete_path = base_dir.join("complete.jsonl");
-    let mut complete = JournalRecordEnvelope {
-        schema_version: JOURNAL_SCHEMA_VERSION,
-        ..v1_record(1)
-    };
-    complete.record.session_id = "complete".into();
-    complete.event_id = "complete:1".into();
-    fs::write(&complete_path, serde_json::to_string(&complete).unwrap()).unwrap();
-    repair_partial_tail(&complete_path).expect("restore the missing append delimiter");
-    assert!(fs::read_to_string(&complete_path).unwrap().ends_with('\n'));
-    let mut recorder = TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "complete")
-        .expect("reopen the delimiter-repaired transcript");
-    recorder
-        .record_session_title("next")
-        .expect("append a separate v2 record");
-    assert_eq!(read_records(&complete_path).unwrap().len(), 2);
+        #[test]
+        fn partial_tail_repair_open_allows_only_the_empty_recovery_frontier() {
+            let base_dir = journal_test_dir("partial-tail-recovery-open");
+            fs::create_dir_all(&base_dir).unwrap();
+            let path = base_dir.join("recoverable.jsonl");
+            fs::write(&path, "{\"partial\":").unwrap();
+            repair_partial_tail(&path).expect("repair first partial record to an empty frontier");
 
-    let v1_path = base_dir.join("legacy.jsonl");
-    let mut legacy = v1_record(1);
-    legacy.record.session_id = "legacy".into();
-    legacy.event_id = "legacy:1".into();
-    fs::write(
-        &v1_path,
-        format!("{}\n", serde_json::to_string(&legacy).unwrap()),
-    )
-    .unwrap();
-    let mut recorder = TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "legacy")
-        .expect("the repair path should accept a complete v1 frontier");
-    recorder
-        .record_session_title("translated")
-        .expect("append a v2 record after the v1 frontier");
-    let raw = fs::read_to_string(&v1_path).unwrap();
-    assert!(raw.lines().next().unwrap().contains("\"schema_version\":1"));
-    assert!(raw.lines().last().unwrap().contains("\"schema_version\":2"));
-}
+            let mut recorder =
+                TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "recoverable")
+                    .expect("the bounded partial-write recovery path may reopen an empty frontier");
+            recorder
+                .record_session_title("recovered")
+                .expect("write first complete v2 record");
+            let raw = fs::read_to_string(&path).unwrap();
+            assert!(raw.contains("\"schema_version\":2"));
 
-#[test]
-fn v1_transcript_is_discoverable_resumable_and_appends_v2() {
-    let base_dir = journal_test_dir("v1-resume-translation");
-    fs::create_dir_all(&base_dir).unwrap();
-    let path = base_dir.join("legacy-session.jsonl");
-    let mut record = v1_record(1);
-    record.record.session_id = "legacy-session".into();
-    record.event_id = "legacy-session:1".into();
-    record.record.event = TranscriptEvent::AssistantMessage {
-        content: "legacy answer".into(),
-    };
-    let original = format!("{}\n", serde_json::to_string(&record).unwrap());
-    fs::write(&path, &original).unwrap();
+            let complete_path = base_dir.join("complete.jsonl");
+            let mut complete = JournalRecordEnvelope {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                ..v1_record(1)
+            };
+            complete.record.session_id = "complete".into();
+            complete.event_id = "complete:1".into();
+            fs::write(&complete_path, serde_json::to_string(&complete).unwrap()).unwrap();
+            repair_partial_tail(&complete_path).expect("restore the missing append delimiter");
+            assert!(fs::read_to_string(&complete_path).unwrap().ends_with('\n'));
+            let mut recorder =
+                TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "complete")
+                    .expect("reopen the delimiter-repaired transcript");
+            recorder
+                .record_session_title("next")
+                .expect("append a separate v2 record");
+            assert_eq!(read_records(&complete_path).unwrap().len(), 2);
 
-    let discovery = read_records(&path).unwrap();
-    assert!(matches!(
-        discovery[0].event,
-        TranscriptEvent::AssistantMessage { .. }
-    ));
-    let summaries = list_sessions(&base_dir).expect("legacy session remains discoverable");
-    assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0].session_id, "legacy-session");
-    assert_eq!(
-        summaries[0].last_assistant_summary.as_deref(),
-        Some("legacy answer")
-    );
+            let v1_path = base_dir.join("legacy.jsonl");
+            let mut legacy = v1_record(1);
+            legacy.record.session_id = "legacy".into();
+            legacy.event_id = "legacy:1".into();
+            fs::write(
+                &v1_path,
+                format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+            )
+            .unwrap();
+            let mut recorder =
+                TranscriptRecorder::open_after_partial_tail_repair(&base_dir, "legacy")
+                    .expect("the repair path should accept a complete v1 frontier");
+            recorder
+                .record_session_title("translated")
+                .expect("append a v2 record after the v1 frontier");
+            let raw = fs::read_to_string(&v1_path).unwrap();
+            assert!(raw.lines().next().unwrap().contains("\"schema_version\":1"));
+            assert!(raw.lines().last().unwrap().contains("\"schema_version\":2"));
+        }
 
-    let records = read_resumable_records_with_fingerprint(&path)
-        .expect("v1 transcript should translate for resume")
-        .0;
-    assert!(matches!(
-        &records[0].event,
-        TranscriptEvent::AssistantTurn(turn)
-            if turn.text.as_deref() == Some("legacy answer")
-                && turn.calls.is_empty()
-    ));
+        #[test]
+        fn v1_transcript_is_discoverable_resumable_and_appends_v2() {
+            let base_dir = journal_test_dir("v1-resume-translation");
+            fs::create_dir_all(&base_dir).unwrap();
+            let path = base_dir.join("legacy-session.jsonl");
+            let mut record = v1_record(1);
+            record.record.session_id = "legacy-session".into();
+            record.event_id = "legacy-session:1".into();
+            record.record.event = TranscriptEvent::AssistantMessage {
+                content: "legacy answer".into(),
+            };
+            let original = format!("{}\n", serde_json::to_string(&record).unwrap());
+            fs::write(&path, &original).unwrap();
 
-    let mut recorder = TranscriptRecorder::open_existing(&base_dir, "legacy-session")
-        .expect("v1 transcript should accept v2 append");
-    recorder
-        .record_assistant_message("continued")
-        .expect("append v2 assistant turn");
-    let raw = fs::read_to_string(&path).unwrap();
-    assert!(raw.starts_with(&original));
-    let lines = raw.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2);
-    assert!(lines[0].contains("\"schema_version\":1"));
-    assert!(lines[1].contains("\"schema_version\":2"));
-    assert!(lines[1].contains("\"kind\":\"assistant_turn\""));
+            let discovery = read_records(&path).unwrap();
+            assert!(matches!(
+                discovery[0].event,
+                TranscriptEvent::AssistantMessage { .. }
+            ));
+            let summaries = list_sessions(&base_dir).expect("legacy session remains discoverable");
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].session_id, "legacy-session");
+            assert_eq!(
+                summaries[0].last_assistant_summary.as_deref(),
+                Some("legacy answer")
+            );
 
-    drop(recorder);
-    let prepared = crate::session::prepare_resume_package(&base_dir, "legacy-session")
-        .expect("mixed v1/v2 transcript should prepare resume");
-    assert_eq!(prepared.records.len(), 2);
-    assert!(
-        prepared
-            .records
-            .iter()
-            .all(|record| matches!(record.event, TranscriptEvent::AssistantTurn(_)))
-    );
-}
+            let records = read_resumable_records_with_fingerprint(&path)
+                .expect("v1 transcript should translate for resume")
+                .0;
+            assert!(matches!(
+                &records[0].event,
+                TranscriptEvent::AssistantTurn(turn)
+                    if turn.text.as_deref() == Some("legacy answer")
+                        && turn.calls.is_empty()
+            ));
 
-#[test]
-fn v1_transaction_translates_and_allows_v2_append() {
-    let base_dir = journal_test_dir("v1-transaction-translation");
-    fs::create_dir_all(&base_dir).unwrap();
-    let path = base_dir.join("legacy-transaction.jsonl");
-    let transaction_id = "legacy-transaction:1:100".to_string();
-    let mut first = v1_record(1);
-    first.record.session_id = "legacy-transaction".into();
-    first.event_id = "legacy-transaction:1".into();
-    first.transaction_id = Some(transaction_id.clone());
-    first.transaction_index = Some(0);
-    first.transaction_count = Some(2);
-    first.record.event = TranscriptEvent::AssistantMessage {
-        content: "legacy answer".into(),
-    };
-    let mut second = v1_record(2);
-    second.record.session_id = "legacy-transaction".into();
-    second.event_id = "legacy-transaction:2".into();
-    second.transaction_id = Some(transaction_id);
-    second.transaction_index = Some(1);
-    second.transaction_count = Some(2);
-    second.record.event = TranscriptEvent::SessionTitle {
-        title: "legacy title".into(),
-    };
-    let original = journal_transaction_lines(vec![first, second], LEGACY_JOURNAL_SCHEMA_VERSION)
-        .join("\n")
-        + "\n";
-    fs::write(&path, &original).unwrap();
+            let mut recorder = TranscriptRecorder::open_existing(&base_dir, "legacy-session")
+                .expect("v1 transcript should accept v2 append");
+            recorder
+                .record_assistant_message("continued")
+                .expect("append v2 assistant turn");
+            let raw = fs::read_to_string(&path).unwrap();
+            assert!(raw.starts_with(&original));
+            let lines = raw.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 2);
+            assert!(lines[0].contains("\"schema_version\":1"));
+            assert!(lines[1].contains("\"schema_version\":2"));
+            assert!(lines[1].contains("\"kind\":\"assistant_turn\""));
 
-    let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
-    assert!(matches!(
-        records[0].event,
-        TranscriptEvent::AssistantTurn(_)
-    ));
-    assert!(matches!(
-        records[1].event,
-        TranscriptEvent::SessionTitle { .. }
-    ));
+            drop(recorder);
+            let prepared = crate::session::prepare_resume_package(&base_dir, "legacy-session")
+                .expect("mixed v1/v2 transcript should prepare resume");
+            assert_eq!(prepared.records.len(), 2);
+            assert!(
+                prepared
+                    .records
+                    .iter()
+                    .all(|record| matches!(record.event, TranscriptEvent::AssistantTurn(_)))
+            );
+        }
 
-    let mut recorder = TranscriptRecorder::open_existing(&base_dir, "legacy-transaction").unwrap();
-    recorder.record_session_title("continued").unwrap();
-    let raw = fs::read_to_string(&path).unwrap();
-    assert!(raw.starts_with(&original));
-    assert!(raw.lines().last().unwrap().contains("\"schema_version\":2"));
-}
+        #[test]
+        fn v1_transaction_translates_and_allows_v2_append() {
+            let base_dir = journal_test_dir("v1-transaction-translation");
+            fs::create_dir_all(&base_dir).unwrap();
+            let path = base_dir.join("legacy-transaction.jsonl");
+            let transaction_id = "legacy-transaction:1:100".to_string();
+            let mut first = v1_record(1);
+            first.record.session_id = "legacy-transaction".into();
+            first.event_id = "legacy-transaction:1".into();
+            first.transaction_id = Some(transaction_id.clone());
+            first.transaction_index = Some(0);
+            first.transaction_count = Some(2);
+            first.record.event = TranscriptEvent::AssistantMessage {
+                content: "legacy answer".into(),
+            };
+            let mut second = v1_record(2);
+            second.record.session_id = "legacy-transaction".into();
+            second.event_id = "legacy-transaction:2".into();
+            second.transaction_id = Some(transaction_id);
+            second.transaction_index = Some(1);
+            second.transaction_count = Some(2);
+            second.record.event = TranscriptEvent::SessionTitle {
+                title: "legacy title".into(),
+            };
+            let original =
+                journal_transaction_lines(vec![first, second], LEGACY_JOURNAL_SCHEMA_VERSION)
+                    .join("\n")
+                    + "\n";
+            fs::write(&path, &original).unwrap();
 
-#[test]
-fn unenveloped_legacy_transcript_remains_discovery_only() {
-    let base_dir = journal_test_dir("unenveloped-discovery-only");
-    fs::create_dir_all(&base_dir).unwrap();
-    let path = base_dir.join("legacy.jsonl");
-    fs::write(
-        &path,
-        format!("{}\n", serde_json::to_string(&legacy_record(1)).unwrap()),
-    )
-    .unwrap();
+            let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
+            assert!(matches!(
+                records[0].event,
+                TranscriptEvent::AssistantTurn(_)
+            ));
+            assert!(matches!(
+                records[1].event,
+                TranscriptEvent::SessionTitle { .. }
+            ));
 
-    assert_eq!(read_records(&path).unwrap().len(), 1);
-    let error = read_resumable_records_with_fingerprint(&path)
-        .expect_err("unenveloped legacy transcript must remain discovery-only");
-    assert!(error.to_string().contains("unenveloped legacy record"));
-}
+            let mut recorder =
+                TranscriptRecorder::open_existing(&base_dir, "legacy-transaction").unwrap();
+            recorder.record_session_title("continued").unwrap();
+            let raw = fs::read_to_string(&path).unwrap();
+            assert!(raw.starts_with(&original));
+            assert!(raw.lines().last().unwrap().contains("\"schema_version\":2"));
+        }
 
-#[test]
-fn v2_assistant_turn_round_trips_typed_replay_state() {
-    let base_dir = journal_test_dir("v2-assistant-turn");
-    let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
-    let reasoning_wire = serde_json::json!([{
-        "type": "thinking",
-        "thinking": "inspect",
-        "signature": "signed"
-    }])
-    .to_string();
-    recorder
-        .record_assistant_tool_call_batch(
-            Some("working".into()),
-            Some("inspect".into()),
-            Some(reasoning_wire),
-            vec![HistoryToolCall {
-                call_id: "call-1".into(),
-                name: "fs__read".into(),
-                arguments_json: "{}".into(),
-            }],
-        )
-        .unwrap();
-    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
-    let raw = fs::read_to_string(&path).unwrap();
-    assert!(raw.contains("\"schema_version\":2"));
-    assert!(raw.contains("\"kind\":\"assistant_turn\""));
-    assert!(raw.contains("anthropic.thinking_blocks"));
-    assert!(!raw.contains("assistant_tool_call_batch"));
-    assert!(!raw.contains("reasoning_wire"));
+        #[test]
+        fn unenveloped_legacy_transcript_remains_discovery_only() {
+            let base_dir = journal_test_dir("unenveloped-discovery-only");
+            fs::create_dir_all(&base_dir).unwrap();
+            let path = base_dir.join("legacy.jsonl");
+            fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&legacy_record(1)).unwrap()),
+            )
+            .unwrap();
 
-    let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
-    assert!(matches!(
-        &records[0].event,
-        TranscriptEvent::AssistantTurn(turn)
-            if turn.text.as_deref() == Some("working")
-                && turn.reasoning_content.as_deref() == Some("inspect")
-                && turn.calls.len() == 1
-                && turn.replay.as_ref().is_some_and(|state| {
-                    state.namespace == "anthropic.thinking_blocks"
-                        && state.version == 1
-                        && state.producer.protocol_id.as_str() == "anthropic"
-                })
-    ));
-}
+            assert_eq!(read_records(&path).unwrap().len(), 1);
+            let error = read_resumable_records_with_fingerprint(&path)
+                .expect_err("unenveloped legacy transcript must remain discovery-only");
+            assert!(error.to_string().contains("unenveloped legacy record"));
+        }
 
-#[test]
-fn v1_tool_call_batch_translates_replay_for_resume() {
-    let base_dir = journal_test_dir("v1-tool-call-translation");
-    fs::create_dir_all(&base_dir).unwrap();
-    let path = base_dir.join("legacy-tools.jsonl");
-    let mut record = v1_record(1);
-    record.record.session_id = "legacy-tools".into();
-    record.event_id = "legacy-tools:1".into();
-    record.record.event = TranscriptEvent::AssistantToolCallBatch {
-        text: Some("working".into()),
-        reasoning_content: Some("inspect".into()),
-        reasoning_wire: Some(
-            serde_json::json!([{
+        #[test]
+        fn v2_assistant_turn_round_trips_typed_replay_state() {
+            let base_dir = journal_test_dir("v2-assistant-turn");
+            let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
+            let reasoning_wire = serde_json::json!([{
                 "type": "thinking",
                 "thinking": "inspect",
                 "signature": "signed"
             }])
-            .to_string(),
-        ),
-        calls: vec![HistoryToolCall {
-            call_id: "call-1".into(),
-            name: "fs__read".into(),
-            arguments_json: "{}".into(),
-        }],
-    };
-    fs::write(
-        &path,
-        format!("{}\n", serde_json::to_string(&record).unwrap()),
-    )
-    .unwrap();
+            .to_string();
+            recorder
+                .record_assistant_tool_call_batch(
+                    Some("working".into()),
+                    Some("inspect".into()),
+                    Some(reasoning_wire),
+                    vec![HistoryToolCall {
+                        call_id: "call-1".into(),
+                        name: "fs__read".into(),
+                        arguments_json: "{}".into(),
+                    }],
+                )
+                .unwrap();
+            let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+            let raw = fs::read_to_string(&path).unwrap();
+            assert!(raw.contains("\"schema_version\":2"));
+            assert!(raw.contains("\"kind\":\"assistant_turn\""));
+            assert!(raw.contains("anthropic.thinking_blocks"));
+            assert!(!raw.contains("assistant_tool_call_batch"));
+            assert!(!raw.contains("reasoning_wire"));
 
-    let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
-    assert!(matches!(
-        &records[0].event,
-        TranscriptEvent::AssistantTurn(turn)
-            if turn.text.as_deref() == Some("working")
-                && turn.reasoning_content.as_deref() == Some("inspect")
-                && turn.calls.len() == 1
-                && turn.replay.as_ref().is_some_and(|state| {
-                    state.namespace == "anthropic.thinking_blocks"
-                        && state.producer.protocol_id.as_str() == "anthropic"
-                })
-    ));
-}
+            let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
+            assert!(matches!(
+                &records[0].event,
+                TranscriptEvent::AssistantTurn(turn)
+                    if turn.text.as_deref() == Some("working")
+                        && turn.reasoning_content.as_deref() == Some("inspect")
+                        && turn.calls.len() == 1
+                        && turn.replay.as_ref().is_some_and(|state| {
+                            state.namespace == "anthropic.thinking_blocks"
+                                && state.version == 1
+                                && state.producer.protocol_id.as_str() == "anthropic"
+                        })
+            ));
+        }
 
-#[test]
-fn invalid_v1_replay_state_fails_resume_translation() {
-    let base_dir = journal_test_dir("v1-invalid-replay");
-    fs::create_dir_all(&base_dir).unwrap();
-    let path = base_dir.join("invalid.jsonl");
-    let mut record = v1_record(1);
-    record.record.session_id = "invalid".into();
-    record.event_id = "invalid:1".into();
-    record.record.event = TranscriptEvent::AssistantToolCallBatch {
-        text: None,
-        reasoning_content: None,
-        reasoning_wire: Some("not-json".into()),
-        calls: Vec::new(),
-    };
-    fs::write(
-        &path,
-        format!("{}\n", serde_json::to_string(&record).unwrap()),
-    )
-    .unwrap();
+        #[test]
+        fn v1_tool_call_batch_translates_replay_for_resume() {
+            let base_dir = journal_test_dir("v1-tool-call-translation");
+            fs::create_dir_all(&base_dir).unwrap();
+            let path = base_dir.join("legacy-tools.jsonl");
+            let mut record = v1_record(1);
+            record.record.session_id = "legacy-tools".into();
+            record.event_id = "legacy-tools:1".into();
+            record.record.event = TranscriptEvent::AssistantToolCallBatch {
+                text: Some("working".into()),
+                reasoning_content: Some("inspect".into()),
+                reasoning_wire: Some(
+                    serde_json::json!([{
+                        "type": "thinking",
+                        "thinking": "inspect",
+                        "signature": "signed"
+                    }])
+                    .to_string(),
+                ),
+                calls: vec![HistoryToolCall {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                    arguments_json: "{}".into(),
+                }],
+            };
+            fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&record).unwrap()),
+            )
+            .unwrap();
 
-    assert_eq!(read_records(&path).unwrap().len(), 1);
-    let error = read_resumable_records_with_fingerprint(&path)
-        .expect_err("invalid replay state must not be silently discarded");
-    assert!(error.to_string().contains("invalid assistant replay state"));
-}
+            let records = read_resumable_records_with_fingerprint(&path).unwrap().0;
+            assert!(matches!(
+                &records[0].event,
+                TranscriptEvent::AssistantTurn(turn)
+                    if turn.text.as_deref() == Some("working")
+                        && turn.reasoning_content.as_deref() == Some("inspect")
+                        && turn.calls.len() == 1
+                        && turn.replay.as_ref().is_some_and(|state| {
+                            state.namespace == "anthropic.thinking_blocks"
+                                && state.producer.protocol_id.as_str() == "anthropic"
+                        })
+            ));
+        }
 
-#[test]
-fn v2_envelope_rejects_legacy_assistant_payload_for_resume() {
-    let base_dir = journal_test_dir("v2-legacy-assistant-payload");
-    fs::create_dir_all(&base_dir).unwrap();
-    let path = base_dir.join("invalid.jsonl");
-    let mut envelope = v1_record(1);
-    envelope.schema_version = JOURNAL_SCHEMA_VERSION;
-    envelope.record.event = TranscriptEvent::AssistantMessage {
-        content: "legacy payload".into(),
-    };
-    fs::write(
-        &path,
-        format!("{}\n", serde_json::to_string(&envelope).unwrap()),
-    )
-    .unwrap();
-    assert_eq!(read_records(&path).unwrap().len(), 1);
-    let error = read_resumable_records_with_fingerprint(&path)
-        .expect_err("legacy payload under v2 must fail resume");
-    assert!(error.to_string().contains("legacy assistant payload"));
+        #[test]
+        fn invalid_v1_replay_state_fails_resume_translation() {
+            let base_dir = journal_test_dir("v1-invalid-replay");
+            fs::create_dir_all(&base_dir).unwrap();
+            let path = base_dir.join("invalid.jsonl");
+            let mut record = v1_record(1);
+            record.record.session_id = "invalid".into();
+            record.event_id = "invalid:1".into();
+            record.record.event = TranscriptEvent::AssistantToolCallBatch {
+                text: None,
+                reasoning_content: None,
+                reasoning_wire: Some("not-json".into()),
+                calls: Vec::new(),
+            };
+            fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&record).unwrap()),
+            )
+            .unwrap();
+
+            assert_eq!(read_records(&path).unwrap().len(), 1);
+            let error = read_resumable_records_with_fingerprint(&path)
+                .expect_err("invalid replay state must not be silently discarded");
+            assert!(error.to_string().contains("invalid assistant replay state"));
+        }
+
+        #[test]
+        fn v2_envelope_rejects_legacy_assistant_payload_for_resume() {
+            let base_dir = journal_test_dir("v2-legacy-assistant-payload");
+            fs::create_dir_all(&base_dir).unwrap();
+            let path = base_dir.join("invalid.jsonl");
+            let mut envelope = v1_record(1);
+            envelope.schema_version = JOURNAL_SCHEMA_VERSION;
+            envelope.record.event = TranscriptEvent::AssistantMessage {
+                content: "legacy payload".into(),
+            };
+            fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&envelope).unwrap()),
+            )
+            .unwrap();
+            assert_eq!(read_records(&path).unwrap().len(), 1);
+            let error = read_resumable_records_with_fingerprint(&path)
+                .expect_err("legacy payload under v2 must fail resume");
+            assert!(error.to_string().contains("legacy assistant payload"));
+        }
+    }
 }
 
 #[test]
@@ -609,113 +630,128 @@ fn journal_io_failures_poison_recorder_without_advancing_sequence() {
     }
 }
 
-#[test]
-fn transaction_round_trip_commits_all_records_and_uncommitted_tail_is_ignored() {
-    let base_dir = journal_test_dir("transaction-tail");
-    let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
-    recorder
-        .append_transaction(vec![
-            (
-                TranscriptEvent::SessionTitle {
-                    title: "first".into(),
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::AssistantMessage {
-                    content: "second".into(),
-                },
-                Some("branch-a".into()),
-            ),
-        ])
-        .unwrap();
-    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
-    let records = read_records(&path).unwrap();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].sequence, 1);
-    assert_eq!(records[1].sequence, 2);
+mod transactions {
+    use super::*;
 
-    let lines = fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    assert!(lines[..lines.len() - 1].iter().all(|line| {
-        serde_json::from_str::<Value>(line).unwrap()["schema_version"] == JOURNAL_SCHEMA_VERSION
-    }));
-    assert_eq!(
-        serde_json::from_str::<Value>(lines.last().unwrap()).unwrap()["schema_version"],
-        Value::from(JOURNAL_SCHEMA_VERSION)
-    );
+    mod integration_tests {
+        use super::*;
 
-    let mut mismatched_schema_lines = lines.clone();
-    let mut mismatched_commit: Value =
-        serde_json::from_str(mismatched_schema_lines.last().unwrap()).unwrap();
-    mismatched_commit["schema_version"] = Value::from(LEGACY_JOURNAL_SCHEMA_VERSION);
-    *mismatched_schema_lines.last_mut().unwrap() =
-        serde_json::to_string(&mismatched_commit).unwrap();
-    fs::write(&path, mismatched_schema_lines.join("\n") + "\n").unwrap();
-    assert!(read_records(&path).is_err());
+        #[test]
+        fn transaction_round_trip_commits_all_records_and_uncommitted_tail_is_ignored() {
+            let base_dir = journal_test_dir("transaction-tail");
+            let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
+            recorder
+                .append_transaction(vec![
+                    (
+                        TranscriptEvent::SessionTitle {
+                            title: "first".into(),
+                        },
+                        None,
+                    ),
+                    (
+                        TranscriptEvent::AssistantMessage {
+                            content: "second".into(),
+                        },
+                        Some("branch-a".into()),
+                    ),
+                ])
+                .unwrap();
+            let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+            let records = read_records(&path).unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].sequence, 1);
+            assert_eq!(records[1].sequence, 2);
 
-    let mut corrupt_commit: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-    corrupt_commit["payload_digest"] = Value::String("wrong".into());
-    let mut corrupt_lines = lines.clone();
-    *corrupt_lines.last_mut().unwrap() = serde_json::to_string(&corrupt_commit).unwrap();
-    fs::write(&path, corrupt_lines.join("\n") + "\n").unwrap();
-    assert!(read_records(&path).is_err());
+            let lines = fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert!(lines[..lines.len() - 1].iter().all(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["schema_version"]
+                    == JOURNAL_SCHEMA_VERSION
+            }));
+            assert_eq!(
+                serde_json::from_str::<Value>(lines.last().unwrap()).unwrap()["schema_version"],
+                Value::from(JOURNAL_SCHEMA_VERSION)
+            );
 
-    let mut lines = lines;
-    lines.pop(); // Remove only the private transaction commit marker.
-    fs::write(&path, lines.join("\n") + "\n").unwrap();
-    assert!(read_records(&path).unwrap().is_empty());
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap()
-        .write_all(format!("{}\n", serde_json::to_string(&legacy_record(3)).unwrap()).as_bytes())
-        .unwrap();
-    assert!(read_records(&path).is_err());
-    fs::write(&path, lines.join("\n") + "\n").unwrap();
-    let records = read_records(&path).unwrap();
-    assert!(
-        TranscriptRecorder::open_existing_with_records(&base_dir, recorder.session_id(), &records,)
-            .is_err()
-    );
-    assert!(TranscriptRecorder::open_existing(&base_dir, recorder.session_id()).is_err());
-}
+            let mut mismatched_schema_lines = lines.clone();
+            let mut mismatched_commit: Value =
+                serde_json::from_str(mismatched_schema_lines.last().unwrap()).unwrap();
+            mismatched_commit["schema_version"] = Value::from(LEGACY_JOURNAL_SCHEMA_VERSION);
+            *mismatched_schema_lines.last_mut().unwrap() =
+                serde_json::to_string(&mismatched_commit).unwrap();
+            fs::write(&path, mismatched_schema_lines.join("\n") + "\n").unwrap();
+            assert!(read_records(&path).is_err());
 
-#[test]
-fn journal_reader_rejects_transaction_commit_with_mismatched_resulting_revision() {
-    let base_dir = journal_test_dir("transaction-resulting-revision");
-    let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
-    recorder
-        .append_transaction(vec![
-            (
-                TranscriptEvent::SessionTitle {
-                    title: "first".into(),
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::AssistantMessage {
-                    content: "second".into(),
-                },
-                None,
-            ),
-        ])
-        .unwrap();
-    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
-    let mut lines = fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let mut commit: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-    commit["resulting_revision"] = Value::from(1);
-    *lines.last_mut().unwrap() = serde_json::to_string(&commit).unwrap();
-    fs::write(&path, lines.join("\n") + "\n").unwrap();
+            let mut corrupt_commit: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            corrupt_commit["payload_digest"] = Value::String("wrong".into());
+            let mut corrupt_lines = lines.clone();
+            *corrupt_lines.last_mut().unwrap() = serde_json::to_string(&corrupt_commit).unwrap();
+            fs::write(&path, corrupt_lines.join("\n") + "\n").unwrap();
+            assert!(read_records(&path).is_err());
 
-    assert!(read_records(path).is_err());
+            let mut lines = lines;
+            lines.pop(); // Remove only the private transaction commit marker.
+            fs::write(&path, lines.join("\n") + "\n").unwrap();
+            assert!(read_records(&path).unwrap().is_empty());
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(
+                    format!("{}\n", serde_json::to_string(&legacy_record(3)).unwrap()).as_bytes(),
+                )
+                .unwrap();
+            assert!(read_records(&path).is_err());
+            fs::write(&path, lines.join("\n") + "\n").unwrap();
+            let records = read_records(&path).unwrap();
+            assert!(
+                TranscriptRecorder::open_existing_with_records(
+                    &base_dir,
+                    recorder.session_id(),
+                    &records,
+                )
+                .is_err()
+            );
+            assert!(TranscriptRecorder::open_existing(&base_dir, recorder.session_id()).is_err());
+        }
+
+        #[test]
+        fn journal_reader_rejects_transaction_commit_with_mismatched_resulting_revision() {
+            let base_dir = journal_test_dir("transaction-resulting-revision");
+            let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
+            recorder
+                .append_transaction(vec![
+                    (
+                        TranscriptEvent::SessionTitle {
+                            title: "first".into(),
+                        },
+                        None,
+                    ),
+                    (
+                        TranscriptEvent::AssistantMessage {
+                            content: "second".into(),
+                        },
+                        None,
+                    ),
+                ])
+                .unwrap();
+            let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+            let mut lines = fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut commit: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            commit["resulting_revision"] = Value::from(1);
+            *lines.last_mut().unwrap() = serde_json::to_string(&commit).unwrap();
+            fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+            assert!(read_records(path).is_err());
+        }
+    }
 }
 
 #[test]
@@ -752,1117 +788,1141 @@ fn transaction_io_failure_poison_does_not_advance_or_switch_scope() {
     }
 }
 
-#[test]
-fn interrupt_transaction_failure_leaves_sequence_events_and_tracker_unchanged() {
-    let base_dir = journal_test_dir("interrupt-transaction-atomicity");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_turn_started(TurnStartedEvent { turn_id: 1 })
-        .expect("start turn");
-    recorder
-        .record_tool_call_started("call-1", "shell__exec", json!({"command": "sleep 1"}))
-        .expect("start tool call");
-    let before_records = read_records(recorder.path()).expect("read records before failure");
-    let before_tracker = recorder
-        .unfinished_tool_calls_in_active_turn()
-        .expect("tracker should be available");
-    let before_sequence = recorder.sequence;
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    recorder.replace_sink_for_test(Box::new(FailingSink {
-        fail: FailPoint::Write,
-        calls: Arc::clone(&calls),
-    }));
+mod restoration {
+    use super::*;
 
-    assert!(
-        recorder
-            .append_transaction(vec![
-                (
-                    TranscriptEvent::ToolCallCancelled {
+    mod integration_tests {
+        use super::*;
+
+        #[test]
+        fn interrupt_transaction_failure_leaves_sequence_events_and_tracker_unchanged() {
+            let base_dir = journal_test_dir("interrupt-transaction-atomicity");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .record_turn_started(TurnStartedEvent { turn_id: 1 })
+                .expect("start turn");
+            recorder
+                .record_tool_call_started("call-1", "shell__exec", json!({"command": "sleep 1"}))
+                .expect("start tool call");
+            let before_records =
+                read_records(recorder.path()).expect("read records before failure");
+            let before_tracker = recorder
+                .unfinished_tool_calls_in_active_turn()
+                .expect("tracker should be available");
+            let before_sequence = recorder.sequence;
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            recorder.replace_sink_for_test(Box::new(FailingSink {
+                fail: FailPoint::Write,
+                calls: Arc::clone(&calls),
+            }));
+
+            assert!(
+                recorder
+                    .append_transaction(vec![
+                        (
+                            TranscriptEvent::ToolCallCancelled {
+                                call_id: "call-1".into(),
+                                name: "shell__exec".into(),
+                            },
+                            None,
+                        ),
+                        (TranscriptEvent::TurnInterrupted { turn_id: Some(1) }, None,),
+                    ])
+                    .is_err()
+            );
+
+            assert_eq!(recorder.sequence, before_sequence);
+            assert_eq!(
+                recorder
+                    .unfinished_tool_calls_in_active_turn()
+                    .expect("tracker should remain available"),
+                before_tracker
+            );
+            let after_records = read_records(recorder.path()).expect("read records after failure");
+            assert_eq!(
+                serde_json::to_value(after_records).expect("serialize records after failure"),
+                serde_json::to_value(before_records).expect("serialize records before failure")
+            );
+            assert_eq!(*calls.lock().unwrap(), vec!["write"]);
+        }
+
+        #[test]
+        fn restore_conversation_messages_ignores_provenance_events() {
+            let records = vec![
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 1,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::UserMessage {
+                        content: "hi".into(),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 2,
+                    timestamp_ms: 1,
+                    context_branch_id: None,
+                    event: TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 1 }),
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 3,
+                    timestamp_ms: 2,
+                    context_branch_id: None,
+                    event: TranscriptEvent::SubagentLifecycle {
+                        run_id: "sub-1".into(),
+                        parent_session_id: "s".into(),
+                        parent_run_id: "turn-1".into(),
+                        agent_name: "explorer".into(),
+                        status: "running".into(),
+                        detail: None,
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 4,
+                    timestamp_ms: 3,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ModelChanged {
+                        previous_model: "a".into(),
+                        new_model: "b".into(),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 5,
+                    timestamp_ms: 4,
+                    context_branch_id: None,
+                    event: TranscriptEvent::AssistantMessage {
+                        content: "hello".into(),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 6,
+                    timestamp_ms: 5,
+                    context_branch_id: None,
+                    event: TranscriptEvent::PermissionModeChanged {
+                        previous_mode: "default".into(),
+                        new_mode: "safe".into(),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 7,
+                    timestamp_ms: 6,
+                    context_branch_id: None,
+                    event: TranscriptEvent::AutoContinuationScheduled {
+                        continuation_count: 1,
+                        remaining_unfinished: 2,
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 8,
+                    timestamp_ms: 7,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
+                        write_effects: 1,
+                        validation_effects: 0,
+                        failed_validation_effects: 0,
+                        message: "validation reminder".into(),
+                    }),
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 9,
+                    timestamp_ms: 8,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                        turn_id: 1,
+                        call_id: "call-1".into(),
+                        name: "fs__write".into(),
+                        status: "executed".into(),
+                        rejection: None,
+                        effect_kind: "write".into(),
+                        primary_path: Some("src/main.rs".into()),
+                        command: None,
+                    }),
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 10,
+                    timestamp_ms: 9,
+                    context_branch_id: None,
+                    event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
+                        turn_id: 1,
+                        outcome: "completed".into(),
+                        tool_call_count: 1,
+                        continuation_count: 0,
+                        write_effects: 1,
+                        validation_effects: 0,
+                        failed_validation_effects: 0,
+                        validation_advisory_emitted: true,
+                    }),
+                },
+            ];
+
+            let restored = restore_conversation_messages(&records).expect("restore messages");
+            assert_eq!(restored.len(), 2);
+            assert!(matches!(restored[0].role, ConversationRole::User));
+            assert_eq!(restored[0].content, "hi");
+            assert!(matches!(restored[1].role, ConversationRole::Assistant));
+            assert_eq!(restored[1].content, "hello");
+        }
+
+        #[test]
+        fn restore_session_history_preserves_tool_calls_permission_decisions_and_cancelled_tools() {
+            let records = vec![
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 1,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ToolCallStarted {
+                        call_id: "call-1".into(),
+                        name: "shell__exec".into(),
+                        args: json!({"command": "cargo test"}),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 2,
+                    timestamp_ms: 1,
+                    context_branch_id: None,
+                    event: TranscriptEvent::PermissionDecision {
+                        call_id: Some("call-1".into()),
+                        tool: "shell__exec".into(),
+                        args: json!({"command": "cargo test"}),
+                        allowed: false,
+                        reason: Some("Denied by user from TUI permission prompt".into()),
+                        reviewer: None,
+                        approval: None,
+                        risk: None,
+                        reviewer_child_session_id: None,
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 3,
+                    timestamp_ms: 2,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ToolCallCancelled {
                         call_id: "call-1".into(),
                         name: "shell__exec".into(),
                     },
-                    None,
-                ),
-                (TranscriptEvent::TurnInterrupted { turn_id: Some(1) }, None,),
-            ])
-            .is_err()
-    );
+                },
+            ];
 
-    assert_eq!(recorder.sequence, before_sequence);
-    assert_eq!(
-        recorder
-            .unfinished_tool_calls_in_active_turn()
-            .expect("tracker should remain available"),
-        before_tracker
-    );
-    let after_records = read_records(recorder.path()).expect("read records after failure");
-    assert_eq!(
-        serde_json::to_value(after_records).expect("serialize records after failure"),
-        serde_json::to_value(before_records).expect("serialize records before failure")
-    );
-    assert_eq!(*calls.lock().unwrap(), vec!["write"]);
-}
-
-#[test]
-fn restore_conversation_messages_ignores_provenance_events() {
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::UserMessage {
-                content: "hi".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 1 }),
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 3,
-            timestamp_ms: 2,
-            context_branch_id: None,
-            event: TranscriptEvent::SubagentLifecycle {
-                run_id: "sub-1".into(),
-                parent_session_id: "s".into(),
-                parent_run_id: "turn-1".into(),
-                agent_name: "explorer".into(),
-                status: "running".into(),
-                detail: None,
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 4,
-            timestamp_ms: 3,
-            context_branch_id: None,
-            event: TranscriptEvent::ModelChanged {
-                previous_model: "a".into(),
-                new_model: "b".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 5,
-            timestamp_ms: 4,
-            context_branch_id: None,
-            event: TranscriptEvent::AssistantMessage {
-                content: "hello".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 6,
-            timestamp_ms: 5,
-            context_branch_id: None,
-            event: TranscriptEvent::PermissionModeChanged {
-                previous_mode: "default".into(),
-                new_mode: "safe".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 7,
-            timestamp_ms: 6,
-            context_branch_id: None,
-            event: TranscriptEvent::AutoContinuationScheduled {
-                continuation_count: 1,
-                remaining_unfinished: 2,
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 8,
-            timestamp_ms: 7,
-            context_branch_id: None,
-            event: TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
-                write_effects: 1,
-                validation_effects: 0,
-                failed_validation_effects: 0,
-                message: "validation reminder".into(),
-            }),
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 9,
-            timestamp_ms: 8,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
-                turn_id: 1,
-                call_id: "call-1".into(),
-                name: "fs__write".into(),
-                status: "executed".into(),
-                rejection: None,
-                effect_kind: "write".into(),
-                primary_path: Some("src/main.rs".into()),
-                command: None,
-            }),
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 10,
-            timestamp_ms: 9,
-            context_branch_id: None,
-            event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
-                turn_id: 1,
-                outcome: "completed".into(),
-                tool_call_count: 1,
-                continuation_count: 0,
-                write_effects: 1,
-                validation_effects: 0,
-                failed_validation_effects: 0,
-                validation_advisory_emitted: true,
-            }),
-        },
-    ];
-
-    let restored = restore_conversation_messages(&records).expect("restore messages");
-    assert_eq!(restored.len(), 2);
-    assert!(matches!(restored[0].role, ConversationRole::User));
-    assert_eq!(restored[0].content, "hi");
-    assert!(matches!(restored[1].role, ConversationRole::Assistant));
-    assert_eq!(restored[1].content, "hello");
-}
-
-#[test]
-fn restore_session_history_preserves_tool_calls_permission_decisions_and_cancelled_tools() {
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolCallStarted {
-                call_id: "call-1".into(),
-                name: "shell__exec".into(),
-                args: json!({"command": "cargo test"}),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::PermissionDecision {
-                call_id: Some("call-1".into()),
-                tool: "shell__exec".into(),
-                args: json!({"command": "cargo test"}),
-                allowed: false,
-                reason: Some("Denied by user from TUI permission prompt".into()),
-                reviewer: None,
-                approval: None,
-                risk: None,
-                reviewer_child_session_id: None,
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 3,
-            timestamp_ms: 2,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolCallCancelled {
-                call_id: "call-1".into(),
-                name: "shell__exec".into(),
-            },
-        },
-    ];
-
-    let history = restore_session_history(&records).expect("restore history");
-    assert!(matches!(
-        history.first(),
-        Some(HistoryItem::AssistantTurn { calls, .. })
-            if calls.len() == 1 && calls[0].call_id == "call-1"
-    ));
-    assert!(matches!(
-        history.get(1),
-        Some(HistoryItem::ToolOutput {
-            call_id,
-            output_json,
-            ..
-        }) if call_id == "call-1"
-            && output_json == r#"{"status":"cancelled","summary":"user cancelled"}"#
-    ));
-}
-
-#[test]
-fn active_writer_blocks_resume_until_the_recorder_is_dropped() {
-    let base_dir = journal_test_dir("exclusive-writer-lock");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_session_started("model")
-        .expect("record session start");
-    let session_id = recorder.session_id().to_string();
-    let path = recorder.path().to_path_buf();
-    let (records, fingerprint) =
-        read_records_with_fingerprint(&path).expect("read active transcript");
-
-    let error = match TranscriptRecorder::open_existing_with_records_at_fingerprint(
-        &base_dir,
-        &session_id,
-        &records,
-        &fingerprint,
-    ) {
-        Ok(_) => panic!("a second writer must not open an active transcript"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("session transcript is already open for writing")
-    );
-
-    drop(recorder);
-    let mut reopened =
-        TranscriptRecorder::open_existing(&base_dir, &session_id).expect("lock releases on drop");
-    reopened
-        .record_session_title("continued")
-        .expect("append after exclusive owner exits");
-    assert_eq!(
-        read_records(path)
-            .expect("read reopened transcript")
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>(),
-        vec![1, 2]
-    );
-}
-
-#[test]
-fn poisoned_recorder_releases_writer_lock_for_recovery() {
-    let base_dir = journal_test_dir("poison-releases-writer-lock");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_session_started("model")
-        .expect("record session start");
-    let session_id = recorder.session_id().to_string();
-    recorder.replace_sink_for_test(Box::new(FailingSink {
-        fail: FailPoint::Write,
-        calls: Arc::new(Mutex::new(Vec::new())),
-    }));
-
-    assert!(recorder.record_session_title("fails").is_err());
-    assert_eq!(recorder.health, RecorderHealth::Poisoned);
-    let reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
-        .expect("poisoned recorder must release its writer lock");
-    assert_eq!(reopened.sequence, 1);
-}
-
-#[test]
-fn open_existing_with_records_preserves_sequence_and_context_scope() {
-    let base_dir = journal_test_dir("open-with-records");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_context_branch_created("branch-1", ROOT_CONTEXT_BRANCH_ID, 0, None)
-        .expect("create branch definition");
-    recorder
-        .append_metadata(TranscriptEvent::ContextExperimentStarted {
-            branch_id: "branch-1".into(),
-            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-            base_sequence: 0,
-        })
-        .expect("start experiment");
-    recorder.set_current_context_branch_id(Some("branch-1".into()));
-    recorder
-        .record_tool_execution_summary(ToolExecutionSummaryEvent {
-            turn_id: 1,
-            call_id: "call-write".into(),
-            name: "fs__write".into(),
-            status: "executed".into(),
-            rejection: None,
-            effect_kind: "write".into(),
-            primary_path: Some("src/lib.rs".into()),
-            command: None,
-        })
-        .expect("record write");
-    let session_id = recorder.session_id().to_string();
-    let path = recorder.path().to_path_buf();
-    let records = read_records(&path).expect("load records");
-    drop(recorder);
-
-    let mut reopened =
-        TranscriptRecorder::open_existing_with_records(&base_dir, &session_id, &records)
-            .expect("open using records");
-    assert_eq!(
-        reopened.active_context_experiment(),
-        Some(ActiveContextExperiment {
-            branch_id: "branch-1".into(),
-            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-            base_sequence: 0,
-            writes_observed: true,
-        })
-    );
-    reopened
-        .record_user_message("continued")
-        .expect("append after records-backed open");
-
-    assert_eq!(
-        read_records(path)
-            .expect("read appended records")
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>(),
-        vec![1, 2, 3, 4]
-    );
-}
-
-#[test]
-fn checkout_to_root_reconstructs_root_tracker_after_reopen() {
-    let base_dir = journal_test_dir("checkout-root-tracker");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_turn_started(TurnStartedEvent { turn_id: 1 })
-        .expect("start root turn");
-    recorder
-        .record_turn_finalized(TurnFinalizedEvent {
-            turn_id: 1,
-            outcome: "completed".into(),
-            tool_call_count: 0,
-            continuation_count: 0,
-            write_effects: 0,
-            validation_effects: 0,
-            failed_validation_effects: 0,
-            validation_advisory_emitted: false,
-        })
-        .expect("finish root turn");
-    let root_base = recorder.sequence;
-    recorder
-        .record_context_branch_created("branch-a", ROOT_CONTEXT_BRANCH_ID, root_base, None)
-        .expect("create branch");
-    recorder
-        .record_context_checkout("branch-a", root_base)
-        .expect("checkout branch");
-    recorder.set_current_context_branch_id(Some("branch-a".into()));
-    recorder
-        .record_turn_started(TurnStartedEvent { turn_id: 2 })
-        .expect("start branch turn");
-    recorder
-        .record_context_checkout(ROOT_CONTEXT_BRANCH_ID, root_base)
-        .expect("checkout root");
-    recorder.set_current_context_branch_id(None);
-    recorder
-        .record_turn_started(TurnStartedEvent { turn_id: 3 })
-        .expect("start root turn after checkout");
-    recorder
-        .record_tool_call_started("root-call", "fs__read", json!({}))
-        .expect("start root tool");
-    let session_id = recorder.session_id().to_string();
-    drop(recorder);
-
-    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
-        .expect("reopen root checkout transcript");
-    assert_eq!(reopened.current_context_branch_id(), None);
-    assert_eq!(
-        reopened
-            .unfinished_tool_calls_in_active_turn()
-            .expect("root tracker should be available"),
-        vec![("root-call".into(), "fs__read".into())]
-    );
-}
-
-#[test]
-fn open_reconstructs_metadata_only_branch_tracker_from_parent_projection() {
-    let base_dir = journal_test_dir("metadata-only-branch-tracker");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_turn_started(TurnStartedEvent { turn_id: 1 })
-        .expect("start parent turn");
-    recorder
-        .record_tool_call_started("parent-call", "fs__read", json!({}))
-        .expect("start parent tool");
-    let base_sequence = recorder.sequence;
-    recorder
-        .record_context_branch_created("metadata-only", ROOT_CONTEXT_BRANCH_ID, base_sequence, None)
-        .expect("create metadata-only branch");
-    let session_id = recorder.session_id().to_string();
-    drop(recorder);
-
-    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
-        .expect("reopen metadata-only branch transcript");
-    reopened.set_current_context_branch_id(Some("metadata-only".into()));
-    assert_eq!(
-        reopened
-            .unfinished_tool_calls_in_active_turn()
-            .expect("metadata-only tracker should be available"),
-        vec![("parent-call".into(), "fs__read".into())]
-    );
-}
-
-#[test]
-fn open_rejects_malformed_branch_projection_without_tracker_fallback() {
-    let base_dir = journal_test_dir("malformed-branch-projection");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .append_transaction(vec![(
-            TranscriptEvent::AssistantMessage {
-                content: "scoped without a branch definition".into(),
-            },
-            Some("missing-branch".into()),
-        )])
-        .expect("write malformed scoped record");
-    let session_id = recorder.session_id().to_string();
-    drop(recorder);
-
-    let error = match TranscriptRecorder::open_existing(&base_dir, &session_id) {
-        Ok(_) => panic!("malformed branch projection must fail open"),
-        Err(error) => error,
-    };
-    assert!(
-        error.to_string().contains("branch")
-            || error.to_string().contains("projection")
-            || error.to_string().contains("scope")
-    );
-}
-
-#[test]
-fn open_existing_with_records_rejects_mismatched_session_records() {
-    let base_dir = journal_test_dir("open-with-records-session-mismatch");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_user_message("message")
-        .expect("record message");
-    let session_id = recorder.session_id().to_string();
-    let mut records = read_records(recorder.path()).expect("load records");
-    records[0].session_id = "other-session".into();
-    drop(recorder);
-
-    let result = TranscriptRecorder::open_existing_with_records(&base_dir, &session_id, &records);
-    assert!(result.is_err());
-    let error = result.err().expect("mismatched records must be rejected");
-    assert!(error.to_string().contains("different session"));
-}
-
-#[test]
-fn open_existing_with_records_rejects_stale_committed_frontier() {
-    let base_dir = journal_test_dir("open-with-records-stale-frontier");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_user_message("loaded")
-        .expect("record loaded message");
-    let session_id = recorder.session_id().to_string();
-    let (records, fingerprint) =
-        read_records_with_fingerprint(recorder.path()).expect("load records");
-    recorder
-        .record_assistant_message("appended later")
-        .expect("append after load");
-    drop(recorder);
-
-    let result = TranscriptRecorder::open_existing_with_records_at_fingerprint(
-        &base_dir,
-        &session_id,
-        &records,
-        &fingerprint,
-    );
-    assert!(result.is_err());
-    let error = result.err().expect("stale records must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("changed after records were loaded")
-    );
-}
-
-#[test]
-fn legacy_linear_branch_adoption_scopes_future_records_without_topology_mutation() {
-    let base_dir = journal_test_dir("legacy-linear-adoption");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder.record_user_message("root").expect("root message");
-    recorder
-        .record_context_branch_created("legacy-child", ROOT_CONTEXT_BRANCH_ID, 1, None)
-        .expect("create legacy branch");
-    recorder
-        .append_metadata(TranscriptEvent::ContextExperimentStarted {
-            branch_id: "legacy-child".into(),
-            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-            base_sequence: 1,
-        })
-        .expect("legacy experiment");
-    let path = recorder.path().to_path_buf();
-    let session_id = recorder.session_id().to_string();
-    drop(recorder);
-
-    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen");
-    let frontier = read_records(&path).expect("read frontier").len();
-    reopened
-        .adopt_legacy_linear_branch("legacy-child")
-        .expect("adopt matching branch");
-    assert_eq!(reopened.current_context_branch_id(), Some("legacy-child"));
-    assert!(reopened.active_context_experiment().is_none());
-    drop(reopened);
-    let reconstructed = TranscriptRecorder::open_existing(&base_dir, &session_id)
-        .expect("reconstruct legacy state");
-    assert_eq!(reconstructed.current_context_branch_id(), None);
-    assert_eq!(
-        reconstructed.active_context_experiment(),
-        Some(ActiveContextExperiment {
-            branch_id: "legacy-child".into(),
-            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-            base_sequence: 1,
-            writes_observed: false,
-        })
-    );
-    drop(reconstructed);
-    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
-        .expect("reopen before adopting branch for append");
-    reopened
-        .adopt_legacy_linear_branch("legacy-child")
-        .expect("adopt matching branch for append");
-    reopened
-        .record_user_message("continued")
-        .expect("user append");
-    reopened
-        .record_assistant_message("continued response")
-        .expect("assistant append");
-    reopened
-        .record_turn_finalized(TurnFinalizedEvent {
-            turn_id: 1,
-            outcome: "completed".into(),
-            tool_call_count: 0,
-            continuation_count: 0,
-            write_effects: 0,
-            validation_effects: 0,
-            failed_validation_effects: 0,
-            validation_advisory_emitted: false,
-        })
-        .expect("finalization append");
-
-    let records = read_records(&path).expect("read adopted journal");
-    assert_eq!(records.len(), frontier + 3, "adoption must not append");
-    assert!(
-        records[frontier..]
-            .iter()
-            .all(|record| record.context_branch_id.as_deref() == Some("legacy-child"))
-    );
-    assert!(records[frontier..].iter().all(|record| !matches!(
-        record.event,
-        TranscriptEvent::ContextBranchCreated { .. }
-            | TranscriptEvent::ContextCheckout { .. }
-            | TranscriptEvent::ContextExperimentReturned { .. }
-    )));
-
-    drop(reopened);
-    let reopened_again =
-        TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen again");
-    assert_eq!(
-        reopened_again.current_context_branch_id(),
-        None,
-        "open remains branch-neutral"
-    );
-}
-
-#[test]
-fn legacy_linear_branch_adoption_rejects_unreturned_experiment_on_another_branch_without_mutation()
-{
-    let base_dir = journal_test_dir("legacy-linear-adoption-mismatch");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .append_metadata(TranscriptEvent::ContextExperimentStarted {
-            branch_id: "legacy-child".into(),
-            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-            base_sequence: 0,
-        })
-        .expect("legacy experiment");
-    let path = recorder.path().to_path_buf();
-    let session_id = recorder.session_id().to_string();
-    drop(recorder);
-
-    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen");
-    let before = read_records(&path).expect("read before");
-    let error = reopened
-        .adopt_legacy_linear_branch(ROOT_CONTEXT_BRANCH_ID)
-        .expect_err("root must reject child experiment");
-    assert!(error.to_string().contains("main"));
-    assert!(error.to_string().contains("legacy-child"));
-    assert_eq!(reopened.current_context_branch_id(), None);
-    assert!(reopened.active_context_experiment().is_some());
-    let after = read_records(&path).expect("read after");
-    assert_eq!(after.len(), before.len());
-    assert_eq!(
-        after
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>(),
-        before
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn records_tool_cancellation_and_turn_interruption() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-interrupt-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-
-    recorder
-        .record_tool_call_cancelled("call-1", "shell__exec")
-        .expect("record tool cancellation");
-    recorder
-        .record_turn_interrupted(Some(7))
-        .expect("record turn interruption");
-
-    let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-        .expect("read records");
-    assert_eq!(records.len(), 2);
-
-    let cancelled = serde_json::to_value(&records[0]).expect("serialize cancelled");
-    assert_eq!(cancelled.get("kind"), Some(&json!("tool_call_cancelled")));
-    assert_eq!(cancelled.get("call_id"), Some(&json!("call-1")));
-
-    let interrupted = serde_json::to_value(&records[1]).expect("serialize interrupted");
-    assert_eq!(interrupted.get("kind"), Some(&json!("turn_interrupted")));
-    assert_eq!(interrupted.get("turn_id"), Some(&json!(7)));
-}
-
-#[test]
-fn restore_session_history_closes_dangling_user_turn_on_interrupt() {
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::UserMessage {
-                content: "unfinished".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
-        },
-    ];
-
-    let history = restore_session_history(&records).expect("restore history");
-    assert!(matches!(
-        history.as_slice(),
-        [HistoryItem::UserMessage { content }, HistoryItem::AssistantTurn { text: Some(assistant_text), .. }]
-            if content.text == "unfinished" && assistant_text.is_empty()
-    ));
-
-    let messages = restore_conversation_messages(&records).expect("restore messages");
-    assert_eq!(messages.len(), 2);
-    assert!(matches!(messages[0].role, ConversationRole::User));
-    assert!(matches!(messages[1].role, ConversationRole::Assistant));
-    assert!(messages[1].content.is_empty());
-}
-
-#[test]
-fn restore_session_history_preserves_multimodal_tool_output_images() {
-    let image = crate::user_content::UserImageAttachment::from_bytes(
-        "pixel.png",
-        "image/png",
-        b"image-bytes",
-    );
-    let output = ToolResult::ok(
-        "fs__read",
-        json!({"path": "pixel.png", "kind": "image", "mime": "image/png"}),
-    )
-    .with_images(vec![image.clone()]);
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolCallStarted {
-                call_id: "call-image".into(),
-                name: "fs__read".into(),
-                args: json!({"path": "pixel.png", "offset": 1, "limit": 10}),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolCallFinished {
-                call_id: "call-image".into(),
-                name: "fs__read".into(),
-                ok: true,
-                output,
-            },
-        },
-    ];
-
-    let history = restore_session_history(&records).expect("restore image tool output");
-    let HistoryItem::ToolOutput {
-        output_json,
-        images,
-        ..
-    } = &history[1]
-    else {
-        panic!("expected restored tool output");
-    };
-    assert_eq!(images, &[image]);
-    assert!(!output_json.contains("data:image/png;base64,"));
-    assert!(!output_json.contains("\"images\""));
-}
-
-#[test]
-fn restore_session_history_closes_interrupted_turn_after_tool_output() {
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::UserMessage {
-                content: "run it".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolCallStarted {
-                call_id: "call-1".into(),
-                name: "shell__exec".into(),
-                args: json!({"command": "sleep 10"}),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 3,
-            timestamp_ms: 2,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolCallFinished {
-                call_id: "call-1".into(),
-                name: "shell__exec".into(),
-                ok: true,
-                output: ToolResult::ok("shell__exec", json!({"stdout": "started"})),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 4,
-            timestamp_ms: 3,
-            context_branch_id: None,
-            event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
-        },
-    ];
-
-    let messages = restore_conversation_messages(&records).expect("restore messages");
-    assert_eq!(messages.len(), 2);
-    assert!(matches!(messages[0].role, ConversationRole::User));
-    assert!(matches!(messages[1].role, ConversationRole::Assistant));
-    assert_eq!(messages[0].content, "run it");
-    assert!(messages[1].content.is_empty());
-}
-
-#[test]
-fn evidence_records_round_trip_and_restore_from_transcript() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-evidence-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    let draft = EvidenceDraft {
-        id: Some("ev-test".into()),
-        evidence_kind: EvidenceKind::FileExcerpt,
-        title: "read config".into(),
-        summary: "config has active provider".into(),
-        detail: Some("active_provider = openai".into()),
-        source: EvidenceSource::File {
-            path: "letcode.toml".into(),
-            start_line: Some(1),
-            end_line: Some(1),
-        },
-        tags: vec!["letcode.toml".into()],
-    };
-
-    let record = recorder.record_evidence(draft).expect("record evidence");
-    assert_eq!(record.id, "ev-test");
-
-    let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-        .expect("read records");
-    let evidence = restore_session_evidence(&records).expect("restore evidence");
-    assert_eq!(evidence.len(), 1);
-    assert_eq!(evidence[0].id, "ev-test");
-    assert_eq!(evidence[0].summary, "config has active provider");
-    assert!(
-        restore_conversation_messages(&records)
-            .expect("restore messages")
-            .is_empty()
-    );
-}
-
-#[test]
-fn child_transcript_records_parent_attribution_without_affecting_parent_restore() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-child-test-{}",
-        unix_timestamp_ms()
-    ));
-
-    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
-    parent
-        .record_user_message("parent question")
-        .expect("record parent user");
-    parent
-        .record_assistant_message("parent answer")
-        .expect("record parent assistant");
-
-    let child_dir = child_sessions_dir(&base_dir);
-    let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
-    let child_session_id = child.session_id().to_string();
-    child
-        .record_session_started("gpt-test")
-        .expect("record child start");
-    child
-        .record_subagent_lifecycle(
-            "sub-1",
-            parent.session_id(),
-            "turn-1",
-            "explorer",
-            "running",
-            Some("inspect src".into()),
-        )
-        .expect("record lifecycle");
-    child
-        .record_assistant_message("child summary")
-        .expect("record child message");
-
-    let parent_records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
-        .expect("read parent records");
-    let child_records = read_records(child_dir.join(format!("{}.jsonl", child.session_id())))
-        .expect("read child records");
-
-    let restored = restore_conversation_messages(&parent_records).expect("restore messages");
-    assert_eq!(restored.len(), 2);
-    assert_eq!(restored[0].content, "parent question");
-    assert_eq!(restored[1].content, "parent answer");
-    assert!(matches!(
-        child_records[1].event,
-        TranscriptEvent::SubagentLifecycle { .. }
-    ));
-
-    match &child_records[1].event {
-        TranscriptEvent::SubagentLifecycle {
-            parent_session_id,
-            parent_run_id,
-            agent_name,
-            status,
-            ..
-        } => {
-            assert_eq!(parent_session_id, parent.session_id());
-            assert_eq!(parent_run_id, "turn-1");
-            assert_eq!(agent_name, "explorer");
-            assert_eq!(status, "running");
+            let history = restore_session_history(&records).expect("restore history");
+            assert!(matches!(
+                history.first(),
+                Some(HistoryItem::AssistantTurn { calls, .. })
+                    if calls.len() == 1 && calls[0].call_id == "call-1"
+            ));
+            assert!(matches!(
+                history.get(1),
+                Some(HistoryItem::ToolOutput {
+                    call_id,
+                    output_json,
+                    ..
+                }) if call_id == "call-1"
+                    && output_json == r#"{"status":"cancelled","summary":"user cancelled"}"#
+            ));
         }
-        other => panic!("unexpected event: {other:?}"),
-    }
-}
 
-#[test]
-fn context_view_remove_is_append_only_metadata_not_raw_purge() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-context-view-append-only-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        #[test]
+        fn active_writer_blocks_resume_until_the_recorder_is_dropped() {
+            let base_dir = journal_test_dir("exclusive-writer-lock");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .record_session_started("model")
+                .expect("record session start");
+            let session_id = recorder.session_id().to_string();
+            let path = recorder.path().to_path_buf();
+            let (records, fingerprint) =
+                read_records_with_fingerprint(&path).expect("read active transcript");
 
-    recorder
-        .record_assistant_message("soft note that may be hidden from derived view")
-        .expect("record assistant note");
-    recorder
-        .record_context_view_operation_metadata(
-            "remove_from_view",
-            Some("block-seq-1-note".into()),
-            None,
-            Some("hide from prompt-derived context view only".into()),
-        )
-        .expect("record remove-from-view metadata");
+            let error = match TranscriptRecorder::open_existing_with_records_at_fingerprint(
+                &base_dir,
+                &session_id,
+                &records,
+                &fingerprint,
+            ) {
+                Ok(_) => panic!("a second writer must not open an active transcript"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("session transcript is already open for writing")
+            );
 
-    let session_id = recorder.session_id().to_string();
-    let transcript_path = base_dir.join(format!("{session_id}.jsonl"));
-    let records = read_records(&transcript_path).expect("read records");
+            drop(recorder);
+            let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+                .expect("lock releases on drop");
+            reopened
+                .record_session_title("continued")
+                .expect("append after exclusive owner exits");
+            assert_eq!(
+                read_records(path)
+                    .expect("read reopened transcript")
+                    .iter()
+                    .map(|record| record.sequence)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
 
-    assert_eq!(records.len(), 2);
-    assert!(matches!(
-        &records[0].event,
-        TranscriptEvent::AssistantTurn(turn)
-            if turn.text.as_deref() == Some("soft note that may be hidden from derived view")
-    ));
-    assert!(matches!(
-        &records[1].event,
-        TranscriptEvent::ContextViewOperationMetadata {
-            operation,
-            block_id,
-            node_id,
-            ..
-        } if operation == "remove_from_view"
-            && block_id.as_deref() == Some("block-seq-1-note")
-            && node_id.is_none()
-    ));
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>(),
-        vec![1, 2]
-    );
+        #[test]
+        fn poisoned_recorder_releases_writer_lock_for_recovery() {
+            let base_dir = journal_test_dir("poison-releases-writer-lock");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .record_session_started("model")
+                .expect("record session start");
+            let session_id = recorder.session_id().to_string();
+            recorder.replace_sink_for_test(Box::new(FailingSink {
+                fail: FailPoint::Write,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }));
 
-    drop(recorder);
-    let mut reopened =
-        TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen recorder");
-    reopened
-        .record_user_message("new message after reopen")
-        .expect("append after reopen");
+            assert!(recorder.record_session_title("fails").is_err());
+            assert_eq!(recorder.health, RecorderHealth::Poisoned);
+            let reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+                .expect("poisoned recorder must release its writer lock");
+            assert_eq!(reopened.sequence, 1);
+        }
 
-    let reopened_records = read_records(&transcript_path).expect("read reopened records");
-    assert_eq!(reopened_records.len(), 3);
-    assert!(matches!(
-        &reopened_records[0].event,
-        TranscriptEvent::AssistantTurn(turn)
-            if turn.text.as_deref() == Some("soft note that may be hidden from derived view")
-    ));
-    assert!(matches!(
-        &reopened_records[1].event,
-        TranscriptEvent::ContextViewOperationMetadata { operation, .. }
-            if operation == "remove_from_view"
-    ));
-    assert!(matches!(
-        &reopened_records[2].event,
-        TranscriptEvent::UserMessage { content }
-            if content.display_text() == "new message after reopen"
-    ));
-    let sequences = reopened_records
-        .iter()
-        .map(|record| record.sequence)
-        .collect::<Vec<_>>();
-    assert_eq!(sequences, vec![1, 2, 3]);
-    assert_eq!(
-        reopened_records.last().map(|record| record.sequence),
-        Some(
-            records
+        #[test]
+        fn open_existing_with_records_preserves_sequence_and_context_scope() {
+            let base_dir = journal_test_dir("open-with-records");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .record_context_branch_created("branch-1", ROOT_CONTEXT_BRANCH_ID, 0, None)
+                .expect("create branch definition");
+            recorder
+                .append_metadata(TranscriptEvent::ContextExperimentStarted {
+                    branch_id: "branch-1".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 0,
+                })
+                .expect("start experiment");
+            recorder.set_current_context_branch_id(Some("branch-1".into()));
+            recorder
+                .record_tool_execution_summary(ToolExecutionSummaryEvent {
+                    turn_id: 1,
+                    call_id: "call-write".into(),
+                    name: "fs__write".into(),
+                    status: "executed".into(),
+                    rejection: None,
+                    effect_kind: "write".into(),
+                    primary_path: Some("src/lib.rs".into()),
+                    command: None,
+                })
+                .expect("record write");
+            let session_id = recorder.session_id().to_string();
+            let path = recorder.path().to_path_buf();
+            let records = read_records(&path).expect("load records");
+            drop(recorder);
+
+            let mut reopened =
+                TranscriptRecorder::open_existing_with_records(&base_dir, &session_id, &records)
+                    .expect("open using records");
+            assert_eq!(
+                reopened.active_context_experiment(),
+                Some(ActiveContextExperiment {
+                    branch_id: "branch-1".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 0,
+                    writes_observed: true,
+                })
+            );
+            reopened
+                .record_user_message("continued")
+                .expect("append after records-backed open");
+
+            assert_eq!(
+                read_records(path)
+                    .expect("read appended records")
+                    .iter()
+                    .map(|record| record.sequence)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 4]
+            );
+        }
+
+        #[test]
+        fn checkout_to_root_reconstructs_root_tracker_after_reopen() {
+            let base_dir = journal_test_dir("checkout-root-tracker");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .record_turn_started(TurnStartedEvent { turn_id: 1 })
+                .expect("start root turn");
+            recorder
+                .record_turn_finalized(TurnFinalizedEvent {
+                    turn_id: 1,
+                    outcome: "completed".into(),
+                    tool_call_count: 0,
+                    continuation_count: 0,
+                    write_effects: 0,
+                    validation_effects: 0,
+                    failed_validation_effects: 0,
+                    validation_advisory_emitted: false,
+                })
+                .expect("finish root turn");
+            let root_base = recorder.sequence;
+            recorder
+                .record_context_branch_created("branch-a", ROOT_CONTEXT_BRANCH_ID, root_base, None)
+                .expect("create branch");
+            recorder
+                .record_context_checkout("branch-a", root_base)
+                .expect("checkout branch");
+            recorder.set_current_context_branch_id(Some("branch-a".into()));
+            recorder
+                .record_turn_started(TurnStartedEvent { turn_id: 2 })
+                .expect("start branch turn");
+            recorder
+                .record_context_checkout(ROOT_CONTEXT_BRANCH_ID, root_base)
+                .expect("checkout root");
+            recorder.set_current_context_branch_id(None);
+            recorder
+                .record_turn_started(TurnStartedEvent { turn_id: 3 })
+                .expect("start root turn after checkout");
+            recorder
+                .record_tool_call_started("root-call", "fs__read", json!({}))
+                .expect("start root tool");
+            let session_id = recorder.session_id().to_string();
+            drop(recorder);
+
+            let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+                .expect("reopen root checkout transcript");
+            assert_eq!(reopened.current_context_branch_id(), None);
+            assert_eq!(
+                reopened
+                    .unfinished_tool_calls_in_active_turn()
+                    .expect("root tracker should be available"),
+                vec![("root-call".into(), "fs__read".into())]
+            );
+        }
+
+        #[test]
+        fn open_reconstructs_metadata_only_branch_tracker_from_parent_projection() {
+            let base_dir = journal_test_dir("metadata-only-branch-tracker");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .record_turn_started(TurnStartedEvent { turn_id: 1 })
+                .expect("start parent turn");
+            recorder
+                .record_tool_call_started("parent-call", "fs__read", json!({}))
+                .expect("start parent tool");
+            let base_sequence = recorder.sequence;
+            recorder
+                .record_context_branch_created(
+                    "metadata-only",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    base_sequence,
+                    None,
+                )
+                .expect("create metadata-only branch");
+            let session_id = recorder.session_id().to_string();
+            drop(recorder);
+
+            let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+                .expect("reopen metadata-only branch transcript");
+            reopened.set_current_context_branch_id(Some("metadata-only".into()));
+            assert_eq!(
+                reopened
+                    .unfinished_tool_calls_in_active_turn()
+                    .expect("metadata-only tracker should be available"),
+                vec![("parent-call".into(), "fs__read".into())]
+            );
+        }
+
+        #[test]
+        fn open_rejects_malformed_branch_projection_without_tracker_fallback() {
+            let base_dir = journal_test_dir("malformed-branch-projection");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .append_transaction(vec![(
+                    TranscriptEvent::AssistantMessage {
+                        content: "scoped without a branch definition".into(),
+                    },
+                    Some("missing-branch".into()),
+                )])
+                .expect("write malformed scoped record");
+            let session_id = recorder.session_id().to_string();
+            drop(recorder);
+
+            let error = match TranscriptRecorder::open_existing(&base_dir, &session_id) {
+                Ok(_) => panic!("malformed branch projection must fail open"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("branch")
+                    || error.to_string().contains("projection")
+                    || error.to_string().contains("scope")
+            );
+        }
+
+        #[test]
+        fn open_existing_with_records_rejects_mismatched_session_records() {
+            let base_dir = journal_test_dir("open-with-records-session-mismatch");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .record_user_message("message")
+                .expect("record message");
+            let session_id = recorder.session_id().to_string();
+            let mut records = read_records(recorder.path()).expect("load records");
+            records[0].session_id = "other-session".into();
+            drop(recorder);
+
+            let result =
+                TranscriptRecorder::open_existing_with_records(&base_dir, &session_id, &records);
+            assert!(result.is_err());
+            let error = result.err().expect("mismatched records must be rejected");
+            assert!(error.to_string().contains("different session"));
+        }
+
+        #[test]
+        fn open_existing_with_records_rejects_stale_committed_frontier() {
+            let base_dir = journal_test_dir("open-with-records-stale-frontier");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .record_user_message("loaded")
+                .expect("record loaded message");
+            let session_id = recorder.session_id().to_string();
+            let (records, fingerprint) =
+                read_records_with_fingerprint(recorder.path()).expect("load records");
+            recorder
+                .record_assistant_message("appended later")
+                .expect("append after load");
+            drop(recorder);
+
+            let result = TranscriptRecorder::open_existing_with_records_at_fingerprint(
+                &base_dir,
+                &session_id,
+                &records,
+                &fingerprint,
+            );
+            assert!(result.is_err());
+            let error = result.err().expect("stale records must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed after records were loaded")
+            );
+        }
+
+        #[test]
+        fn legacy_linear_branch_adoption_scopes_future_records_without_topology_mutation() {
+            let base_dir = journal_test_dir("legacy-linear-adoption");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder.record_user_message("root").expect("root message");
+            recorder
+                .record_context_branch_created("legacy-child", ROOT_CONTEXT_BRANCH_ID, 1, None)
+                .expect("create legacy branch");
+            recorder
+                .append_metadata(TranscriptEvent::ContextExperimentStarted {
+                    branch_id: "legacy-child".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 1,
+                })
+                .expect("legacy experiment");
+            let path = recorder.path().to_path_buf();
+            let session_id = recorder.session_id().to_string();
+            drop(recorder);
+
+            let mut reopened =
+                TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen");
+            let frontier = read_records(&path).expect("read frontier").len();
+            reopened
+                .adopt_legacy_linear_branch("legacy-child")
+                .expect("adopt matching branch");
+            assert_eq!(reopened.current_context_branch_id(), Some("legacy-child"));
+            assert!(reopened.active_context_experiment().is_none());
+            drop(reopened);
+            let reconstructed = TranscriptRecorder::open_existing(&base_dir, &session_id)
+                .expect("reconstruct legacy state");
+            assert_eq!(reconstructed.current_context_branch_id(), None);
+            assert_eq!(
+                reconstructed.active_context_experiment(),
+                Some(ActiveContextExperiment {
+                    branch_id: "legacy-child".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 1,
+                    writes_observed: false,
+                })
+            );
+            drop(reconstructed);
+            let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id)
+                .expect("reopen before adopting branch for append");
+            reopened
+                .adopt_legacy_linear_branch("legacy-child")
+                .expect("adopt matching branch for append");
+            reopened
+                .record_user_message("continued")
+                .expect("user append");
+            reopened
+                .record_assistant_message("continued response")
+                .expect("assistant append");
+            reopened
+                .record_turn_finalized(TurnFinalizedEvent {
+                    turn_id: 1,
+                    outcome: "completed".into(),
+                    tool_call_count: 0,
+                    continuation_count: 0,
+                    write_effects: 0,
+                    validation_effects: 0,
+                    failed_validation_effects: 0,
+                    validation_advisory_emitted: false,
+                })
+                .expect("finalization append");
+
+            let records = read_records(&path).expect("read adopted journal");
+            assert_eq!(records.len(), frontier + 3, "adoption must not append");
+            assert!(
+                records[frontier..]
+                    .iter()
+                    .all(|record| record.context_branch_id.as_deref() == Some("legacy-child"))
+            );
+            assert!(records[frontier..].iter().all(|record| !matches!(
+                record.event,
+                TranscriptEvent::ContextBranchCreated { .. }
+                    | TranscriptEvent::ContextCheckout { .. }
+                    | TranscriptEvent::ContextExperimentReturned { .. }
+            )));
+
+            drop(reopened);
+            let reopened_again =
+                TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen again");
+            assert_eq!(
+                reopened_again.current_context_branch_id(),
+                None,
+                "open remains branch-neutral"
+            );
+        }
+
+        #[test]
+        fn legacy_linear_branch_adoption_rejects_unreturned_experiment_on_another_branch_without_mutation()
+         {
+            let base_dir = journal_test_dir("legacy-linear-adoption-mismatch");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            recorder
+                .append_metadata(TranscriptEvent::ContextExperimentStarted {
+                    branch_id: "legacy-child".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 0,
+                })
+                .expect("legacy experiment");
+            let path = recorder.path().to_path_buf();
+            let session_id = recorder.session_id().to_string();
+            drop(recorder);
+
+            let mut reopened =
+                TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen");
+            let before = read_records(&path).expect("read before");
+            let error = reopened
+                .adopt_legacy_linear_branch(ROOT_CONTEXT_BRANCH_ID)
+                .expect_err("root must reject child experiment");
+            assert!(error.to_string().contains("main"));
+            assert!(error.to_string().contains("legacy-child"));
+            assert_eq!(reopened.current_context_branch_id(), None);
+            assert!(reopened.active_context_experiment().is_some());
+            let after = read_records(&path).expect("read after");
+            assert_eq!(after.len(), before.len());
+            assert_eq!(
+                after
+                    .iter()
+                    .map(|record| record.sequence)
+                    .collect::<Vec<_>>(),
+                before
+                    .iter()
+                    .map(|record| record.sequence)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn records_tool_cancellation_and_turn_interruption() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-interrupt-test-{}",
+                unix_timestamp_ms()
+            ));
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+            recorder
+                .record_tool_call_cancelled("call-1", "shell__exec")
+                .expect("record tool cancellation");
+            recorder
+                .record_turn_interrupted(Some(7))
+                .expect("record turn interruption");
+
+            let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+                .expect("read records");
+            assert_eq!(records.len(), 2);
+
+            let cancelled = serde_json::to_value(&records[0]).expect("serialize cancelled");
+            assert_eq!(cancelled.get("kind"), Some(&json!("tool_call_cancelled")));
+            assert_eq!(cancelled.get("call_id"), Some(&json!("call-1")));
+
+            let interrupted = serde_json::to_value(&records[1]).expect("serialize interrupted");
+            assert_eq!(interrupted.get("kind"), Some(&json!("turn_interrupted")));
+            assert_eq!(interrupted.get("turn_id"), Some(&json!(7)));
+        }
+
+        #[test]
+        fn restore_session_history_closes_dangling_user_turn_on_interrupt() {
+            let records = vec![
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 1,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::UserMessage {
+                        content: "unfinished".into(),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 2,
+                    timestamp_ms: 1,
+                    context_branch_id: None,
+                    event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
+                },
+            ];
+
+            let history = restore_session_history(&records).expect("restore history");
+            assert!(matches!(
+                history.as_slice(),
+                [HistoryItem::UserMessage { content }, HistoryItem::AssistantTurn { text: Some(assistant_text), .. }]
+                    if content.text == "unfinished" && assistant_text.is_empty()
+            ));
+
+            let messages = restore_conversation_messages(&records).expect("restore messages");
+            assert_eq!(messages.len(), 2);
+            assert!(matches!(messages[0].role, ConversationRole::User));
+            assert!(matches!(messages[1].role, ConversationRole::Assistant));
+            assert!(messages[1].content.is_empty());
+        }
+
+        #[test]
+        fn restore_session_history_preserves_multimodal_tool_output_images() {
+            let image = crate::user_content::UserImageAttachment::from_bytes(
+                "pixel.png",
+                "image/png",
+                b"image-bytes",
+            );
+            let output = ToolResult::ok(
+                "fs__read",
+                json!({"path": "pixel.png", "kind": "image", "mime": "image/png"}),
+            )
+            .with_images(vec![image.clone()]);
+            let records = vec![
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 1,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ToolCallStarted {
+                        call_id: "call-image".into(),
+                        name: "fs__read".into(),
+                        args: json!({"path": "pixel.png", "offset": 1, "limit": 10}),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 2,
+                    timestamp_ms: 1,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ToolCallFinished {
+                        call_id: "call-image".into(),
+                        name: "fs__read".into(),
+                        ok: true,
+                        output,
+                    },
+                },
+            ];
+
+            let history = restore_session_history(&records).expect("restore image tool output");
+            let HistoryItem::ToolOutput {
+                output_json,
+                images,
+                ..
+            } = &history[1]
+            else {
+                panic!("expected restored tool output");
+            };
+            assert_eq!(images, &[image]);
+            assert!(!output_json.contains("data:image/png;base64,"));
+            assert!(!output_json.contains("\"images\""));
+        }
+
+        #[test]
+        fn restore_session_history_closes_interrupted_turn_after_tool_output() {
+            let records = vec![
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 1,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::UserMessage {
+                        content: "run it".into(),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 2,
+                    timestamp_ms: 1,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ToolCallStarted {
+                        call_id: "call-1".into(),
+                        name: "shell__exec".into(),
+                        args: json!({"command": "sleep 10"}),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 3,
+                    timestamp_ms: 2,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ToolCallFinished {
+                        call_id: "call-1".into(),
+                        name: "shell__exec".into(),
+                        ok: true,
+                        output: ToolResult::ok("shell__exec", json!({"stdout": "started"})),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 4,
+                    timestamp_ms: 3,
+                    context_branch_id: None,
+                    event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
+                },
+            ];
+
+            let messages = restore_conversation_messages(&records).expect("restore messages");
+            assert_eq!(messages.len(), 2);
+            assert!(matches!(messages[0].role, ConversationRole::User));
+            assert!(matches!(messages[1].role, ConversationRole::Assistant));
+            assert_eq!(messages[0].content, "run it");
+            assert!(messages[1].content.is_empty());
+        }
+
+        #[test]
+        fn evidence_records_round_trip_and_restore_from_transcript() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-evidence-test-{}",
+                unix_timestamp_ms()
+            ));
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            let draft = EvidenceDraft {
+                id: Some("ev-test".into()),
+                evidence_kind: EvidenceKind::FileExcerpt,
+                title: "read config".into(),
+                summary: "config has active provider".into(),
+                detail: Some("active_provider = openai".into()),
+                source: EvidenceSource::File {
+                    path: "letcode.toml".into(),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                },
+                tags: vec!["letcode.toml".into()],
+            };
+
+            let record = recorder.record_evidence(draft).expect("record evidence");
+            assert_eq!(record.id, "ev-test");
+
+            let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+                .expect("read records");
+            let evidence = restore_session_evidence(&records).expect("restore evidence");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].id, "ev-test");
+            assert_eq!(evidence[0].summary, "config has active provider");
+            assert!(
+                restore_conversation_messages(&records)
+                    .expect("restore messages")
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn child_transcript_records_parent_attribution_without_affecting_parent_restore() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-child-test-{}",
+                unix_timestamp_ms()
+            ));
+
+            let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+            parent
+                .record_user_message("parent question")
+                .expect("record parent user");
+            parent
+                .record_assistant_message("parent answer")
+                .expect("record parent assistant");
+
+            let child_dir = child_sessions_dir(&base_dir);
+            let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+            let child_session_id = child.session_id().to_string();
+            child
+                .record_session_started("gpt-test")
+                .expect("record child start");
+            child
+                .record_subagent_lifecycle(
+                    "sub-1",
+                    parent.session_id(),
+                    "turn-1",
+                    "explorer",
+                    "running",
+                    Some("inspect src".into()),
+                )
+                .expect("record lifecycle");
+            child
+                .record_assistant_message("child summary")
+                .expect("record child message");
+
+            let parent_records =
+                read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
+                    .expect("read parent records");
+            let child_records =
+                read_records(child_dir.join(format!("{}.jsonl", child.session_id())))
+                    .expect("read child records");
+
+            let restored =
+                restore_conversation_messages(&parent_records).expect("restore messages");
+            assert_eq!(restored.len(), 2);
+            assert_eq!(restored[0].content, "parent question");
+            assert_eq!(restored[1].content, "parent answer");
+            assert!(matches!(
+                child_records[1].event,
+                TranscriptEvent::SubagentLifecycle { .. }
+            ));
+
+            match &child_records[1].event {
+                TranscriptEvent::SubagentLifecycle {
+                    parent_session_id,
+                    parent_run_id,
+                    agent_name,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(parent_session_id, parent.session_id());
+                    assert_eq!(parent_run_id, "turn-1");
+                    assert_eq!(agent_name, "explorer");
+                    assert_eq!(status, "running");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn context_view_remove_is_append_only_metadata_not_raw_purge() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-context-view-append-only-test-{}",
+                unix_timestamp_ms()
+            ));
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+            recorder
+                .record_assistant_message("soft note that may be hidden from derived view")
+                .expect("record assistant note");
+            recorder
+                .record_context_view_operation_metadata(
+                    "remove_from_view",
+                    Some("block-seq-1-note".into()),
+                    None,
+                    Some("hide from prompt-derived context view only".into()),
+                )
+                .expect("record remove-from-view metadata");
+
+            let session_id = recorder.session_id().to_string();
+            let transcript_path = base_dir.join(format!("{session_id}.jsonl"));
+            let records = read_records(&transcript_path).expect("read records");
+
+            assert_eq!(records.len(), 2);
+            assert!(matches!(
+                &records[0].event,
+                TranscriptEvent::AssistantTurn(turn)
+                    if turn.text.as_deref() == Some("soft note that may be hidden from derived view")
+            ));
+            assert!(matches!(
+                &records[1].event,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation,
+                    block_id,
+                    node_id,
+                    ..
+                } if operation == "remove_from_view"
+                    && block_id.as_deref() == Some("block-seq-1-note")
+                    && node_id.is_none()
+            ));
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.sequence)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+
+            drop(recorder);
+            let mut reopened =
+                TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen recorder");
+            reopened
+                .record_user_message("new message after reopen")
+                .expect("append after reopen");
+
+            let reopened_records = read_records(&transcript_path).expect("read reopened records");
+            assert_eq!(reopened_records.len(), 3);
+            assert!(matches!(
+                &reopened_records[0].event,
+                TranscriptEvent::AssistantTurn(turn)
+                    if turn.text.as_deref() == Some("soft note that may be hidden from derived view")
+            ));
+            assert!(matches!(
+                &reopened_records[1].event,
+                TranscriptEvent::ContextViewOperationMetadata { operation, .. }
+                    if operation == "remove_from_view"
+            ));
+            assert!(matches!(
+                &reopened_records[2].event,
+                TranscriptEvent::UserMessage { content }
+                    if content.display_text() == "new message after reopen"
+            ));
+            let sequences = reopened_records
                 .iter()
                 .map(|record| record.sequence)
-                .max()
-                .unwrap_or(0)
-                + 1
-        )
-    );
-}
+                .collect::<Vec<_>>();
+            assert_eq!(sequences, vec![1, 2, 3]);
+            assert_eq!(
+                reopened_records.last().map(|record| record.sequence),
+                Some(
+                    records
+                        .iter()
+                        .map(|record| record.sequence)
+                        .max()
+                        .unwrap_or(0)
+                        + 1
+                )
+            );
+        }
 
-#[test]
-fn restore_job_board_derives_active_state_from_child_transcript() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-active-job-board-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
-    let parent_session_id = parent.session_id().to_string();
-    let child_dir = child_sessions_dir(&base_dir);
-    let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
-    let child_session_id = child.session_id().to_string();
-    parent
-        .record_subagent_started(
-            "run-active",
-            &parent_session_id,
-            "turn-1",
-            &child_session_id,
-            "fixer",
-            "apply patch",
-            7,
-        )
-        .expect("register child");
-    child
-        .record_subagent_lifecycle(
-            "run-active",
-            &parent_session_id,
-            "turn-1",
-            "fixer",
-            "running",
-            Some("apply patch".into()),
-        )
-        .expect("record running lifecycle");
+        #[test]
+        fn restore_job_board_derives_active_state_from_child_transcript() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-active-job-board-test-{}",
+                unix_timestamp_ms()
+            ));
+            let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+            let parent_session_id = parent.session_id().to_string();
+            let child_dir = child_sessions_dir(&base_dir);
+            let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+            let child_session_id = child.session_id().to_string();
+            parent
+                .record_subagent_started(
+                    "run-active",
+                    &parent_session_id,
+                    "turn-1",
+                    &child_session_id,
+                    "fixer",
+                    "apply patch",
+                    7,
+                )
+                .expect("register child");
+            child
+                .record_subagent_lifecycle(
+                    "run-active",
+                    &parent_session_id,
+                    "turn-1",
+                    "fixer",
+                    "running",
+                    Some("apply patch".into()),
+                )
+                .expect("record running lifecycle");
 
-    let mut child_file = OpenOptions::new()
-        .append(true)
-        .open(child.path())
-        .expect("open child transcript for partial append");
-    child_file
+            let mut child_file = OpenOptions::new()
+                .append(true)
+                .open(child.path())
+                .expect("open child transcript for partial append");
+            child_file
         .write_all(
             br#"{"session_id":"child","sequence":2,"timestamp_ms":1,"kind":"tool_call_finished""#,
         )
         .expect("append partial live record");
 
-    let parent_records = read_records(base_dir.join(format!("{parent_session_id}.jsonl")))
-        .expect("read parent records");
-    let job_board = restore_job_board(&base_dir, &parent_records).expect("derive active board");
-    assert_eq!(job_board.len(), 1);
-    assert!(job_board[0].active);
-    assert_eq!(job_board[0].child_session_id, child_session_id);
-    assert_eq!(job_board[0].status, "running");
+            let parent_records = read_records(base_dir.join(format!("{parent_session_id}.jsonl")))
+                .expect("read parent records");
+            let job_board =
+                restore_job_board(&base_dir, &parent_records).expect("derive active board");
+            assert_eq!(job_board.len(), 1);
+            assert!(job_board[0].active);
+            assert_eq!(job_board[0].child_session_id, child_session_id);
+            assert_eq!(job_board[0].status, "running");
 
-    let projected = project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
-    assert_eq!(projected.len(), 1);
-    assert_eq!(projected[0].run_id, "run-active");
-    assert_eq!(projected[0].pool_ordinal, 7);
-}
+            let projected =
+                project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
+            assert_eq!(projected.len(), 1);
+            assert_eq!(projected[0].run_id, "run-active");
+            assert_eq!(projected[0].pool_ordinal, 7);
+        }
 
-#[test]
-fn project_subagent_jobs_ignores_results_from_unowned_child_sessions() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-unowned-job-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
-    let parent_session_id = parent.session_id().to_string();
-    parent
-        .record_subagent_result(
-            "run-unowned",
-            &parent_session_id,
-            "turn-1",
-            "missing-child",
-            "explorer",
-            "completed",
-            "foreign result",
-        )
-        .expect("record result");
-    let parent_records = read_records(parent.path()).expect("read parent records");
+        #[test]
+        fn project_subagent_jobs_ignores_results_from_unowned_child_sessions() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-unowned-job-test-{}",
+                unix_timestamp_ms()
+            ));
+            let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+            let parent_session_id = parent.session_id().to_string();
+            parent
+                .record_subagent_result(
+                    "run-unowned",
+                    &parent_session_id,
+                    "turn-1",
+                    "missing-child",
+                    "explorer",
+                    "completed",
+                    "foreign result",
+                )
+                .expect("record result");
+            let parent_records = read_records(parent.path()).expect("read parent records");
 
-    let projected = project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
-    assert!(projected.is_empty());
-}
+            let projected =
+                project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
+            assert!(projected.is_empty());
+        }
 
-#[test]
-fn project_subagent_jobs_requires_started_ownership_even_when_child_file_exists() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-unowned-existing-child-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
-    let parent_session_id = parent.session_id().to_string();
-    let child_dir = child_sessions_dir(&base_dir);
-    let child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
-    let child_session_id = child.session_id().to_string();
-    parent
-        .record_subagent_result(
-            "run-unowned-existing",
-            &parent_session_id,
-            "turn-1",
-            &child_session_id,
-            "explorer",
-            "completed",
-            "foreign result",
-        )
-        .expect("record result");
-    let parent_records = read_records(parent.path()).expect("read parent records");
+        #[test]
+        fn project_subagent_jobs_requires_started_ownership_even_when_child_file_exists() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-unowned-existing-child-test-{}",
+                unix_timestamp_ms()
+            ));
+            let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+            let parent_session_id = parent.session_id().to_string();
+            let child_dir = child_sessions_dir(&base_dir);
+            let child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+            let child_session_id = child.session_id().to_string();
+            parent
+                .record_subagent_result(
+                    "run-unowned-existing",
+                    &parent_session_id,
+                    "turn-1",
+                    &child_session_id,
+                    "explorer",
+                    "completed",
+                    "foreign result",
+                )
+                .expect("record result");
+            let parent_records = read_records(parent.path()).expect("read parent records");
 
-    let projected = project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
-    assert!(projected.is_empty());
-    assert!(SubagentPool::child_sessions(&base_dir, &parent_records).is_empty());
+            let projected =
+                project_subagent_jobs(&base_dir, &parent_records).expect("project jobs");
+            assert!(projected.is_empty());
+            assert!(SubagentPool::child_sessions(&base_dir, &parent_records).is_empty());
+        }
+    }
 }
 
 #[test]
@@ -1989,52 +2049,60 @@ fn read_records_accepts_legacy_prompt_composition_shapes() {
     }
 }
 
-#[test]
-fn structured_subagent_result_and_evidence_commit_atomically() {
-    let base_dir = journal_test_dir("subagent-result-transaction");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    let session_id = recorder.session_id().to_string();
-    let structured = StructuredSubagentResult {
-        status: "completed".into(),
-        summary: "done".into(),
-        malformed: false,
-        findings: Vec::new(),
-        files_read: Vec::new(),
-        files_changed: Vec::new(),
-        commands_run: Vec::new(),
-        validation: Vec::new(),
-        blockers: Vec::new(),
-        next_steps: Vec::new(),
-        run_id: "run-transaction".into(),
-        child_session_id: "child-transaction".into(),
-        raw_excerpt: None,
-    };
-    recorder
-        .record_subagent_result_structured(
-            "run-transaction",
-            &session_id,
-            "turn-1",
-            "child-transaction",
-            "explorer",
-            "completed",
-            "done",
-            Some(structured),
-        )
-        .expect("record structured result");
+mod subagent_commit {
+    use super::*;
 
-    let records = read_records(recorder.path()).expect("read records");
-    assert_eq!(records.len(), 2);
-    assert!(matches!(
-        records[0].event,
-        TranscriptEvent::SubagentResult { .. }
-    ));
-    assert!(matches!(
-        &records[1].event,
-        TranscriptEvent::Evidence {
-            source: EvidenceSource::Subagent { run_id, .. },
-            ..
-        } if run_id == "run-transaction"
-    ));
+    mod integration_tests {
+        use super::*;
+
+        #[test]
+        fn structured_subagent_result_and_evidence_commit_atomically() {
+            let base_dir = journal_test_dir("subagent-result-transaction");
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+            let session_id = recorder.session_id().to_string();
+            let structured = StructuredSubagentResult {
+                status: "completed".into(),
+                summary: "done".into(),
+                malformed: false,
+                findings: Vec::new(),
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                commands_run: Vec::new(),
+                validation: Vec::new(),
+                blockers: Vec::new(),
+                next_steps: Vec::new(),
+                run_id: "run-transaction".into(),
+                child_session_id: "child-transaction".into(),
+                raw_excerpt: None,
+            };
+            recorder
+                .record_subagent_result_structured(
+                    "run-transaction",
+                    &session_id,
+                    "turn-1",
+                    "child-transaction",
+                    "explorer",
+                    "completed",
+                    "done",
+                    Some(structured),
+                )
+                .expect("record structured result");
+
+            let records = read_records(recorder.path()).expect("read records");
+            assert_eq!(records.len(), 2);
+            assert!(matches!(
+                records[0].event,
+                TranscriptEvent::SubagentResult { .. }
+            ));
+            assert!(matches!(
+                &records[1].event,
+                TranscriptEvent::Evidence {
+                    source: EvidenceSource::Subagent { run_id, .. },
+                    ..
+                } if run_id == "run-transaction"
+            ));
+        }
+    }
 }
 
 #[test]
@@ -2176,15 +2244,21 @@ fn restore_latest_workflow_todos_persist_across_turns_and_errors() {
     assert!(restore_latest_todo_snapshot(&records).is_none());
 }
 
-#[test]
-fn unknown_transcript_events_are_read_and_ignored_for_restore() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-unknown-event-test-{}",
-        unix_timestamp_ms()
-    ));
-    fs::create_dir_all(&base_dir).expect("create temp dir");
-    let path = base_dir.join("unknown.jsonl");
-    fs::write(
+mod unknown_events {
+    use super::*;
+
+    mod integration_tests {
+        use super::*;
+
+        #[test]
+        fn unknown_transcript_events_are_read_and_ignored_for_restore() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-unknown-event-test-{}",
+                unix_timestamp_ms()
+            ));
+            fs::create_dir_all(&base_dir).expect("create temp dir");
+            let path = base_dir.join("unknown.jsonl");
+            fs::write(
         &path,
         r#"{"session_id":"s","sequence":1,"timestamp_ms":0,"kind":"future_audit_event","extra":"ignored"}
 {"session_id":"s","sequence":2,"timestamp_ms":1,"kind":"user_message","content":"hi"}
@@ -2192,13 +2266,15 @@ fn unknown_transcript_events_are_read_and_ignored_for_restore() {
     )
     .expect("write transcript");
 
-    let records = read_records(&path).expect("read unknown transcript event");
-    assert_eq!(records.len(), 2);
-    assert!(matches!(records[0].event, TranscriptEvent::Unknown));
+            let records = read_records(&path).expect("read unknown transcript event");
+            assert_eq!(records.len(), 2);
+            assert!(matches!(records[0].event, TranscriptEvent::Unknown));
 
-    let restored = restore_conversation_messages(&records).expect("restore messages");
-    assert_eq!(restored.len(), 1);
-    assert_eq!(restored[0].content, "hi");
+            let restored = restore_conversation_messages(&records).expect("restore messages");
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].content, "hi");
+        }
+    }
 }
 
 #[test]
@@ -2249,84 +2325,94 @@ fn strict_read_records_fails_on_partial_tail_but_live_read_ignores_it() {
     ));
 }
 
-#[test]
-fn recovery_ignores_an_uncommitted_logical_checkpoint_tail_and_keeps_legacy_projection() {
-    let base_dir = journal_test_dir("checkpoint-uncommitted-tail");
-    fs::create_dir_all(&base_dir).expect("create temp dir");
-    let path = base_dir.join("checkpoint-tail.jsonl");
-    let legacy = TranscriptRecord {
-        session_id: "s".into(),
-        sequence: 1,
-        timestamp_ms: 0,
-        context_branch_id: None,
-        event: TranscriptEvent::UserMessage {
-            content: UserMessageContent::from("legacy request"),
-        },
-    };
-    let checkpoint = JournalRecordEnvelope {
-        schema_version: JOURNAL_SCHEMA_VERSION,
-        event_id: "s:2".into(),
-        scope: JournalScope::Branch,
-        base_revision: 1,
-        resulting_revision: 2,
-        transaction_id: Some("checkpoint-tail".into()),
-        transaction_index: Some(0),
-        transaction_count: Some(1),
-        record: TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 0,
-            context_branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
-            event: TranscriptEvent::LogicalCheckpoint(LogicalCheckpointEventV1 {
-                schema_version: 1,
-                checkpoint_id: "checkpoint-tail".into(),
-                turn_id: 1,
-                previous_segment_id: 0,
-                segment_id: 1,
-                previous_checkpoint_id: None,
-                boundary_sequence: 1,
-                context_scope_revision: 0,
-                covered_source_spans: vec![LogicalCheckpointSourceSpanV1 {
-                    start_sequence: 1,
-                    end_sequence: 1,
-                }],
-                retained_items: Vec::new(),
-            }),
-        },
-    };
-    let legacy_line = serde_json::to_string(&legacy).expect("serialize legacy record");
-    let checkpoint_line = String::from_utf8(
-        serialize_journal_record(&checkpoint).expect("serialize checkpoint record"),
-    )
-    .expect("checkpoint JSON is UTF-8");
-    // The final commit marker is both malformed and physically incomplete,
-    // matching a crash while acknowledging a checkpoint transaction.
-    fs::write(
-        &path,
-        format!("{legacy_line}\n{checkpoint_line}\n{{\"journal_entry\":\"transaction_commit\""),
-    )
-    .expect("write interrupted journal");
+mod recovery {
+    use super::*;
 
-    let recovered = read_records_allow_partial_tail(&path).expect("recover live prefix");
-    assert_eq!(recovered.len(), 1);
-    assert!(matches!(
-        recovered[0].event,
-        TranscriptEvent::UserMessage { .. }
-    ));
-    assert!(
-        restore_runtime_snapshot(&recovered)
-            .expect("restore legacy prefix")
-            .current_segment_id
-            .is_none()
-    );
-    assert_eq!(
-        restore_conversation_messages(&recovered)
-            .expect("restore legacy messages")
-            .into_iter()
-            .map(|message| message.content)
-            .collect::<Vec<_>>(),
-        ["legacy request"]
-    );
+    mod integration_tests {
+        use super::*;
+
+        #[test]
+        fn recovery_ignores_an_uncommitted_logical_checkpoint_tail_and_keeps_legacy_projection() {
+            let base_dir = journal_test_dir("checkpoint-uncommitted-tail");
+            fs::create_dir_all(&base_dir).expect("create temp dir");
+            let path = base_dir.join("checkpoint-tail.jsonl");
+            let legacy = TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("legacy request"),
+                },
+            };
+            let checkpoint = JournalRecordEnvelope {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                event_id: "s:2".into(),
+                scope: JournalScope::Branch,
+                base_revision: 1,
+                resulting_revision: 2,
+                transaction_id: Some("checkpoint-tail".into()),
+                transaction_index: Some(0),
+                transaction_count: Some(1),
+                record: TranscriptRecord {
+                    session_id: "s".into(),
+                    sequence: 2,
+                    timestamp_ms: 0,
+                    context_branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                    event: TranscriptEvent::LogicalCheckpoint(LogicalCheckpointEventV1 {
+                        schema_version: 1,
+                        checkpoint_id: "checkpoint-tail".into(),
+                        turn_id: 1,
+                        previous_segment_id: 0,
+                        segment_id: 1,
+                        previous_checkpoint_id: None,
+                        boundary_sequence: 1,
+                        context_scope_revision: 0,
+                        covered_source_spans: vec![LogicalCheckpointSourceSpanV1 {
+                            start_sequence: 1,
+                            end_sequence: 1,
+                        }],
+                        retained_items: Vec::new(),
+                    }),
+                },
+            };
+            let legacy_line = serde_json::to_string(&legacy).expect("serialize legacy record");
+            let checkpoint_line = String::from_utf8(
+                serialize_journal_record(&checkpoint).expect("serialize checkpoint record"),
+            )
+            .expect("checkpoint JSON is UTF-8");
+            // The final commit marker is both malformed and physically incomplete,
+            // matching a crash while acknowledging a checkpoint transaction.
+            fs::write(
+                &path,
+                format!(
+                    "{legacy_line}\n{checkpoint_line}\n{{\"journal_entry\":\"transaction_commit\""
+                ),
+            )
+            .expect("write interrupted journal");
+
+            let recovered = read_records_allow_partial_tail(&path).expect("recover live prefix");
+            assert_eq!(recovered.len(), 1);
+            assert!(matches!(
+                recovered[0].event,
+                TranscriptEvent::UserMessage { .. }
+            ));
+            assert!(
+                restore_runtime_snapshot(&recovered)
+                    .expect("restore legacy prefix")
+                    .current_segment_id
+                    .is_none()
+            );
+            assert_eq!(
+                restore_conversation_messages(&recovered)
+                    .expect("restore legacy messages")
+                    .into_iter()
+                    .map(|message| message.content)
+                    .collect::<Vec<_>>(),
+                ["legacy request"]
+            );
+        }
+    }
 }
 
 #[test]
@@ -2353,170 +2439,179 @@ fn live_read_records_keeps_complete_tail_strict() {
     assert!(error.to_string().contains("failed to parse line 2"));
 }
 
-#[test]
-fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-live-batch-tail-test-{}",
-        unix_timestamp_ms()
-    ));
-    fs::create_dir_all(&base_dir).expect("create temp dir");
-    let path = base_dir.join("live.jsonl");
-    let calls = vec![
-        HistoryToolCall {
-            call_id: "call-1".into(),
-            name: "fs__read".into(),
-            arguments_json: r#"{"path":"one"}"#.into(),
-        },
-        HistoryToolCall {
-            call_id: "call-2".into(),
-            name: "fs__read".into(),
-            arguments_json: r#"{"path":"two"}"#.into(),
-        },
-    ];
-    let prefix = vec![
-        TranscriptRecord {
-            session_id: "live".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 1 }),
-        },
-        TranscriptRecord {
-            session_id: "live".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::UserMessage {
-                content: UserMessageContent::from("inspect both"),
-            },
-        },
-        TranscriptRecord {
-            session_id: "live".into(),
-            sequence: 3,
-            timestamp_ms: 2,
-            context_branch_id: None,
-            event: TranscriptEvent::AssistantToolCallBatch {
-                text: None,
-                reasoning_content: None,
-                reasoning_wire: None,
-                calls,
-            },
-        },
-        TranscriptRecord {
-            session_id: "live".into(),
-            sequence: 4,
-            timestamp_ms: 3,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolCallFinished {
-                call_id: "call-1".into(),
-                name: "fs__read".into(),
-                ok: true,
-                output: ToolResult::ok("fs__read", json!({"contents":"one"})),
-            },
-        },
-    ];
-    let final_record = TranscriptRecord {
-        session_id: "live".into(),
-        sequence: 5,
-        timestamp_ms: 4,
-        context_branch_id: None,
-        event: TranscriptEvent::ToolCallFinished {
-            call_id: "call-2".into(),
-            name: "fs__read".into(),
-            ok: true,
-            output: ToolResult::ok("fs__read", json!({"contents":"two"})),
-        },
-    };
-    let final_line = serde_json::to_string(&final_record).expect("serialize final output");
-    let partial_len = final_line.len() - 1;
-    let mut content = prefix
-        .iter()
-        .map(|record| serde_json::to_string(record).expect("serialize prefix"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    content.push('\n');
-    content.push_str(&final_line[..partial_len]);
-    fs::write(&path, content).expect("write live partial transcript");
+mod live_projection {
+    use super::*;
 
-    let live_records = read_records_allow_partial_tail(&path).expect("read complete live prefix");
-    assert_eq!(live_records.len(), 4);
-    let live = transcript_projection::project_runtime_restore_snapshot(
-        "live".into(),
-        live_records.clone(),
-        transcript_projection::SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("project incomplete live runtime");
-    let live_history = history_items_from_frames(&live.protocol_frames);
-    assert!(
-        analyze_history_items(&live_history, None)
-            .expect("analyze live group")
-            .has_incomplete_tool_call_groups()
-    );
-    let protected = &live.snapshot.compaction.protected_frame_ids;
-    assert_eq!(protected.len(), 3);
-    assert!(live.snapshot.frames.iter().any(|frame| {
-        protected.contains(&frame.id)
-            && frame.kind == crate::runtime_context::RuntimeFrameKind::ToolCall
-    }));
-    let model = ModelRequestMetadata {
-        supports_tools: true,
-        ..Default::default()
-    };
-    assert!(
-        build_request(RequestBuilderInput {
-            model_id: "gpt-test",
-            model: model.clone(),
-            prelude: &[],
-            snapshot: &live.snapshot,
-            tools: &[]
-        })
-        .is_err(),
-        "the planner must reject the incomplete batch"
-    );
-    assert_eq!(
-        serde_json::to_value(&live_records).expect("serialize live records"),
-        serde_json::to_value(&prefix).expect("serialize source prefix")
-    );
+    mod integration_tests {
+        use super::*;
 
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .expect("open live transcript");
-    file.write_all(&final_line.as_bytes()[partial_len..])
-        .expect("complete final record");
-    file.write_all(b"\n").expect("terminate final record");
-    file.flush().expect("flush final record");
-    let complete_records =
-        read_records_allow_partial_tail(&path).expect("read completed live transcript");
-    assert_eq!(complete_records.len(), 5);
-    let complete = transcript_projection::project_runtime_restore_snapshot(
-        "live".into(),
-        complete_records,
-        transcript_projection::SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("project complete live runtime");
-    let complete_history = history_items_from_frames(&complete.protocol_frames);
-    assert!(
-        !analyze_history_items(&complete_history, None)
-            .expect("analyze completed group")
-            .has_incomplete_tool_call_groups()
-    );
-    build_request(RequestBuilderInput {
-        model_id: "gpt-test",
-        model,
-        prelude: &[],
-        snapshot: &complete.snapshot,
-        tools: &[],
-    })
-    .expect("the planner accepts the complete batch");
+        #[test]
+        fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-transcript-live-batch-tail-test-{}",
+                unix_timestamp_ms()
+            ));
+            fs::create_dir_all(&base_dir).expect("create temp dir");
+            let path = base_dir.join("live.jsonl");
+            let calls = vec![
+                HistoryToolCall {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                    arguments_json: r#"{"path":"one"}"#.into(),
+                },
+                HistoryToolCall {
+                    call_id: "call-2".into(),
+                    name: "fs__read".into(),
+                    arguments_json: r#"{"path":"two"}"#.into(),
+                },
+            ];
+            let prefix = vec![
+                TranscriptRecord {
+                    session_id: "live".into(),
+                    sequence: 1,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::TurnStarted(TurnStartedEvent { turn_id: 1 }),
+                },
+                TranscriptRecord {
+                    session_id: "live".into(),
+                    sequence: 2,
+                    timestamp_ms: 1,
+                    context_branch_id: None,
+                    event: TranscriptEvent::UserMessage {
+                        content: UserMessageContent::from("inspect both"),
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "live".into(),
+                    sequence: 3,
+                    timestamp_ms: 2,
+                    context_branch_id: None,
+                    event: TranscriptEvent::AssistantToolCallBatch {
+                        text: None,
+                        reasoning_content: None,
+                        reasoning_wire: None,
+                        calls,
+                    },
+                },
+                TranscriptRecord {
+                    session_id: "live".into(),
+                    sequence: 4,
+                    timestamp_ms: 3,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ToolCallFinished {
+                        call_id: "call-1".into(),
+                        name: "fs__read".into(),
+                        ok: true,
+                        output: ToolResult::ok("fs__read", json!({"contents":"one"})),
+                    },
+                },
+            ];
+            let final_record = TranscriptRecord {
+                session_id: "live".into(),
+                sequence: 5,
+                timestamp_ms: 4,
+                context_branch_id: None,
+                event: TranscriptEvent::ToolCallFinished {
+                    call_id: "call-2".into(),
+                    name: "fs__read".into(),
+                    ok: true,
+                    output: ToolResult::ok("fs__read", json!({"contents":"two"})),
+                },
+            };
+            let final_line = serde_json::to_string(&final_record).expect("serialize final output");
+            let partial_len = final_line.len() - 1;
+            let mut content = prefix
+                .iter()
+                .map(|record| serde_json::to_string(record).expect("serialize prefix"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            content.push('\n');
+            content.push_str(&final_line[..partial_len]);
+            fs::write(&path, content).expect("write live partial transcript");
+
+            let live_records =
+                read_records_allow_partial_tail(&path).expect("read complete live prefix");
+            assert_eq!(live_records.len(), 4);
+            let live = transcript_projection::project_runtime_restore_snapshot(
+                "live".into(),
+                live_records.clone(),
+                transcript_projection::SessionContextCursor {
+                    branch_id: None,
+                    leaf_sequence: None,
+                },
+                &[],
+            )
+            .expect("project incomplete live runtime");
+            let live_history = history_items_from_frames(&live.protocol_frames);
+            assert!(
+                analyze_history_items(&live_history, None)
+                    .expect("analyze live group")
+                    .has_incomplete_tool_call_groups()
+            );
+            let protected = &live.snapshot.compaction.protected_frame_ids;
+            assert_eq!(protected.len(), 3);
+            assert!(live.snapshot.frames.iter().any(|frame| {
+                protected.contains(&frame.id)
+                    && frame.kind == crate::runtime_context::RuntimeFrameKind::ToolCall
+            }));
+            let model = ModelRequestMetadata {
+                supports_tools: true,
+                ..Default::default()
+            };
+            assert!(
+                build_request(RequestBuilderInput {
+                    model_id: "gpt-test",
+                    model: model.clone(),
+                    prelude: &[],
+                    snapshot: &live.snapshot,
+                    tools: &[]
+                })
+                .is_err(),
+                "the planner must reject the incomplete batch"
+            );
+            assert_eq!(
+                serde_json::to_value(&live_records).expect("serialize live records"),
+                serde_json::to_value(&prefix).expect("serialize source prefix")
+            );
+
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open live transcript");
+            file.write_all(&final_line.as_bytes()[partial_len..])
+                .expect("complete final record");
+            file.write_all(b"\n").expect("terminate final record");
+            file.flush().expect("flush final record");
+            let complete_records =
+                read_records_allow_partial_tail(&path).expect("read completed live transcript");
+            assert_eq!(complete_records.len(), 5);
+            let complete = transcript_projection::project_runtime_restore_snapshot(
+                "live".into(),
+                complete_records,
+                transcript_projection::SessionContextCursor {
+                    branch_id: None,
+                    leaf_sequence: None,
+                },
+                &[],
+            )
+            .expect("project complete live runtime");
+            let complete_history = history_items_from_frames(&complete.protocol_frames);
+            assert!(
+                !analyze_history_items(&complete_history, None)
+                    .expect("analyze completed group")
+                    .has_incomplete_tool_call_groups()
+            );
+            build_request(RequestBuilderInput {
+                model_id: "gpt-test",
+                model,
+                prelude: &[],
+                snapshot: &complete.snapshot,
+                tools: &[],
+            })
+            .expect("the planner accepts the complete batch");
+        }
+    }
 }
 
 #[test]
@@ -2566,352 +2661,360 @@ fn restore_max_turn_id_uses_all_turn_audit_events() {
     assert_eq!(restore_max_turn_id(&records), 5);
 }
 
-#[test]
-fn non_checkpoint_tool_finished_does_not_switch_branch() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-non-checkpoint-tool-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_session_started("gpt-test")
-        .expect("session started");
-    recorder
-        .record_tool_call_started("call-1", "fs__read", json!({"path": "src/main.rs"}))
-        .expect("tool started");
+mod integration_tests {
+    use super::*;
 
-    recorder
-        .record_tool_call_finished(
-            "call-1",
-            "fs__read",
-            true,
-            ToolResult::ok("fs__read", json!({"content": "ok"})),
-        )
-        .expect("tool finished");
-    recorder
-        .record_assistant_message("still on main")
-        .expect("assistant message");
+    #[test]
+    fn non_checkpoint_tool_finished_does_not_switch_branch() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-non-checkpoint-tool-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder
+            .record_tool_call_started("call-1", "fs__read", json!({"path": "src/main.rs"}))
+            .expect("tool started");
 
-    let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-        .expect("read records");
-    assert_eq!(records.len(), 4);
-    assert!(matches!(
-        records[2].event,
-        TranscriptEvent::ToolCallFinished { .. }
-    ));
-    assert!(matches!(
-        records[3].event,
-        TranscriptEvent::AssistantTurn(_)
-    ));
-    assert_eq!(records[3].context_branch_id, None);
-    assert_eq!(recorder.current_context_branch_id(), None);
-}
+        recorder
+            .record_tool_call_finished(
+                "call-1",
+                "fs__read",
+                true,
+                ToolResult::ok("fs__read", json!({"content": "ok"})),
+            )
+            .expect("tool finished");
+        recorder
+            .record_assistant_message("still on main")
+            .expect("assistant message");
 
-#[test]
-fn session_summaries_carry_the_recorded_workspace() {
-    let base_dir = journal_test_dir("session-workspace");
-    let mut grouped = TranscriptRecorder::create(&base_dir).expect("create transcript");
-    grouped
-        .record_session_started("test/model")
-        .expect("record session start");
-    grouped
-        .record_session_workspace("/work/letcode")
-        .expect("record workspace");
-    grouped
-        .record_user_message("grouped by project")
-        .expect("record user message");
-
-    let mut unrecorded = TranscriptRecorder::create(&base_dir).expect("create transcript");
-    unrecorded
-        .record_session_started("test/model")
-        .expect("record session start");
-    unrecorded
-        .record_user_message("predates the workspace record")
-        .expect("record user message");
-
-    for summaries in [
-        list_sessions(&base_dir).expect("first list"),
-        list_sessions(&base_dir).expect("second list hits the sidecar index"),
-    ] {
-        let workspace = |session_id: &str| {
-            summaries
-                .iter()
-                .find(|summary| summary.session_id == session_id)
-                .and_then(|summary| summary.workspace.clone())
-        };
-
-        assert_eq!(
-            workspace(grouped.session_id()).as_deref(),
-            Some("/work/letcode")
-        );
-        assert_eq!(workspace(unrecorded.session_id()), None);
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        assert_eq!(records.len(), 4);
+        assert!(matches!(
+            records[2].event,
+            TranscriptEvent::ToolCallFinished { .. }
+        ));
+        assert!(matches!(
+            records[3].event,
+            TranscriptEvent::AssistantTurn(_)
+        ));
+        assert_eq!(records[3].context_branch_id, None);
+        assert_eq!(recorder.current_context_branch_id(), None);
     }
-}
 
-#[test]
-fn list_sessions_persists_and_reuses_sidecar_index() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-list-index-test-{}",
-        unix_timestamp_ms()
-    ));
+    #[test]
+    fn session_summaries_carry_the_recorded_workspace() {
+        let base_dir = journal_test_dir("session-workspace");
+        let mut grouped = TranscriptRecorder::create(&base_dir).expect("create transcript");
+        grouped
+            .record_session_started("test/model")
+            .expect("record session start");
+        grouped
+            .record_session_workspace("/work/letcode")
+            .expect("record workspace");
+        grouped
+            .record_user_message("grouped by project")
+            .expect("record user message");
 
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_session_started("gpt-test")
-        .expect("record session start");
-    recorder
-        .record_user_message("indexed session")
-        .expect("record user message");
-    recorder
-        .record_session_title("Indexed")
-        .expect("record title");
+        let mut unrecorded = TranscriptRecorder::create(&base_dir).expect("create transcript");
+        unrecorded
+            .record_session_started("test/model")
+            .expect("record session start");
+        unrecorded
+            .record_user_message("predates the workspace record")
+            .expect("record user message");
 
-    assert!(
-        !base_dir.join("sessions-index.json").exists(),
-        "append must not create the session index sidecar"
-    );
+        for summaries in [
+            list_sessions(&base_dir).expect("first list"),
+            list_sessions(&base_dir).expect("second list hits the sidecar index"),
+        ] {
+            let workspace = |session_id: &str| {
+                summaries
+                    .iter()
+                    .find(|summary| summary.session_id == session_id)
+                    .and_then(|summary| summary.workspace.clone())
+            };
 
-    let first = list_sessions(&base_dir).expect("first list");
-    assert_eq!(first.len(), 1);
-    assert_eq!(first[0].title.as_deref(), Some("Indexed"));
-    assert!(
-        base_dir.join("sessions-index.json").is_file(),
-        "sidecar index should be written"
-    );
+            assert_eq!(
+                workspace(grouped.session_id()).as_deref(),
+                Some("/work/letcode")
+            );
+            assert_eq!(workspace(unrecorded.session_id()), None);
+        }
+    }
 
-    let second = list_sessions(&base_dir).expect("second list hits index");
-    assert_eq!(first, second);
+    #[test]
+    fn list_sessions_persists_and_reuses_sidecar_index() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-list-index-test-{}",
+            unix_timestamp_ms()
+        ));
 
-    std::fs::write(base_dir.join("sessions-index.json"), b"{}").expect("invalidate sidecar");
-    let appended_during_scan = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let append_once = Arc::clone(&appended_during_scan);
-    let transcript_path = recorder.path().to_path_buf();
-    let during_scan =
-        super::session_index::list_sessions_with_index(&base_dir, |path, session_id| {
-            let summary = summarize_session_file(path, session_id)?;
-            if !append_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                recorder
-                    .record_session_title("Concurrent")
-                    .expect("append during sidecar rebuild");
-            }
-            Ok(summary)
-        })
-        .expect("list while transcript advances");
-    assert_eq!(during_scan[0].title.as_deref(), Some("Indexed"));
-    let after_concurrent_append =
-        list_sessions(&base_dir).expect("stale scan stamp forces rebuild");
-    assert_eq!(
-        after_concurrent_append[0].title.as_deref(),
-        Some("Concurrent")
-    );
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("record session start");
+        recorder
+            .record_user_message("indexed session")
+            .expect("record user message");
+        recorder
+            .record_session_title("Indexed")
+            .expect("record title");
 
-    let path = transcript_path;
-    let stale_index =
-        std::fs::read(base_dir.join("sessions-index.json")).expect("read existing sidecar");
-    recorder
-        .record_session_title("Updated")
-        .expect("append updated title");
-    assert_eq!(
-        std::fs::read(base_dir.join("sessions-index.json")).expect("read sidecar after append"),
-        stale_index,
-        "append must not update the session index sidecar"
-    );
-    let after_append = list_sessions(&base_dir).expect("list after append");
-    assert_eq!(after_append[0].title.as_deref(), Some("Updated"));
+        assert!(
+            !base_dir.join("sessions-index.json").exists(),
+            "append must not create the session index sidecar"
+        );
 
-    // Stale stamp forces a rescan when the transcript changes outside the recorder.
+        let first = list_sessions(&base_dir).expect("first list");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].title.as_deref(), Some("Indexed"));
+        assert!(
+            base_dir.join("sessions-index.json").is_file(),
+            "sidecar index should be written"
+        );
 
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .expect("open transcript");
-    use std::io::Write;
-    file.write_all(b"\n").expect("touch file");
-    drop(file);
+        let second = list_sessions(&base_dir).expect("second list hits index");
+        assert_eq!(first, second);
 
-    let third = list_sessions(&base_dir).expect("list after stamp change");
-    assert_eq!(third.len(), 1);
-    assert_eq!(third[0].session_id, recorder.session_id());
-}
-
-#[test]
-fn subagents_policy_is_durable_metadata_outside_session_history() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut recorder = TranscriptRecorder::create(dir.path()).unwrap();
-    recorder.record_session_started("test/model").unwrap();
-    let policy = crate::config::SubagentsConfig {
-        mode: crate::config::SubagentMode::Swarm,
-        max_depth: 5,
-        ..Default::default()
-    };
-    recorder.record_subagents_policy(&policy).unwrap();
-    recorder
-        .record_subagent_activation(
-            "run".into(),
-            crate::subagent::SwarmMember {
-                root_session_id: "root".into(),
-                parent_session_id: "root".into(),
-                child_session_id: recorder.session_id().to_string(),
-                depth: 1,
-                agent_name: "explorer".into(),
-                pool_ordinal: 1,
+        std::fs::write(base_dir.join("sessions-index.json"), b"{}").expect("invalidate sidecar");
+        let appended_during_scan = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let append_once = Arc::clone(&appended_during_scan);
+        let transcript_path = recorder.path().to_path_buf();
+        let during_scan = crate::transcript::session_index::list_sessions_with_index(
+            &base_dir,
+            |path, session_id| {
+                let summary = summarize_session_file(path, session_id)?;
+                if !append_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    recorder
+                        .record_session_title("Concurrent")
+                        .expect("append during sidecar rebuild");
+                }
+                Ok(summary)
             },
         )
-        .unwrap();
-    let records = read_records(recorder.path()).unwrap();
-    for metadata in &records[1..] {
-        assert!(metadata.context_branch_id.is_none());
-        assert!(!metadata.event.is_session_content());
-        assert!(!metadata.event.is_session_history_entry());
-        assert!(super::recorder::requires_durable_commit(&metadata.event));
+        .expect("list while transcript advances");
+        assert_eq!(during_scan[0].title.as_deref(), Some("Indexed"));
+        let after_concurrent_append =
+            list_sessions(&base_dir).expect("stale scan stamp forces rebuild");
+        assert_eq!(
+            after_concurrent_append[0].title.as_deref(),
+            Some("Concurrent")
+        );
+
+        let path = transcript_path;
+        let stale_index =
+            std::fs::read(base_dir.join("sessions-index.json")).expect("read existing sidecar");
+        recorder
+            .record_session_title("Updated")
+            .expect("append updated title");
+        assert_eq!(
+            std::fs::read(base_dir.join("sessions-index.json")).expect("read sidecar after append"),
+            stale_index,
+            "append must not update the session index sidecar"
+        );
+        let after_append = list_sessions(&base_dir).expect("list after append");
+        assert_eq!(after_append[0].title.as_deref(), Some("Updated"));
+
+        // Stale stamp forces a rescan when the transcript changes outside the recorder.
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open transcript");
+        use std::io::Write;
+        file.write_all(b"\n").expect("touch file");
+        drop(file);
+
+        let third = list_sessions(&base_dir).expect("list after stamp change");
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].session_id, recorder.session_id());
     }
-    assert_eq!(restore_subagents_policy(&records).unwrap(), policy);
-    let snapshot = project_runtime_restore_snapshot(
-        recorder.session_id().to_string(),
-        records,
-        SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .unwrap();
-    assert!(snapshot.snapshot.active_protocol_frames().is_empty());
-    let path = recorder.path().to_path_buf();
-    drop(recorder);
-    assert!(remove_empty_session_file(path).unwrap());
-}
 
-#[test]
-fn remove_empty_session_file_only_deletes_empty_transcripts() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-remove-empty-test-{}",
-        unix_timestamp_ms()
-    ));
-
-    let mut empty = TranscriptRecorder::create(&base_dir).expect("create empty recorder");
-    empty
-        .record_session_started("gpt-test")
-        .expect("record empty session start");
-    let empty_path = empty.path().to_path_buf();
-
-    assert!(remove_empty_session_file(&empty_path).expect("remove empty session"));
-    assert!(!empty_path.exists());
-
-    let mut content = TranscriptRecorder::create(&base_dir).expect("create content recorder");
-    content
-        .record_session_started("gpt-test")
-        .expect("record content session start");
-    content
-        .record_user_message("keep me")
-        .expect("record user message");
-    let content_path = content.path().to_path_buf();
-
-    assert!(!remove_empty_session_file(&content_path).expect("keep content session"));
-    assert!(content_path.exists());
-}
-
-#[test]
-fn public_compatibility_restores_reject_malformed_logical_checkpoints() {
-    let records = vec![TranscriptRecord {
-        session_id: "s".into(),
-        sequence: 1,
-        timestamp_ms: 0,
-        context_branch_id: None,
-        event: TranscriptEvent::LogicalCheckpoint(LogicalCheckpointEventV1 {
-            schema_version: 0,
-            checkpoint_id: "invalid".into(),
-            turn_id: 1,
-            previous_segment_id: 0,
-            segment_id: 1,
-            previous_checkpoint_id: None,
-            boundary_sequence: 0,
-            context_scope_revision: 0,
-            covered_source_spans: Vec::new(),
-            retained_items: Vec::new(),
-        }),
-    }];
-
-    assert!(restore_session_history(&records).is_err());
-    assert!(restore_compacted_conversation_messages(&records).is_err());
-    assert!(restore_conversation_messages(&records).is_err());
-    assert!(restore_session_protocol_frames(&records).is_err());
-    assert!(restore_runtime_snapshot(&records).is_err());
-}
-
-#[cfg(any())]
-#[test]
-fn prepare_logical_checkpoint_is_deterministic_valid_and_non_persistent() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-prepare-logical-checkpoint-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
-    recorder.record_session_started("test").expect("session");
-    recorder
-        .record_user_message("keep this requirement")
-        .expect("user");
-    recorder
-        .record_turn_started(TurnStartedEvent { turn_id: 9 })
-        .expect("turn");
-    recorder
-        .record_assistant_message("working")
-        .expect("assistant");
-    let before = read_records(recorder.path()).expect("records before prepare");
-
-    let first = recorder
-        .prepare_logical_checkpoint()
-        .expect("first candidate");
-    let second = recorder
-        .prepare_logical_checkpoint()
-        .expect("second candidate");
-
-    assert_eq!(first.expected_journal_frontier, recorder.sequence);
-    assert_eq!(first.event, second.event);
-    assert!(first.event.checkpoint_id.starts_with("lcp-v1-"));
-    assert_eq!(
-        serde_json::to_value(read_records(recorder.path()).expect("records after prepare"))
-            .expect("serialize records after prepare"),
-        serde_json::to_value(&before).expect("serialize records before prepare")
-    );
-    transcript_projection::validate_logical_checkpoint_candidate(
-        recorder.session_id(),
-        &before,
-        Some(ROOT_CONTEXT_BRANCH_ID.into()),
-        recorder.sequence,
-        recorder.sequence + 1,
-        &first.event,
-    )
-    .expect("prepared event satisfies the Phase3a contract");
-}
-
-#[cfg(any())]
-#[test]
-fn prepare_logical_checkpoint_rejects_incomplete_or_inactive_input() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-prepare-logical-checkpoint-invalid-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
-    recorder.record_session_started("test").expect("session");
-    assert!(recorder.prepare_logical_checkpoint().is_err());
-    recorder.record_user_message("goal").expect("user");
-    recorder
-        .record_turn_started(TurnStartedEvent { turn_id: 1 })
-        .expect("turn");
-    recorder
-        .record_assistant_tool_call_batch(
-            None,
-            None,
-            None,
-            vec![HistoryToolCall {
-                call_id: "unfinished".into(),
-                name: "read".into(),
-                arguments_json: "{}".into(),
-            }],
+    #[test]
+    fn subagents_policy_is_durable_metadata_outside_session_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = TranscriptRecorder::create(dir.path()).unwrap();
+        recorder.record_session_started("test/model").unwrap();
+        let policy = crate::config::SubagentsConfig {
+            mode: crate::config::SubagentMode::Swarm,
+            max_depth: 5,
+            ..Default::default()
+        };
+        recorder.record_subagents_policy(&policy).unwrap();
+        recorder
+            .record_subagent_activation(
+                "run".into(),
+                crate::subagent::SwarmMember {
+                    root_session_id: "root".into(),
+                    parent_session_id: "root".into(),
+                    child_session_id: recorder.session_id().to_string(),
+                    depth: 1,
+                    agent_name: "explorer".into(),
+                    pool_ordinal: 1,
+                },
+            )
+            .unwrap();
+        let records = read_records(recorder.path()).unwrap();
+        for metadata in &records[1..] {
+            assert!(metadata.context_branch_id.is_none());
+            assert!(!metadata.event.is_session_content());
+            assert!(!metadata.event.is_session_history_entry());
+            assert!(crate::transcript::recorder::requires_durable_commit(
+                &metadata.event
+            ));
+        }
+        assert_eq!(restore_subagents_policy(&records).unwrap(), policy);
+        let snapshot = project_runtime_restore_snapshot(
+            recorder.session_id().to_string(),
+            records,
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
         )
-        .expect("tool call");
-    assert!(recorder.prepare_logical_checkpoint().is_err());
+        .unwrap();
+        assert!(snapshot.snapshot.active_protocol_frames().is_empty());
+        let path = recorder.path().to_path_buf();
+        drop(recorder);
+        assert!(remove_empty_session_file(path).unwrap());
+    }
+
+    #[test]
+    fn remove_empty_session_file_only_deletes_empty_transcripts() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-remove-empty-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut empty = TranscriptRecorder::create(&base_dir).expect("create empty recorder");
+        empty
+            .record_session_started("gpt-test")
+            .expect("record empty session start");
+        let empty_path = empty.path().to_path_buf();
+
+        assert!(remove_empty_session_file(&empty_path).expect("remove empty session"));
+        assert!(!empty_path.exists());
+
+        let mut content = TranscriptRecorder::create(&base_dir).expect("create content recorder");
+        content
+            .record_session_started("gpt-test")
+            .expect("record content session start");
+        content
+            .record_user_message("keep me")
+            .expect("record user message");
+        let content_path = content.path().to_path_buf();
+
+        assert!(!remove_empty_session_file(&content_path).expect("keep content session"));
+        assert!(content_path.exists());
+    }
+
+    #[test]
+    fn public_compatibility_restores_reject_malformed_logical_checkpoints() {
+        let records = vec![TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::LogicalCheckpoint(LogicalCheckpointEventV1 {
+                schema_version: 0,
+                checkpoint_id: "invalid".into(),
+                turn_id: 1,
+                previous_segment_id: 0,
+                segment_id: 1,
+                previous_checkpoint_id: None,
+                boundary_sequence: 0,
+                context_scope_revision: 0,
+                covered_source_spans: Vec::new(),
+                retained_items: Vec::new(),
+            }),
+        }];
+
+        assert!(restore_session_history(&records).is_err());
+        assert!(restore_compacted_conversation_messages(&records).is_err());
+        assert!(restore_conversation_messages(&records).is_err());
+        assert!(restore_session_protocol_frames(&records).is_err());
+        assert!(restore_runtime_snapshot(&records).is_err());
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn prepare_logical_checkpoint_is_deterministic_valid_and_non_persistent() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-prepare-logical-checkpoint-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
+        recorder.record_session_started("test").expect("session");
+        recorder
+            .record_user_message("keep this requirement")
+            .expect("user");
+        recorder
+            .record_turn_started(TurnStartedEvent { turn_id: 9 })
+            .expect("turn");
+        recorder
+            .record_assistant_message("working")
+            .expect("assistant");
+        let before = read_records(recorder.path()).expect("records before prepare");
+
+        let first = recorder
+            .prepare_logical_checkpoint()
+            .expect("first candidate");
+        let second = recorder
+            .prepare_logical_checkpoint()
+            .expect("second candidate");
+
+        assert_eq!(first.expected_journal_frontier, recorder.sequence);
+        assert_eq!(first.event, second.event);
+        assert!(first.event.checkpoint_id.starts_with("lcp-v1-"));
+        assert_eq!(
+            serde_json::to_value(read_records(recorder.path()).expect("records after prepare"))
+                .expect("serialize records after prepare"),
+            serde_json::to_value(&before).expect("serialize records before prepare")
+        );
+        transcript_projection::validate_logical_checkpoint_candidate(
+            recorder.session_id(),
+            &before,
+            Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            recorder.sequence,
+            recorder.sequence + 1,
+            &first.event,
+        )
+        .expect("prepared event satisfies the Phase3a contract");
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn prepare_logical_checkpoint_rejects_incomplete_or_inactive_input() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-prepare-logical-checkpoint-invalid-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
+        recorder.record_session_started("test").expect("session");
+        assert!(recorder.prepare_logical_checkpoint().is_err());
+        recorder.record_user_message("goal").expect("user");
+        recorder
+            .record_turn_started(TurnStartedEvent { turn_id: 1 })
+            .expect("turn");
+        recorder
+            .record_assistant_tool_call_batch(
+                None,
+                None,
+                None,
+                vec![HistoryToolCall {
+                    call_id: "unfinished".into(),
+                    name: "read".into(),
+                    arguments_json: "{}".into(),
+                }],
+            )
+            .expect("tool call");
+        assert!(recorder.prepare_logical_checkpoint().is_err());
+    }
 }
 
 #[cfg(test)]
@@ -2919,130 +3022,134 @@ mod compaction_legacy_schema_tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn recorder_rejects_legacy_compaction_shape_while_legacy_jsonl_replays() {
-        let base_dir = std::env::temp_dir().join(format!(
-            "letcode-compaction-boundary-{}",
-            unix_timestamp_ms()
-        ));
-        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
-        recorder.record_session_started("test").expect("session");
-        recorder.record_user_message("request").expect("user");
-        recorder
-            .record_assistant_tool_call_batch(
-                None,
-                None,
-                None,
-                vec![HistoryToolCall {
+    mod integration_tests {
+        use super::*;
+
+        #[test]
+        fn recorder_rejects_legacy_compaction_shape_while_legacy_jsonl_replays() {
+            let base_dir = std::env::temp_dir().join(format!(
+                "letcode-compaction-boundary-{}",
+                unix_timestamp_ms()
+            ));
+            let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
+            recorder.record_session_started("test").expect("session");
+            recorder.record_user_message("request").expect("user");
+            recorder
+                .record_assistant_tool_call_batch(
+                    None,
+                    None,
+                    None,
+                    vec![HistoryToolCall {
+                        call_id: "call-1".into(),
+                        name: "read".into(),
+                        arguments_json: "{}".into(),
+                    }],
+                )
+                .expect("tool call");
+            recorder
+                .append(TranscriptEvent::ToolCallFinished {
                     call_id: "call-1".into(),
                     name: "read".into(),
-                    arguments_json: "{}".into(),
-                }],
-            )
-            .expect("tool call");
-        recorder
-            .append(TranscriptEvent::ToolCallFinished {
-                call_id: "call-1".into(),
-                name: "read".into(),
-                ok: true,
-                output: ToolResult {
                     ok: true,
-                    tool: "read".into(),
-                    data: Some(serde_json::json!("ok")),
-                    images: Vec::new(),
-                    error: None,
-                },
-            })
-            .expect("tool result");
-        let error = recorder
-            .record_context_compaction(ContextCompactionEvent::succeeded("summary", 2))
-            .expect_err("new recorder appends reject legacy compaction fields");
-        assert!(error.to_string().contains("tail_start_index"));
-    }
+                    output: ToolResult {
+                        ok: true,
+                        tool: "read".into(),
+                        data: Some(serde_json::json!("ok")),
+                        images: Vec::new(),
+                        error: None,
+                    },
+                })
+                .expect("tool result");
+            let error = recorder
+                .record_context_compaction(ContextCompactionEvent::succeeded("summary", 2))
+                .expect_err("new recorder appends reject legacy compaction fields");
+            assert!(error.to_string().contains("tail_start_index"));
+        }
 
-    #[test]
-    fn modern_compaction_replays_from_a_stable_first_kept_entry_id() {
-        let event = ContextCompactionEvent::succeeded_at("summary", Some("raw:2".into()));
-        let serialized = serde_json::to_value(&event).expect("serialize modern event");
-        assert_eq!(serialized["first_kept_entry_id"], "raw:2");
-        assert!(serialized.get("tail_start_index").is_none());
-        assert!(serialized.get("checkpoint").is_none());
+        #[test]
+        fn modern_compaction_replays_from_a_stable_first_kept_entry_id() {
+            let event = ContextCompactionEvent::succeeded_at("summary", Some("raw:2".into()));
+            let serialized = serde_json::to_value(&event).expect("serialize modern event");
+            assert_eq!(serialized["first_kept_entry_id"], "raw:2");
+            assert!(serialized.get("tail_start_index").is_none());
+            assert!(serialized.get("checkpoint").is_none());
 
-        let records = vec![
-            TranscriptRecord {
-                session_id: "modern".into(),
-                sequence: 1,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("retired"),
+            let records = vec![
+                TranscriptRecord {
+                    session_id: "modern".into(),
+                    sequence: 1,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::UserMessage {
+                        content: UserMessageContent::from("retired"),
+                    },
                 },
-            },
-            TranscriptRecord {
-                session_id: "modern".into(),
-                sequence: 2,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: TranscriptEvent::AssistantMessage {
-                    content: "kept".into(),
+                TranscriptRecord {
+                    session_id: "modern".into(),
+                    sequence: 2,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::AssistantMessage {
+                        content: "kept".into(),
+                    },
                 },
-            },
-            TranscriptRecord {
-                session_id: "modern".into(),
-                sequence: 3,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: TranscriptEvent::ContextCompaction(event),
-            },
-        ];
+                TranscriptRecord {
+                    session_id: "modern".into(),
+                    sequence: 3,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::ContextCompaction(event),
+                },
+            ];
 
-        let restored = restore_session_history(&records).expect("modern compaction replays");
-        assert!(matches!(
-            restored.as_slice(),
-            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantTurn { text: Some(kept), .. }]
-                if text == "summary" && kept == "kept"
-        ));
-    }
+            let restored = restore_session_history(&records).expect("modern compaction replays");
+            assert!(matches!(
+                restored.as_slice(),
+                [HistoryItem::ContextSummary { text }, HistoryItem::AssistantTurn { text: Some(kept), .. }]
+                    if text == "summary" && kept == "kept"
+            ));
+        }
 
-    #[test]
-    fn legacy_compaction_jsonl_replays_tolerantly() {
-        let raw = json!({
-            "session_id": "legacy",
-            "sequence": 3,
-            "timestamp_ms": 0,
-            "kind": "context_compaction",
-            "summary": "legacy summary",
-            "tail_start_index": 1
-        });
-        let compacted: TranscriptRecord =
-            serde_json::from_value(raw).expect("legacy record deserializes");
-        let records = vec![
-            TranscriptRecord {
-                session_id: "legacy".into(),
-                sequence: 1,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("old"),
+        #[test]
+        fn legacy_compaction_jsonl_replays_tolerantly() {
+            let raw = json!({
+                "session_id": "legacy",
+                "sequence": 3,
+                "timestamp_ms": 0,
+                "kind": "context_compaction",
+                "summary": "legacy summary",
+                "tail_start_index": 1
+            });
+            let compacted: TranscriptRecord =
+                serde_json::from_value(raw).expect("legacy record deserializes");
+            let records = vec![
+                TranscriptRecord {
+                    session_id: "legacy".into(),
+                    sequence: 1,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::UserMessage {
+                        content: UserMessageContent::from("old"),
+                    },
                 },
-            },
-            TranscriptRecord {
-                session_id: "legacy".into(),
-                sequence: 2,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: TranscriptEvent::AssistantMessage {
-                    content: "reply".into(),
+                TranscriptRecord {
+                    session_id: "legacy".into(),
+                    sequence: 2,
+                    timestamp_ms: 0,
+                    context_branch_id: None,
+                    event: TranscriptEvent::AssistantMessage {
+                        content: "reply".into(),
+                    },
                 },
-            },
-            compacted,
-        ];
+                compacted,
+            ];
 
-        let restored = restore_session_history(&records).expect("legacy compaction replays");
-        assert!(matches!(
-            restored.as_slice(),
-            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantTurn { text: Some(reply), .. }]
-                if text == "legacy summary" && reply == "reply"
-        ));
+            let restored = restore_session_history(&records).expect("legacy compaction replays");
+            assert!(matches!(
+                restored.as_slice(),
+                [HistoryItem::ContextSummary { text }, HistoryItem::AssistantTurn { text: Some(reply), .. }]
+                    if text == "legacy summary" && reply == "reply"
+            ));
+        }
     }
 }

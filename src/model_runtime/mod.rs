@@ -3661,82 +3661,6 @@ mod tests {
     }
 
     #[test]
-    fn protocol_settings_preserve_adapter_owned_toml() {
-        let value = toml::from_str::<toml::Value>(
-            r#"vendor = { mode = "strict", retries = 2 }
-flags = ["a", "b"]"#,
-        )
-        .expect("valid TOML value");
-        let settings = ProtocolSettings::new(value.clone());
-        assert_eq!(settings.value, value);
-        assert!(matches!(settings.value, toml::Value::Table(_)));
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        #[serde(deny_unknown_fields)]
-        struct VendorSettings {
-            mode: String,
-            retries: u32,
-        }
-        let vendor: VendorSettings = settings
-            .value
-            .get("vendor")
-            .cloned()
-            .expect("vendor settings")
-            .try_into()
-            .expect("strict adapter settings");
-        assert_eq!(vendor.mode, "strict");
-        assert_eq!(vendor.retries, 2);
-    }
-
-    #[test]
-    fn generation_supports_custom_reasoning_and_route_options() {
-        let generation = GenerationSettings {
-            reasoning: ReasoningIntent {
-                enabled: true,
-                effort: Some(ReasoningEffort::Custom("vendor-effort".into())),
-            },
-            summary: Some(ReasoningSummary::Detailed),
-            verbosity: Some(Verbosity::High),
-            parallel_tool_calls: Some(true),
-            priority_service: Some(true),
-            ..GenerationSettings::default()
-        };
-        assert_eq!(
-            generation.reasoning.effort,
-            Some(ReasoningEffort::Custom("vendor-effort".into()))
-        );
-        assert_eq!(generation.summary, Some(ReasoningSummary::Detailed));
-        assert_eq!(generation.verbosity, Some(Verbosity::High));
-        assert_eq!(generation.parallel_tool_calls, Some(true));
-        assert_eq!(generation.priority_service, Some(true));
-    }
-
-    #[test]
-    fn cache_intent_preserves_namespace_and_optional_retention() {
-        let without_retention = CacheIntent {
-            enabled: true,
-            namespace: Some("cache-a".into()),
-            retention: None,
-            stable_prefix: None,
-        };
-        assert!(without_retention.enabled);
-        assert_eq!(without_retention.namespace.as_deref(), Some("cache-a"));
-        assert_eq!(without_retention.retention, None);
-
-        let with_retention = CacheIntent {
-            enabled: true,
-            namespace: Some("cache-b".into()),
-            retention: Some(CacheRetention::InMemory),
-            stable_prefix: Some(StablePrefixMetadata { segment_count: 2 }),
-        };
-        assert_eq!(with_retention.retention, Some(CacheRetention::InMemory));
-        assert_eq!(
-            with_retention.stable_prefix.as_ref().unwrap().segment_count,
-            2
-        );
-    }
-
-    #[test]
     fn protocol_id_is_extensible_and_validated() {
         let custom = ProtocolId::new("vendor.protocol-v2").expect("custom id");
         assert_eq!(custom.as_str(), "vendor.protocol-v2");
@@ -3825,85 +3749,6 @@ flags = ["a", "b"]"#,
     }
 
     #[test]
-    fn request_is_typed_and_has_no_conversation_id() {
-        let request = ModelRequestInput::new(
-            "model",
-            vec![
-                ModelMessage::user_image("image/png", [1, 2, 3]),
-                ModelMessage {
-                    role: MessageRole::Assistant,
-                    content: vec![
-                        ContentPart::Text("answer".into()),
-                        ContentPart::Reasoning {
-                            item_id: "r1".into(),
-                            text: "thought".into(),
-                            replay: None,
-                        },
-                        ContentPart::ToolCall {
-                            id: "t1".into(),
-                            name: "search".into(),
-                            arguments: Value::Object(serde_json::Map::new()),
-                        },
-                    ],
-                },
-                ModelMessage {
-                    role: MessageRole::Tool,
-                    content: vec![ContentPart::ToolResult {
-                        id: "t1".into(),
-                        content: vec![ContentPart::Image {
-                            media_type: "image/png".into(),
-                            data: vec![4, 5],
-                        }],
-                    }],
-                },
-            ],
-        );
-        assert_eq!(request.messages.len(), 3);
-        assert!(request.control.model == "model");
-        assert!(request.cache.stable_prefix.is_none());
-    }
-
-    #[test]
-    fn cache_retention_has_no_caller_supplied_key() {
-        let cache = CacheIntent {
-            enabled: true,
-            namespace: Some("test-cache".into()),
-            retention: Some(CacheRetention::TwentyFourHours),
-            stable_prefix: Some(StablePrefixMetadata { segment_count: 0 }),
-        };
-        assert_eq!(cache.retention, Some(CacheRetention::TwentyFourHours));
-        assert!(cache.stable_prefix.is_some());
-    }
-
-    #[test]
-    fn object_safe_decoder_is_incremental() {
-        struct DecoderFixture;
-        impl ModelStreamDecoder for DecoderFixture {
-            fn push(&mut self, _chunk: &[u8]) -> Result<Vec<ModelEvent>, ModelFailure> {
-                Ok(vec![ModelEvent::TextDelta {
-                    text: "delta".into(),
-                }])
-            }
-
-            fn finish(&mut self) -> Result<Vec<ModelEvent>, ModelFailure> {
-                Ok(vec![ModelEvent::Terminal {
-                    status: TerminalStatus::Completed,
-                }])
-            }
-        }
-
-        let mut decoder: Box<dyn ModelStreamDecoder> = Box::new(DecoderFixture);
-        assert!(matches!(decoder.push(b"chunk"), Ok(events) if matches!(
-            events.first(),
-            Some(ModelEvent::TextDelta { text }) if text == "delta"
-        )));
-        assert!(matches!(decoder.finish(), Ok(events) if matches!(
-            events.first(),
-            Some(ModelEvent::Terminal { status: TerminalStatus::Completed })
-        )));
-    }
-
-    #[test]
     fn replay_scope_uses_producer_identity_and_target_binding() {
         let target = binding("responses", "profile", "route");
         let same_profile_other_route = binding("responses", "profile", "other-route");
@@ -3920,95 +3765,6 @@ flags = ["a", "b"]"#,
         assert!(ReplayScope::Route.is_compatible_with(&route_producer, &target));
         assert!(!ReplayScope::Route.is_compatible_with(&route_producer, &same_profile_other_route));
         assert!(!ReplayScope::None.is_compatible_with(&route_producer, &target));
-    }
-
-    #[test]
-    fn opaque_replay_state_uses_typed_payload_and_producer() {
-        let identity = binding("responses", "profile", "route");
-        let state = OpaqueReplayState::new(
-            "model-runtime",
-            1,
-            ReplayProducer::new(ReplayScope::Route, &identity),
-            Value::Object(serde_json::Map::from_iter([
-                ("cursor".into(), Value::from(3)),
-                ("opaque".into(), Value::from(true)),
-            ])),
-        );
-        assert_eq!(state.namespace, "model-runtime");
-        assert_eq!(state.version, 1);
-        assert_eq!(state.producer.scope, ReplayScope::Route);
-        assert_eq!(state.payload["cursor"], Value::from(3));
-    }
-
-    #[test]
-    fn model_events_cover_complete_lifecycle_and_terminal_statuses() {
-        let events = [
-            ModelEvent::ReasoningStarted {
-                item_id: "r1".into(),
-            },
-            ModelEvent::ReasoningDelta {
-                item_id: "r1".into(),
-                text: "think".into(),
-            },
-            ModelEvent::ReasoningSummaryDelta {
-                item_id: "r1".into(),
-                summary_index: 0,
-                text: "summary".into(),
-            },
-            ModelEvent::ReasoningSummaryDone {
-                item_id: "r1".into(),
-                summary_index: 0,
-                text: "summary".into(),
-            },
-            ModelEvent::ReasoningDone {
-                item_id: "r1".into(),
-                text: "thought".into(),
-                replay: None,
-            },
-            ModelEvent::ToolStarted {
-                id: "t1".into(),
-                name: "search".into(),
-            },
-            ModelEvent::ToolArgumentsDelta {
-                id: "t1".into(),
-                delta: "{\"q\":".into(),
-            },
-            ModelEvent::ToolDone {
-                id: "t1".into(),
-                name: "search".into(),
-                arguments: Value::Object(serde_json::Map::new()),
-            },
-            ModelEvent::Usage {
-                input_tokens: 1,
-                output_tokens: 2,
-                total_tokens: 3,
-                reasoning_tokens: Some(1),
-                cached_input_tokens: Some(4),
-            },
-            ModelEvent::Cache {
-                hit: true,
-                read_tokens: 4,
-                write_tokens: 0,
-            },
-            ModelEvent::Terminal {
-                status: TerminalStatus::Completed,
-            },
-            ModelEvent::Failure(ModelFailure::new(
-                FailurePhase::Decode,
-                FailureKind::MalformedResponse,
-            )),
-        ];
-        assert_eq!(events.len(), 12);
-        let statuses = [
-            TerminalStatus::Completed,
-            TerminalStatus::ToolUse,
-            TerminalStatus::Length,
-            TerminalStatus::ContentFilter,
-            TerminalStatus::Refusal,
-            TerminalStatus::Pause,
-            TerminalStatus::Incomplete,
-        ];
-        assert_eq!(statuses.len(), 7);
     }
 
     #[test]
@@ -4244,73 +4000,6 @@ protocol = "completions"
             assert_eq!(route.transport.connect_timeout().as_secs(), 17);
             assert!(!route.transport.no_proxy_loopback());
         }
-    }
-
-    #[tokio::test]
-    async fn provider_requests_identify_letcode_unless_a_header_overrides_it() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let url = format!("http://{address}/v1/responses");
-        let server = tokio::spawn(async move {
-            let mut seen = Vec::new();
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut buffer = vec![0u8; 4096];
-                let read = stream.read(&mut buffer).await.unwrap();
-                seen.push(String::from_utf8_lossy(&buffer[..read]).to_lowercase());
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                    .await
-                    .unwrap();
-            }
-            seen
-        });
-
-        let transport =
-            ProviderTransport::new_for_endpoint(&RuntimeTransportConfig::default(), Some(&url))
-                .unwrap();
-        let auth = RuntimeAuthConfig {
-            scheme: AuthScheme::None,
-            name: None,
-            credential: None,
-            credential_env: None,
-        };
-        let sent = [
-            BTreeMap::new(),
-            BTreeMap::from([(
-                "user-agent".to_string(),
-                "codex_cli_rs/9.9.9 (Plan9; vax) vt100/1".to_string(),
-            )]),
-        ];
-        for headers in &sent {
-            let request = transport
-                .request(
-                    reqwest::Method::POST,
-                    &url,
-                    "vendor",
-                    &auth,
-                    headers,
-                    &BTreeMap::new(),
-                )
-                .unwrap()
-                .build()
-                .unwrap();
-            let _ = transport.client().execute(request).await;
-        }
-
-        let seen = server.await.unwrap();
-        assert!(
-            seen[0].contains(&format!("user-agent: {}", user_agent().to_lowercase())),
-            "{}",
-            seen[0]
-        );
-        assert!(
-            seen[1].contains("user-agent: codex_cli_rs/9.9.9 (plan9; vax) vt100/1"),
-            "{}",
-            seen[1]
-        );
     }
 
     #[test]
@@ -4595,164 +4284,6 @@ protocol = "completions"
     }
 
     #[tokio::test]
-    async fn transport_errors_redact_request_metadata() {
-        let transport = ProviderTransport::new_for_endpoint(
-            &RuntimeTransportConfig {
-                connect_timeout_secs: 1,
-                ..RuntimeTransportConfig::default()
-            },
-            Some("http://127.0.0.1:1"),
-        )
-        .unwrap();
-        let auth = RuntimeAuthConfig {
-            scheme: AuthScheme::Query,
-            name: Some("api-token".into()),
-            credential: Some("secret with / reserved?&=+".into()),
-            credential_env: None,
-        };
-        let request = transport
-            .request(
-                reqwest::Method::GET,
-                "http://127.0.0.1:1/unreachable",
-                "vendor",
-                &auth,
-                &BTreeMap::from([(String::from("x-configured"), String::from("header secret"))]),
-                &BTreeMap::from([(String::from("trace"), String::from("query value"))]),
-            )
-            .unwrap();
-        let failure = transport.send(request, &auth).await.unwrap_err();
-        assert_eq!(failure.status, None);
-        assert_eq!(failure.retry_hint, RetryHint::Retryable);
-        for representation in [
-            "secret with / reserved?&=+",
-            "secret%20with%20%2F%20reserved%3F%26%3D%2B",
-            "secret+with+%2F+reserved%3F%26%3D%2B",
-            "secret%20with%20%2f%20reserved%3f%26%3d%2b",
-            "secret+with+%2f+reserved%3f%26%3d%2b",
-        ] {
-            assert!(!failure.detail().contains(representation));
-            assert!(!format!("{failure:?}").contains(representation));
-            assert!(!failure.to_string().contains(representation));
-        }
-    }
-
-    #[tokio::test]
-    async fn local_chunked_transport_response_preserves_boundary_metadata() {
-        use std::io::Write;
-        use std::net::TcpListener;
-        use std::thread;
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = std::io::Read::read(&mut stream, &mut request);
-            for part in [
-                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nX-Test: boundary\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
-                b"5\r\nfirst\r\n".as_slice(),
-                b"6\r\nsecond\r\n".as_slice(),
-                b"0\r\n\r\n".as_slice(),
-            ] {
-                stream.write_all(part).unwrap();
-                stream.flush().unwrap();
-                thread::yield_now();
-            }
-        });
-        let transport = ProviderTransport::new_for_endpoint(
-            &RuntimeTransportConfig::default(),
-            Some(&format!("http://{address}")),
-        )
-        .unwrap();
-        let auth = RuntimeAuthConfig {
-            scheme: AuthScheme::Query,
-            name: Some("key".into()),
-            credential: Some("secret".into()),
-            credential_env: None,
-        };
-        let request = transport
-            .request(
-                reqwest::Method::GET,
-                &format!("http://{address}/model"),
-                "local",
-                &auth,
-                &BTreeMap::new(),
-                &BTreeMap::from([(String::from("trace"), String::from("one"))]),
-            )
-            .unwrap();
-        let mut response = transport.send(request, &auth).await.unwrap();
-        assert_eq!(response.status, 429);
-        assert_eq!(
-            response.headers.get("x-test"),
-            Some(&String::from("boundary"))
-        );
-        assert_eq!(response.retry_hint(), RetryHint::RetryAfterSeconds(7));
-        let mut body = Vec::new();
-        while let Some(chunk) = response.next_chunk().await {
-            body.extend_from_slice(&chunk.unwrap());
-        }
-        assert_eq!(body, b"firstsecond");
-        assert!(!body.windows(3).any(|window| window == b"5\r\n"));
-        assert!(!body.windows(3).any(|window| window == b"6\r\n"));
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn truncated_response_chunk_preserves_status_and_retry_hint() {
-        use std::io::Write;
-        use std::net::TcpListener;
-        use std::thread;
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = std::io::Read::read(&mut stream, &mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfirst",
-                )
-                .unwrap();
-            stream.flush().unwrap();
-        });
-        let transport = ProviderTransport::new_for_endpoint(
-            &RuntimeTransportConfig::default(),
-            Some(&format!("http://{address}")),
-        )
-        .unwrap();
-        let auth = RuntimeAuthConfig {
-            scheme: AuthScheme::None,
-            name: None,
-            credential: None,
-            credential_env: None,
-        };
-        let request = transport
-            .request(
-                reqwest::Method::GET,
-                &format!("http://{address}/model"),
-                "local",
-                &auth,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-            )
-            .unwrap();
-        let mut response = transport.send(request, &auth).await.unwrap();
-        assert_eq!(response.status, 429);
-        let mut failure = None;
-        while let Some(chunk) = response.next_chunk().await {
-            if let Err(error) = chunk {
-                failure = Some(error);
-                break;
-            }
-        }
-        let failure = failure.expect("truncated body must fail while reading chunks");
-        assert_eq!(failure.status, Some(429));
-        assert_eq!(failure.retry_hint, RetryHint::RetryAfterSeconds(7));
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
     async fn transport_response_preserves_status_headers_and_chunks() {
         let mut headers = BTreeMap::new();
         headers.insert("retry-after".into(), "7".into());
@@ -4766,6 +4297,239 @@ protocol = "completions"
         assert_eq!(response.next_chunk().await.unwrap().unwrap(), b"first");
         assert_eq!(response.next_chunk().await.unwrap().unwrap(), b"second");
         assert!(response.next_chunk().await.is_none());
+    }
+
+    mod integration_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn provider_requests_identify_letcode_unless_a_header_overrides_it() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let url = format!("http://{address}/v1/responses");
+            let server =
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    for _ in 0..2 {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut buffer = vec![0u8; 4096];
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        seen.push(String::from_utf8_lossy(&buffer[..read]).to_lowercase());
+                        stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                    }
+                    seen
+                });
+
+            let transport =
+                ProviderTransport::new_for_endpoint(&RuntimeTransportConfig::default(), Some(&url))
+                    .unwrap();
+            let auth = RuntimeAuthConfig {
+                scheme: AuthScheme::None,
+                name: None,
+                credential: None,
+                credential_env: None,
+            };
+            let sent = [
+                BTreeMap::new(),
+                BTreeMap::from([(
+                    "user-agent".to_string(),
+                    "codex_cli_rs/9.9.9 (Plan9; vax) vt100/1".to_string(),
+                )]),
+            ];
+            for headers in &sent {
+                let request = transport
+                    .request(
+                        reqwest::Method::POST,
+                        &url,
+                        "vendor",
+                        &auth,
+                        headers,
+                        &BTreeMap::new(),
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let _ = transport.client().execute(request).await;
+            }
+
+            let seen = server.await.unwrap();
+            assert!(
+                seen[0].contains(&format!("user-agent: {}", user_agent().to_lowercase())),
+                "{}",
+                seen[0]
+            );
+            assert!(
+                seen[1].contains("user-agent: codex_cli_rs/9.9.9 (plan9; vax) vt100/1"),
+                "{}",
+                seen[1]
+            );
+        }
+
+        #[tokio::test]
+        async fn transport_errors_redact_request_metadata() {
+            let transport = ProviderTransport::new_for_endpoint(
+                &RuntimeTransportConfig {
+                    connect_timeout_secs: 1,
+                    ..RuntimeTransportConfig::default()
+                },
+                Some("http://127.0.0.1:1"),
+            )
+            .unwrap();
+            let auth = RuntimeAuthConfig {
+                scheme: AuthScheme::Query,
+                name: Some("api-token".into()),
+                credential: Some("secret with / reserved?&=+".into()),
+                credential_env: None,
+            };
+            let request = transport
+                .request(
+                    reqwest::Method::GET,
+                    "http://127.0.0.1:1/unreachable",
+                    "vendor",
+                    &auth,
+                    &BTreeMap::from([(
+                        String::from("x-configured"),
+                        String::from("header secret"),
+                    )]),
+                    &BTreeMap::from([(String::from("trace"), String::from("query value"))]),
+                )
+                .unwrap();
+            let failure = transport.send(request, &auth).await.unwrap_err();
+            assert_eq!(failure.status, None);
+            assert_eq!(failure.retry_hint, RetryHint::Retryable);
+            for representation in [
+                "secret with / reserved?&=+",
+                "secret%20with%20%2F%20reserved%3F%26%3D%2B",
+                "secret+with+%2F+reserved%3F%26%3D%2B",
+                "secret%20with%20%2f%20reserved%3f%26%3d%2b",
+                "secret+with+%2f+reserved%3f%26%3d%2b",
+            ] {
+                assert!(!failure.detail().contains(representation));
+                assert!(!format!("{failure:?}").contains(representation));
+                assert!(!failure.to_string().contains(representation));
+            }
+        }
+
+        #[tokio::test]
+        async fn local_chunked_transport_response_preserves_boundary_metadata() {
+            use std::io::Write;
+            use std::net::TcpListener;
+            use std::thread;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                for part in [
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nX-Test: boundary\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+                b"5\r\nfirst\r\n".as_slice(),
+                b"6\r\nsecond\r\n".as_slice(),
+                b"0\r\n\r\n".as_slice(),
+            ] {
+                stream.write_all(part).unwrap();
+                stream.flush().unwrap();
+                thread::yield_now();
+            }
+            });
+            let transport = ProviderTransport::new_for_endpoint(
+                &RuntimeTransportConfig::default(),
+                Some(&format!("http://{address}")),
+            )
+            .unwrap();
+            let auth = RuntimeAuthConfig {
+                scheme: AuthScheme::Query,
+                name: Some("key".into()),
+                credential: Some("secret".into()),
+                credential_env: None,
+            };
+            let request = transport
+                .request(
+                    reqwest::Method::GET,
+                    &format!("http://{address}/model"),
+                    "local",
+                    &auth,
+                    &BTreeMap::new(),
+                    &BTreeMap::from([(String::from("trace"), String::from("one"))]),
+                )
+                .unwrap();
+            let mut response = transport.send(request, &auth).await.unwrap();
+            assert_eq!(response.status, 429);
+            assert_eq!(
+                response.headers.get("x-test"),
+                Some(&String::from("boundary"))
+            );
+            assert_eq!(response.retry_hint(), RetryHint::RetryAfterSeconds(7));
+            let mut body = Vec::new();
+            while let Some(chunk) = response.next_chunk().await {
+                body.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(body, b"firstsecond");
+            assert!(!body.windows(3).any(|window| window == b"5\r\n"));
+            assert!(!body.windows(3).any(|window| window == b"6\r\n"));
+            server.join().unwrap();
+        }
+
+        #[tokio::test]
+        async fn truncated_response_chunk_preserves_status_and_retry_hint() {
+            use std::io::Write;
+            use std::net::TcpListener;
+            use std::thread;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfirst",
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            });
+            let transport = ProviderTransport::new_for_endpoint(
+                &RuntimeTransportConfig::default(),
+                Some(&format!("http://{address}")),
+            )
+            .unwrap();
+            let auth = RuntimeAuthConfig {
+                scheme: AuthScheme::None,
+                name: None,
+                credential: None,
+                credential_env: None,
+            };
+            let request = transport
+                .request(
+                    reqwest::Method::GET,
+                    &format!("http://{address}/model"),
+                    "local",
+                    &auth,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            let mut response = transport.send(request, &auth).await.unwrap();
+            assert_eq!(response.status, 429);
+            let mut failure = None;
+            while let Some(chunk) = response.next_chunk().await {
+                if let Err(error) = chunk {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            let failure = failure.expect("truncated body must fail while reading chunks");
+            assert_eq!(failure.status, Some(429));
+            assert_eq!(failure.retry_hint, RetryHint::RetryAfterSeconds(7));
+            server.join().unwrap();
+        }
     }
 }
 

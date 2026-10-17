@@ -310,7 +310,7 @@ fn parse_hex_color(value: &str) -> Result<Color> {
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
 
     fn temp_prefs_dir(name: &str) -> PathBuf {

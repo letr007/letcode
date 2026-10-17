@@ -740,145 +740,152 @@ mod tests {
         assert_eq!(parsed.rationale, rationale);
     }
 
-    #[tokio::test]
-    async fn missing_reviewer_route_credential_fails_before_starting_a_child() {
-        let dir = std::env::temp_dir().join(format!(
-            "letcode-auto-review-credential-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("sessions dir");
-        let transcript = Arc::new(Mutex::new(
-            TranscriptRecorder::create(&dir).expect("transcript"),
-        ));
-        let route = crate::config::ModelRoute::new("reviewer-provider", "reviewer-model");
-        let providers =
-            indexmap::IndexMap::from([(route.provider.clone(), test_provider(&route.model))]);
-        let factory = Arc::new(
-            crate::subagent::ExpertRouteFactory::new_with_policies(
-                [(
-                    REVIEWER_AGENT_NAME.into(),
-                    Some(route.clone()),
-                    Vec::new(),
-                    None,
-                )],
-                &providers,
-                &crate::config::RetryConfig::default(),
-            )
-            .expect("reviewer route factory"),
-        );
-        let mut parent = Agent::new("parent-model", 1, 1);
-        parent.set_primary_route(crate::config::ModelRoute::new("primary", "parent-model"));
-        parent.set_subagent_child_factory(factory);
-        let reviewer = StickyAutoReviewer::new(
-            SubagentPool::new(),
-            dir.clone(),
-            Arc::clone(&transcript),
-            None,
-            Arc::new(Mutex::new(indexmap::IndexMap::from([(
-                route.display_name(),
-                false,
-            )]))),
-            Arc::new(Mutex::new(indexmap::IndexMap::from([(
-                route.provider.clone(),
-                "Set REVIEWER_API_KEY".into(),
-            )]))),
-            "Set the provider API key".into(),
-        );
+    mod integration_tests {
+        use super::*;
 
-        let error = reviewer
-            .review(&parent, permission_request(), None)
-            .await
-            .expect_err("a missing reviewer credential must fail the review");
+        #[tokio::test]
+        async fn missing_reviewer_route_credential_fails_before_starting_a_child() {
+            let dir = std::env::temp_dir().join(format!(
+                "letcode-auto-review-credential-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("sessions dir");
+            let transcript = Arc::new(Mutex::new(
+                TranscriptRecorder::create(&dir).expect("transcript"),
+            ));
+            let route = crate::config::ModelRoute::new("reviewer-provider", "reviewer-model");
+            let providers =
+                indexmap::IndexMap::from([(route.provider.clone(), test_provider(&route.model))]);
+            let factory = Arc::new(
+                crate::subagent::ExpertRouteFactory::new_with_policies(
+                    [(
+                        REVIEWER_AGENT_NAME.into(),
+                        Some(route.clone()),
+                        Vec::new(),
+                        None,
+                    )],
+                    &providers,
+                    &crate::config::RetryConfig::default(),
+                )
+                .expect("reviewer route factory"),
+            );
+            let mut parent = Agent::new("parent-model", 1, 1);
+            parent.set_primary_route(crate::config::ModelRoute::new("primary", "parent-model"));
+            parent.set_subagent_child_factory(factory);
+            let reviewer = StickyAutoReviewer::new(
+                SubagentPool::new(),
+                dir.clone(),
+                Arc::clone(&transcript),
+                None,
+                Arc::new(Mutex::new(indexmap::IndexMap::from([(
+                    route.display_name(),
+                    false,
+                )]))),
+                Arc::new(Mutex::new(indexmap::IndexMap::from([(
+                    route.provider.clone(),
+                    "Set REVIEWER_API_KEY".into(),
+                )]))),
+                "Set the provider API key".into(),
+            );
 
-        assert!(
-            error
-                .to_string()
-                .contains("reviewer-provider/reviewer-model")
-        );
-        assert!(error.to_string().contains("Set REVIEWER_API_KEY"));
-        assert!(reviewer.sticky_child_id().is_empty());
-        assert!(
-            !crate::transcript::child_sessions_dir(&dir).exists(),
-            "credential preflight must happen before child transcript creation"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
+            let error = reviewer
+                .review(&parent, permission_request(), None)
+                .await
+                .expect_err("a missing reviewer credential must fail the review");
 
-    #[test]
-    fn clearing_sticky_session_allows_new_reviewer_route_after_policy_change() {
-        let dir = std::env::temp_dir().join(format!(
-            "letcode-auto-review-route-change-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("sessions dir");
-        let transcript = Arc::new(Mutex::new(
-            TranscriptRecorder::create(&dir).expect("transcript"),
-        ));
-        let reviewer = StickyAutoReviewer::new(
-            SubagentPool::new(),
-            dir.clone(),
-            Arc::clone(&transcript),
-            None,
-            Arc::new(Mutex::new(indexmap::IndexMap::new())),
-            Arc::new(Mutex::new(indexmap::IndexMap::new())),
-            "Set the provider API key".into(),
-        );
-        let child_dir = crate::transcript::child_sessions_dir(&dir);
-        let mut child = TranscriptRecorder::create(&child_dir).expect("child transcript");
-        let child_session_id = child.session_id().to_string();
-        child
-            .record_session_started("old-provider/reviewer-model")
-            .expect("record child route");
-        reviewer
-            .inner
-            .lock()
-            .expect("reviewer state")
-            .child_session_id = Some(child_session_id.clone());
+            assert!(
+                error
+                    .to_string()
+                    .contains("reviewer-provider/reviewer-model")
+            );
+            assert!(error.to_string().contains("Set REVIEWER_API_KEY"));
+            assert!(reviewer.sticky_child_id().is_empty());
+            assert!(
+                !crate::transcript::child_sessions_dir(&dir).exists(),
+                "credential preflight must happen before child transcript creation"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
 
-        let new_route = crate::config::ModelRoute::new("new-provider", "reviewer-model");
-        let providers = indexmap::IndexMap::from([(
-            new_route.provider.clone(),
-            test_provider(&new_route.model),
-        )]);
-        let factory = Arc::new(
-            crate::subagent::ExpertRouteFactory::new_with_policies(
-                [(
-                    REVIEWER_AGENT_NAME.into(),
-                    Some(new_route.clone()),
-                    Vec::new(),
-                    None,
-                )],
-                &providers,
-                &crate::config::RetryConfig::default(),
-            )
-            .expect("reviewer route factory"),
-        );
-        let mut parent = Agent::new("parent-model", 1, 1);
-        parent.set_primary_route(crate::config::ModelRoute::new("primary", "parent-model"));
-        parent.set_subagent_child_factory(factory);
-
-        let stale =
-            reviewer.resolve_route(&parent, &AgentTemplate::reviewer(), Some(&child_session_id));
-        assert!(
-            stale
-                .expect_err("old reviewer route must fail current policy")
-                .to_string()
-                .contains("cannot resume: recorded route 'old-provider/reviewer-model'")
-        );
-
-        reviewer.clear_sticky();
-        assert_eq!(
+        #[test]
+        fn clearing_sticky_session_allows_new_reviewer_route_after_policy_change() {
+            let dir = std::env::temp_dir().join(format!(
+                "letcode-auto-review-route-change-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("sessions dir");
+            let transcript = Arc::new(Mutex::new(
+                TranscriptRecorder::create(&dir).expect("transcript"),
+            ));
+            let reviewer = StickyAutoReviewer::new(
+                SubagentPool::new(),
+                dir.clone(),
+                Arc::clone(&transcript),
+                None,
+                Arc::new(Mutex::new(indexmap::IndexMap::new())),
+                Arc::new(Mutex::new(indexmap::IndexMap::new())),
+                "Set the provider API key".into(),
+            );
+            let child_dir = crate::transcript::child_sessions_dir(&dir);
+            let mut child = TranscriptRecorder::create(&child_dir).expect("child transcript");
+            let child_session_id = child.session_id().to_string();
+            child
+                .record_session_started("old-provider/reviewer-model")
+                .expect("record child route");
             reviewer
-                .resolve_route(&parent, &AgentTemplate::reviewer(), None)
-                .expect("cleared reviewer should resolve the new default route"),
-            new_route
-        );
-        let _ = std::fs::remove_dir_all(dir);
+                .inner
+                .lock()
+                .expect("reviewer state")
+                .child_session_id = Some(child_session_id.clone());
+
+            let new_route = crate::config::ModelRoute::new("new-provider", "reviewer-model");
+            let providers = indexmap::IndexMap::from([(
+                new_route.provider.clone(),
+                test_provider(&new_route.model),
+            )]);
+            let factory = Arc::new(
+                crate::subagent::ExpertRouteFactory::new_with_policies(
+                    [(
+                        REVIEWER_AGENT_NAME.into(),
+                        Some(new_route.clone()),
+                        Vec::new(),
+                        None,
+                    )],
+                    &providers,
+                    &crate::config::RetryConfig::default(),
+                )
+                .expect("reviewer route factory"),
+            );
+            let mut parent = Agent::new("parent-model", 1, 1);
+            parent.set_primary_route(crate::config::ModelRoute::new("primary", "parent-model"));
+            parent.set_subagent_child_factory(factory);
+
+            let stale = reviewer.resolve_route(
+                &parent,
+                &AgentTemplate::reviewer(),
+                Some(&child_session_id),
+            );
+            assert!(
+                stale
+                    .expect_err("old reviewer route must fail current policy")
+                    .to_string()
+                    .contains("cannot resume: recorded route 'old-provider/reviewer-model'")
+            );
+
+            reviewer.clear_sticky();
+            assert_eq!(
+                reviewer
+                    .resolve_route(&parent, &AgentTemplate::reviewer(), None)
+                    .expect("cleared reviewer should resolve the new default route"),
+                new_route
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

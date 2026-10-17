@@ -687,98 +687,6 @@ mod tests {
             .expect("client")
     }
 
-    #[tokio::test]
-    async fn ask_sends_the_frozen_question_and_reads_the_choice() {
-        let (base_url, seen, server) = endpoint(
-            "200 OK",
-            r#"{"answers":{"approval":{"type":"choice","choice":"ask_user","confidence":0.32,"probabilities":{"execute":0.45,"ask_user":0.55,"refuse":0.0}}}}"#,
-        )
-        .await;
-        let config = review_config(base_url, "test-key");
-        let answer = ask_jev(&client(), &config, json!({"tool": "shell__exec"}))
-            .await
-            .expect("answer");
-
-        assert_eq!(answer.choice, "ask_user");
-        assert_eq!(outcome_for(&answer.choice), Some(AutoReviewOutcome::Ask));
-        let rationale = describe(&answer);
-        assert!(rationale.contains("ask_user"), "{rationale}");
-        assert!(rationale.contains("0.32"), "{rationale}");
-
-        {
-            let requests = seen.lock().expect("capture lock");
-            let request = requests.first().expect("one request");
-            assert!(request.starts_with("POST /v1/systemone "), "{request}");
-            assert!(
-                request.contains("authorization: Bearer test-key"),
-                "{request}"
-            );
-            assert!(request.contains("\"model\":\"jev-latest\""), "{request}");
-            assert!(request.contains("\"type\":\"choice\""), "{request}");
-            for (outcome, _) in REVIEW_OUTCOME_CRITERIA {
-                assert!(request.contains(outcome), "{request}");
-            }
-        }
-        server.await.expect("server");
-    }
-
-    #[tokio::test]
-    async fn ask_leaves_an_unknown_decision_unmapped() {
-        let (base_url, _, server) = endpoint(
-            "200 OK",
-            r#"{"answers":{"approval":{"choice":"maybe","confidence":0.4}}}"#,
-        )
-        .await;
-        let config = review_config(base_url, "test-key");
-        let answer = ask_jev(&client(), &config, json!({}))
-            .await
-            .expect("answer");
-
-        assert_eq!(answer.choice, "maybe");
-        assert_eq!(outcome_for(&answer.choice), None);
-        server.await.expect("server");
-    }
-
-    #[tokio::test]
-    async fn ask_reports_a_rejected_credential() {
-        let (base_url, _, server) = endpoint("401 Unauthorized", "{\"error\":\"nope\"}").await;
-        let config = review_config(base_url, "bad-key");
-        let error = ask_jev(&client(), &config, json!({}))
-            .await
-            .expect_err("401 should fail");
-
-        assert!(format!("{error:#}").contains("401"), "{error:#}");
-        server.await.expect("server");
-    }
-
-    #[tokio::test]
-    async fn ask_reports_a_malformed_body() {
-        let (base_url, _, server) = endpoint("200 OK", "not json").await;
-        let config = review_config(base_url, "test-key");
-        let error = ask_jev(&client(), &config, json!({}))
-            .await
-            .expect_err("malformed body should fail");
-
-        assert!(format!("{error:#}").contains("malformed body"), "{error:#}");
-        server.await.expect("server");
-    }
-
-    #[tokio::test]
-    async fn ask_without_a_credential_never_reaches_the_endpoint() {
-        let (base_url, seen, server) = endpoint("200 OK", "{}").await;
-        let config = review_config(base_url, "");
-        let error = ask_jev(&client(), &config, json!({}))
-            .await
-            .expect_err("missing credential should fail");
-
-        assert!(
-            format!("{error:#}").contains("[providers.typesafe.auth]"),
-            "{error:#}"
-        );
-        assert!(seen.lock().expect("capture lock").is_empty());
-        server.abort();
-    }
-
     #[test]
     fn truncate_marks_what_it_cut() {
         assert_eq!(truncate("abc", 3), "abc");
@@ -795,14 +703,109 @@ mod tests {
         assert!(!is_loopback_endpoint("https://example.invalid/v1"));
     }
 
-    #[tokio::test]
-    async fn review_records_the_exchange_in_a_reviewer_child_session() {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let directory = tempfile::tempdir().expect("config dir");
-            let config_path = directory.path().join("letcode.toml");
-            std::fs::write(
-                &config_path,
-                r#"
+    mod integration_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn ask_sends_the_frozen_question_and_reads_the_choice() {
+            let (base_url, seen, server) = endpoint(
+                "200 OK",
+                r#"{"answers":{"approval":{"type":"choice","choice":"ask_user","confidence":0.32,"probabilities":{"execute":0.45,"ask_user":0.55,"refuse":0.0}}}}"#,
+            )
+            .await;
+            let config = review_config(base_url, "test-key");
+            let answer = ask_jev(&client(), &config, json!({"tool": "shell__exec"}))
+                .await
+                .expect("answer");
+
+            assert_eq!(answer.choice, "ask_user");
+            assert_eq!(outcome_for(&answer.choice), Some(AutoReviewOutcome::Ask));
+            let rationale = describe(&answer);
+            assert!(rationale.contains("ask_user"), "{rationale}");
+            assert!(rationale.contains("0.32"), "{rationale}");
+
+            {
+                let requests = seen.lock().expect("capture lock");
+                let request = requests.first().expect("one request");
+                assert!(request.starts_with("POST /v1/systemone "), "{request}");
+                assert!(
+                    request.contains("authorization: Bearer test-key"),
+                    "{request}"
+                );
+                assert!(request.contains("\"model\":\"jev-latest\""), "{request}");
+                assert!(request.contains("\"type\":\"choice\""), "{request}");
+                for (outcome, _) in REVIEW_OUTCOME_CRITERIA {
+                    assert!(request.contains(outcome), "{request}");
+                }
+            }
+            server.await.expect("server");
+        }
+
+        #[tokio::test]
+        async fn ask_leaves_an_unknown_decision_unmapped() {
+            let (base_url, _, server) = endpoint(
+                "200 OK",
+                r#"{"answers":{"approval":{"choice":"maybe","confidence":0.4}}}"#,
+            )
+            .await;
+            let config = review_config(base_url, "test-key");
+            let answer = ask_jev(&client(), &config, json!({}))
+                .await
+                .expect("answer");
+
+            assert_eq!(answer.choice, "maybe");
+            assert_eq!(outcome_for(&answer.choice), None);
+            server.await.expect("server");
+        }
+
+        #[tokio::test]
+        async fn ask_reports_a_rejected_credential() {
+            let (base_url, _, server) = endpoint("401 Unauthorized", "{\"error\":\"nope\"}").await;
+            let config = review_config(base_url, "bad-key");
+            let error = ask_jev(&client(), &config, json!({}))
+                .await
+                .expect_err("401 should fail");
+
+            assert!(format!("{error:#}").contains("401"), "{error:#}");
+            server.await.expect("server");
+        }
+
+        #[tokio::test]
+        async fn ask_reports_a_malformed_body() {
+            let (base_url, _, server) = endpoint("200 OK", "not json").await;
+            let config = review_config(base_url, "test-key");
+            let error = ask_jev(&client(), &config, json!({}))
+                .await
+                .expect_err("malformed body should fail");
+
+            assert!(format!("{error:#}").contains("malformed body"), "{error:#}");
+            server.await.expect("server");
+        }
+
+        #[tokio::test]
+        async fn ask_without_a_credential_never_reaches_the_endpoint() {
+            let (base_url, seen, server) = endpoint("200 OK", "{}").await;
+            let config = review_config(base_url, "");
+            let error = ask_jev(&client(), &config, json!({}))
+                .await
+                .expect_err("missing credential should fail");
+
+            assert!(
+                format!("{error:#}").contains("[providers.typesafe.auth]"),
+                "{error:#}"
+            );
+            assert!(seen.lock().expect("capture lock").is_empty());
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn review_records_the_exchange_in_a_reviewer_child_session() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let directory = tempfile::tempdir().expect("config dir");
+                let config_path = directory.path().join("letcode.toml");
+                std::fs::write(
+                    &config_path,
+                    r#"
 active_provider = "test"
 [providers.test]
 protocol = "responses"
@@ -814,135 +817,136 @@ credential = "test-key"
 base_url = "http://127.0.0.1:1"
 [providers.test.models.current]
 "#,
-            )
-            .expect("write config");
-            let config = crate::config::AppConfig::load_from_path(&config_path).expect("config");
-
-            let sessions = tempfile::tempdir().expect("sessions dir");
-            let transcript = Arc::new(Mutex::new(
-                TranscriptRecorder::create(sessions.path()).expect("parent transcript"),
-            ));
-            let route = crate::config::ModelRoute::new("test", "current");
-            transcript
-                .lock()
-                .expect("transcript")
-                .record_session_started(route.display_name())
-                .expect("record session started");
-
-            let mut parent = Agent::new("current", 1, 1);
-            let primary_factory = Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
-                config.providers.clone(),
-                config.global.retry.clone(),
-                config.runtime_catalog.clone(),
-            ));
-            parent.apply_prepared_route(
-                primary_factory
-                    .prepare_route(route.clone())
-                    .expect("prepare primary route"),
-            );
-            parent.set_primary_route_factory(primary_factory);
-            parent.set_subagent_child_factory(Arc::new(
-                crate::subagent::ExpertRouteFactory::new_with_policies(
-                    [("reviewer".to_string(), None, Vec::new(), None)],
-                    &config.providers,
-                    &config.global.retry,
                 )
-                .expect("reviewer route factory"),
-            ));
+                .expect("write config");
+                let config = crate::config::AppConfig::load_from_path(&config_path).expect("config");
 
-            let (base_url, seen, server) = serving_endpoint(
-                "200 OK",
-                r#"{"answers":{"approval":{"choice":"execute","confidence":0.93,"probabilities":{"execute":0.93,"ask_user":0.05,"refuse":0.02}}}}"#,
-                2,
-            )
-            .await;
-            let reviewer = JevReviewer::new(
-                review_config(base_url, "test-key"),
-                Arc::clone(&transcript),
-                None,
-                SubagentPool::new(),
-                sessions.path().to_path_buf(),
-            )
-            .expect("reviewer");
+                let sessions = tempfile::tempdir().expect("sessions dir");
+                let transcript = Arc::new(Mutex::new(
+                    TranscriptRecorder::create(sessions.path()).expect("parent transcript"),
+                ));
+                let route = crate::config::ModelRoute::new("test", "current");
+                transcript
+                    .lock()
+                    .expect("transcript")
+                    .record_session_started(route.display_name())
+                    .expect("record session started");
 
-            let first = reviewer
-                .review(&parent, permission_request(), None)
-                .await
-                .expect("first review");
-            assert_eq!(first.outcome, AutoReviewOutcome::AllowOnce);
+                let mut parent = Agent::new("current", 1, 1);
+                let primary_factory = Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+                parent.apply_prepared_route(
+                    primary_factory
+                        .prepare_route(route.clone())
+                        .expect("prepare primary route"),
+                );
+                parent.set_primary_route_factory(primary_factory);
+                parent.set_subagent_child_factory(Arc::new(
+                    crate::subagent::ExpertRouteFactory::new_with_policies(
+                        [("reviewer".to_string(), None, Vec::new(), None)],
+                        &config.providers,
+                        &config.global.retry,
+                    )
+                    .expect("reviewer route factory"),
+                ));
 
-            let child_session_id = reviewer.sticky_child_id().expect("reviewer child session");
-            let child_path = crate::transcript::child_sessions_dir(sessions.path())
-                .join(format!("{child_session_id}.jsonl"));
-            let child_records =
-                read_records_allow_partial_tail(&child_path).expect("child records");
-            let request_card = child_records
-                .iter()
-                .find_map(|record| match &record.event {
-                    TranscriptEvent::UserMessage { content, .. } => {
-                        reviewer_cards::parse_review_request(&content.text)
-                    }
-                    _ => None,
-                })
-                .expect("request card");
-            assert_eq!(request_card.tool, "shell__exec");
-            assert_eq!(request_card.class.as_deref(), Some("command"));
-            let decision_card = child_records
-                .iter()
-                .find_map(|record| match &record.event {
-                    TranscriptEvent::AssistantTurn(turn) => turn
-                        .text
-                        .as_deref()
-                        .and_then(reviewer_cards::parse_review_decision),
-                    _ => None,
-                })
-                .expect("decision card");
-            assert_eq!(decision_card.decision, "allow_once");
-            assert!(decision_card.rationale.contains("jev: execute"));
+                let (base_url, seen, server) = serving_endpoint(
+                    "200 OK",
+                    r#"{"answers":{"approval":{"choice":"execute","confidence":0.93,"probabilities":{"execute":0.93,"ask_user":0.05,"refuse":0.02}}}}"#,
+                    2,
+                )
+                .await;
+                let reviewer = JevReviewer::new(
+                    review_config(base_url, "test-key"),
+                    Arc::clone(&transcript),
+                    None,
+                    SubagentPool::new(),
+                    sessions.path().to_path_buf(),
+                )
+                .expect("reviewer");
 
-            let parent_path = transcript.lock().expect("transcript").path().to_path_buf();
-            let decision = read_records_allow_partial_tail(&parent_path)
-                .expect("parent records")
-                .into_iter()
-                .find_map(|record| match record.event {
-                    TranscriptEvent::PermissionDecision {
-                        reviewer,
-                        reviewer_child_session_id,
-                        ..
-                    } => Some((reviewer, reviewer_child_session_id)),
-                    _ => None,
-                })
-                .expect("parent permission decision");
-            assert_eq!(decision.0.as_deref(), Some("auto"));
-            assert_eq!(decision.1.as_deref(), Some(child_session_id.as_str()));
+                let first = reviewer
+                    .review(&parent, permission_request(), None)
+                    .await
+                    .expect("first review");
+                assert_eq!(first.outcome, AutoReviewOutcome::AllowOnce);
 
-            let second = reviewer
-                .review(&parent, permission_request(), None)
-                .await
-                .expect("second review");
-            assert_eq!(second.outcome, AutoReviewOutcome::AllowOnce);
-            assert_eq!(
-                reviewer.sticky_child_id().as_deref(),
-                Some(child_session_id.as_str())
-            );
-            let child_records =
-                read_records_allow_partial_tail(&child_path).expect("child records");
-            assert_eq!(
-                child_records
+                let child_session_id = reviewer.sticky_child_id().expect("reviewer child session");
+                let child_path = crate::transcript::child_sessions_dir(sessions.path())
+                    .join(format!("{child_session_id}.jsonl"));
+                let child_records =
+                    read_records_allow_partial_tail(&child_path).expect("child records");
+                let request_card = child_records
                     .iter()
-                    .filter(|record| matches!(
-                        &record.event,
-                        TranscriptEvent::UserMessage { .. }
-                    ))
-                    .count(),
-                2,
-                "the second review must reuse the reviewer child session"
-            );
+                    .find_map(|record| match &record.event {
+                        TranscriptEvent::UserMessage { content, .. } => {
+                            reviewer_cards::parse_review_request(&content.text)
+                        }
+                        _ => None,
+                    })
+                    .expect("request card");
+                assert_eq!(request_card.tool, "shell__exec");
+                assert_eq!(request_card.class.as_deref(), Some("command"));
+                let decision_card = child_records
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        TranscriptEvent::AssistantTurn(turn) => turn
+                            .text
+                            .as_deref()
+                            .and_then(reviewer_cards::parse_review_decision),
+                        _ => None,
+                    })
+                    .expect("decision card");
+                assert_eq!(decision_card.decision, "allow_once");
+                assert!(decision_card.rationale.contains("jev: execute"));
 
-            server.await.expect("server");
-            assert_eq!(seen.lock().expect("capture lock").len(), 2);
-        })
-        .await
-        .expect("review flow timed out");
+                let parent_path = transcript.lock().expect("transcript").path().to_path_buf();
+                let decision = read_records_allow_partial_tail(&parent_path)
+                    .expect("parent records")
+                    .into_iter()
+                    .find_map(|record| match record.event {
+                        TranscriptEvent::PermissionDecision {
+                            reviewer,
+                            reviewer_child_session_id,
+                            ..
+                        } => Some((reviewer, reviewer_child_session_id)),
+                        _ => None,
+                    })
+                    .expect("parent permission decision");
+                assert_eq!(decision.0.as_deref(), Some("auto"));
+                assert_eq!(decision.1.as_deref(), Some(child_session_id.as_str()));
+
+                let second = reviewer
+                    .review(&parent, permission_request(), None)
+                    .await
+                    .expect("second review");
+                assert_eq!(second.outcome, AutoReviewOutcome::AllowOnce);
+                assert_eq!(
+                    reviewer.sticky_child_id().as_deref(),
+                    Some(child_session_id.as_str())
+                );
+                let child_records =
+                    read_records_allow_partial_tail(&child_path).expect("child records");
+                assert_eq!(
+                    child_records
+                        .iter()
+                        .filter(|record| matches!(
+                            &record.event,
+                            TranscriptEvent::UserMessage { .. }
+                        ))
+                        .count(),
+                    2,
+                    "the second review must reuse the reviewer child session"
+                );
+
+                server.await.expect("server");
+                assert_eq!(seen.lock().expect("capture lock").len(), 2);
+            })
+            .await
+            .expect("review flow timed out");
+        }
     }
 }

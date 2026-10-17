@@ -1,2 +1,5 @@
 [alias]
 install-local = "install --path . --force --locked --profile local --target-dir target"
+test-unit = "test --locked --bin letcode -- --skip integration_tests::"
+test-integration = "test --locked --bin letcode integration_tests::"
+test-e2e = "test --locked --test cli"

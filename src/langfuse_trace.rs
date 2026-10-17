@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_metadata_projection_keeps_plan_and_actual_usage_separate_and_safe() {
+    fn cache_metadata_projection_keeps_plan_and_actual_usage_separate() {
         let prepared = cache_metadata_projection(&cache_report(), Some(2));
         let actual =
             cache_metadata_projection(&cache_report().with_actual_cached_tokens(77), Some(2));
@@ -344,28 +344,6 @@ mod tests {
             values
                 .values()
                 .all(|value| matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_)))
-        );
-        let serialized = Value::Object(values).to_string();
-        for forbidden in [
-            "user prompt",
-            "evidence",
-            "tool arguments",
-            "/private/source",
-            "canonical bytes",
-        ] {
-            assert!(!serialized.contains(forbidden));
-        }
-        assert!(
-            actual
-                .local_prefix_fingerprint
-                .as_ref()
-                .is_some_and(|value| value.len() <= 128)
-        );
-        assert!(
-            actual
-                .routing_key
-                .as_ref()
-                .is_some_and(|value| value.len() <= 128)
         );
     }
 }

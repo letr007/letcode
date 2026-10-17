@@ -197,7 +197,7 @@ pub fn persist_agent_event(
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::{ContextProjection, JournalEffect, persist_agent_event};
     use crate::agent::{
         AgentEvent, CompactionBlocker, CompactionNoProgress, CompactionTrigger,

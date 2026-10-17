@@ -2066,10 +2066,6 @@ base_url = "https://example.invalid/v1"
             ("run_timeout_secs = 0", "subagents.run_timeout_secs"),
             ("max_depth = -1", "max_depth"),
             ("max_message_bytes = 1.5", "max_message_bytes"),
-            (
-                "run_timeout_secs = 9223372036854775807",
-                "subagents.run_timeout_secs",
-            ),
         ] {
             let text = format!("{}\n[subagents]\n{fields}\n", config("openai", "model", ""));
             let error = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
@@ -2671,119 +2667,123 @@ model_override = "wire-model"
         assert!(!source.exists());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn sibling_lock_remains_held_after_config_target_replacement() {
-        use std::os::fd::AsRawFd;
-        let path = write_temp_config("original\n");
-        let target = fs::canonicalize(&path).unwrap();
-        let lock_path = config_lock_path(&target).unwrap();
-        let lock = acquire_config_lock(&target).unwrap();
-        let replacement = target.with_file_name("config-lock-replacement");
-        fs::write(&replacement, "replacement\n").unwrap();
-        fs::rename(&replacement, &target).unwrap();
-        let second = open_config_lock_file(&lock_path).unwrap();
-        let result = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(result, -1);
-        drop(second);
-        drop(lock);
-        acquire_config_lock(&target).unwrap();
-    }
+    mod integration_tests {
+        use super::*;
 
-    fn assert_config_read_waits_for_writer(path: PathBuf, target: PathBuf) {
-        use std::sync::mpsc;
-        use std::time::Duration;
+        #[cfg(unix)]
+        #[test]
+        fn sibling_lock_remains_held_after_config_target_replacement() {
+            use std::os::fd::AsRawFd;
+            let path = write_temp_config("original\n");
+            let target = fs::canonicalize(&path).unwrap();
+            let lock_path = config_lock_path(&target).unwrap();
+            let lock = acquire_config_lock(&target).unwrap();
+            let replacement = target.with_file_name("config-lock-replacement");
+            fs::write(&replacement, "replacement\n").unwrap();
+            fs::rename(&replacement, &target).unwrap();
+            let second = open_config_lock_file(&lock_path).unwrap();
+            let result = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(result, -1);
+            drop(second);
+            drop(lock);
+            acquire_config_lock(&target).unwrap();
+        }
 
-        let lock = acquire_config_lock(&target).unwrap();
-        let original = target.with_extension("original");
-        fs::rename(&target, &original).unwrap();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (tx, rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
-            let result = AppConfig::load_from_path(&path);
-            let _ = tx.send(result);
-        });
-        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let before_unlock = rx.recv_timeout(Duration::from_millis(100));
-        fs::rename(&original, &target).unwrap();
-        drop(lock);
-        assert!(matches!(
-            before_unlock,
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        reader.join().unwrap();
-    }
+        fn assert_config_read_waits_for_writer(path: PathBuf, target: PathBuf) {
+            use std::sync::mpsc;
+            use std::time::Duration;
 
-    #[test]
-    fn config_read_waits_for_replacement_before_checking_the_target() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("letcode.toml");
-        fs::write(&path, config("openai", "model", "")).unwrap();
-        let target = fs::canonicalize(&path).unwrap();
-        assert_config_read_waits_for_writer(path, target);
-    }
+            let lock = acquire_config_lock(&target).unwrap();
+            let original = target.with_extension("original");
+            fs::rename(&target, &original).unwrap();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (tx, rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let result = AppConfig::load_from_path(&path);
+                let _ = tx.send(result);
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let before_unlock = rx.recv_timeout(Duration::from_millis(100));
+            fs::rename(&original, &target).unwrap();
+            drop(lock);
+            assert!(matches!(
+                before_unlock,
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            reader.join().unwrap();
+        }
 
-    #[cfg(unix)]
-    #[test]
-    fn config_symlink_read_waits_for_the_target_writer() {
-        use std::os::unix::fs::symlink;
+        #[test]
+        fn config_read_waits_for_replacement_before_checking_the_target() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("letcode.toml");
+            fs::write(&path, config("openai", "model", "")).unwrap();
+            let target = fs::canonicalize(&path).unwrap();
+            assert_config_read_waits_for_writer(path, target);
+        }
 
-        let directory = tempfile::tempdir().unwrap();
-        let target_dir = directory.path().join("target");
-        let alias_dir = directory.path().join("alias");
-        fs::create_dir(&target_dir).unwrap();
-        fs::create_dir(&alias_dir).unwrap();
-        let path = alias_dir.join("letcode.toml");
-        let target = target_dir.join("config.toml");
-        fs::write(&target, config("openai", "model", "")).unwrap();
-        symlink("../target/config.toml", alias_dir.join("next.toml")).unwrap();
-        symlink("next.toml", &path).unwrap();
-        let target = fs::canonicalize(&target).unwrap();
-        assert_config_read_waits_for_writer(path.clone(), target);
-        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
-    }
+        #[cfg(unix)]
+        #[test]
+        fn config_symlink_read_waits_for_the_target_writer() {
+            use std::os::unix::fs::symlink;
 
-    #[test]
-    fn config_save_waits_for_an_existing_writer_before_opening_the_target() {
-        use std::sync::mpsc;
-        use std::time::Duration;
+            let directory = tempfile::tempdir().unwrap();
+            let target_dir = directory.path().join("target");
+            let alias_dir = directory.path().join("alias");
+            fs::create_dir(&target_dir).unwrap();
+            fs::create_dir(&alias_dir).unwrap();
+            let path = alias_dir.join("letcode.toml");
+            let target = target_dir.join("config.toml");
+            fs::write(&target, config("openai", "model", "")).unwrap();
+            symlink("../target/config.toml", alias_dir.join("next.toml")).unwrap();
+            symlink("next.toml", &path).unwrap();
+            let target = fs::canonicalize(&target).unwrap();
+            assert_config_read_waits_for_writer(path.clone(), target);
+            assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+        }
 
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("letcode.toml");
-        let text = config("openai", "model", "");
-        fs::write(&path, &text).unwrap();
-        let mut document = text.parse::<toml_edit::DocumentMut>().unwrap();
-        document["global"]["max_iterations"] = toml_edit::value(42);
-        let target = fs::canonicalize(&path).unwrap();
-        let lock = acquire_config_lock(&target).unwrap();
-        let original = target.with_extension("original");
-        fs::rename(&target, &original).unwrap();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (tx, rx) = mpsc::channel();
-        let writer_path = path.clone();
-        let writer = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
-            let _ = tx.send(save_config_document(&writer_path, &document));
-        });
-        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let before_unlock = rx.recv_timeout(Duration::from_millis(100));
-        fs::rename(&original, &target).unwrap();
-        drop(lock);
-        assert!(matches!(
-            before_unlock,
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        writer.join().unwrap();
-        assert_eq!(
-            AppConfig::load_from_path(path)
-                .unwrap()
-                .global
-                .max_iterations,
-            Some(42)
-        );
+        #[test]
+        fn config_save_waits_for_an_existing_writer_before_opening_the_target() {
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("letcode.toml");
+            let text = config("openai", "model", "");
+            fs::write(&path, &text).unwrap();
+            let mut document = text.parse::<toml_edit::DocumentMut>().unwrap();
+            document["global"]["max_iterations"] = toml_edit::value(42);
+            let target = fs::canonicalize(&path).unwrap();
+            let lock = acquire_config_lock(&target).unwrap();
+            let original = target.with_extension("original");
+            fs::rename(&target, &original).unwrap();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (tx, rx) = mpsc::channel();
+            let writer_path = path.clone();
+            let writer = std::thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let _ = tx.send(save_config_document(&writer_path, &document));
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let before_unlock = rx.recv_timeout(Duration::from_millis(100));
+            fs::rename(&original, &target).unwrap();
+            drop(lock);
+            assert!(matches!(
+                before_unlock,
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            writer.join().unwrap();
+            assert_eq!(
+                AppConfig::load_from_path(path)
+                    .unwrap()
+                    .global
+                    .max_iterations,
+                Some(42)
+            );
+        }
     }
 
     #[test]

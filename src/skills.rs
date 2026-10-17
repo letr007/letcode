@@ -1495,49 +1495,53 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
-    async fn skill_tool_rejects_unknown_skill() {
-        let registry = Arc::new(SkillRegistry::default());
-        let tool = SkillTool::new(registry);
-        let error = tool
-            .execute(json!({"name": "missing"}))
-            .await
-            .expect_err("unknown skill should fail");
+    mod integration_tests {
+        use super::*;
 
-        assert!(error.to_string().contains("unknown skill: missing"));
-    }
+        #[tokio::test]
+        async fn skill_tool_rejects_unknown_skill() {
+            let registry = Arc::new(SkillRegistry::default());
+            let tool = SkillTool::new(registry);
+            let error = tool
+                .execute(json!({"name": "missing"}))
+                .await
+                .expect_err("unknown skill should fail");
 
-    #[tokio::test]
-    async fn skill_resource_read_tool_rejects_absolute_and_parent_paths() {
-        let temp = TempDir::new();
-        let skill_dir = temp.path().join("config/skills/rust-audit");
-        fs::create_dir_all(skill_dir.join("docs")).expect("create docs dir");
-        fs::write(
-            skill_dir.join(SKILL_FILE_NAME),
-            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\n",
-        )
-        .expect("write skill file");
-        fs::write(skill_dir.join("docs/guide.txt"), "hello").expect("write guide");
+            assert!(error.to_string().contains("unknown skill: missing"));
+        }
 
-        let registry = Arc::new(
-            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
-        );
-        let tool = SkillResourceReadTool::new(registry);
+        #[tokio::test]
+        async fn skill_resource_read_tool_rejects_absolute_and_parent_paths() {
+            let temp = TempDir::new();
+            let skill_dir = temp.path().join("config/skills/rust-audit");
+            fs::create_dir_all(skill_dir.join("docs")).expect("create docs dir");
+            fs::write(
+                skill_dir.join(SKILL_FILE_NAME),
+                "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\n",
+            )
+            .expect("write skill file");
+            fs::write(skill_dir.join("docs/guide.txt"), "hello").expect("write guide");
 
-        let absolute_error = tool
-            .execute(json!({"name": "rust-audit", "path": "/tmp/nope.txt"}))
-            .await
-            .expect_err("absolute path should fail");
-        assert!(absolute_error.to_string().contains("must be relative"));
+            let registry = Arc::new(
+                load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
+            );
+            let tool = SkillResourceReadTool::new(registry);
 
-        let traversal_error = tool
-            .execute(json!({"name": "rust-audit", "path": "../secret.txt"}))
-            .await
-            .expect_err("traversal path should fail");
-        assert!(
-            traversal_error
-                .to_string()
-                .contains("must not contain '..'")
-        );
+            let absolute_error = tool
+                .execute(json!({"name": "rust-audit", "path": "/tmp/nope.txt"}))
+                .await
+                .expect_err("absolute path should fail");
+            assert!(absolute_error.to_string().contains("must be relative"));
+
+            let traversal_error = tool
+                .execute(json!({"name": "rust-audit", "path": "../secret.txt"}))
+                .await
+                .expect_err("traversal path should fail");
+            assert!(
+                traversal_error
+                    .to_string()
+                    .contains("must not contain '..'")
+            );
+        }
     }
 }

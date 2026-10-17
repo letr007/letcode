@@ -227,9 +227,3 @@ fn accent_style(theme: Theme) -> Style {
         .bg(theme.elevated_bg)
         .add_modifier(Modifier::BOLD)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
-}

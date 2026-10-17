@@ -1019,6 +1019,8 @@ mod tests {
     #[test]
     fn sidebar_renders_compact_session_and_model_details() {
         let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        state.set_git_branch(Some("main".into()));
         state.session_id = Some("session-1234567890".into());
         state.model_label = "Test Model".into();
         let backend = TestBackend::new(42, 18);
@@ -1035,10 +1037,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("session-1234567890"), "{rendered}");
         assert!(rendered.contains("Test Model"), "{rendered}");
-        assert!(
-            rendered.contains("Git       ") || !rendered.contains("Git"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Git       main"), "{rendered}");
         assert_eq!(
             rendered.matches("session-1234567890").count(),
             1,

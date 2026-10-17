@@ -160,7 +160,7 @@ fn rewrite_body(body: &[u8], apply: impl FnOnce(&mut Value)) -> Result<Vec<u8>, 
 mod tests {
     use super::*;
     use crate::fake::{FakeIdentity, FakeRequestContext};
-    use crate::model_runtime::{HttpMethod, ModelStreamDecoder, TerminalStatus};
+    use crate::model_runtime::HttpMethod;
     use std::collections::BTreeMap;
 
     fn request(protocol: &str, body: Value) -> PreparedHttpRequest {
@@ -406,35 +406,5 @@ mod tests {
             websocket.protocol_headers["openai-beta"],
             crate::fake::CODEX_RESPONSES_WEBSOCKET_BETA
         );
-    }
-
-    struct TerminalDecoder;
-
-    impl ModelStreamDecoder for TerminalDecoder {
-        fn push(
-            &mut self,
-            _chunk: &[u8],
-        ) -> Result<Vec<crate::model_runtime::ModelEvent>, ModelFailure> {
-            Ok(Vec::new())
-        }
-
-        fn finish(&mut self) -> Result<Vec<crate::model_runtime::ModelEvent>, ModelFailure> {
-            Ok(vec![crate::model_runtime::ModelEvent::Terminal {
-                status: TerminalStatus::Length,
-            }])
-        }
-    }
-
-    #[test]
-    fn request_decorator_has_no_decoder_or_terminal_override() {
-        let mut decoder = TerminalDecoder;
-        let events = decoder.finish().unwrap();
-        assert!(matches!(
-            events.as_slice(),
-            [crate::model_runtime::ModelEvent::Terminal {
-                status: TerminalStatus::Length,
-                ..
-            }]
-        ));
     }
 }

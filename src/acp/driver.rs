@@ -2137,137 +2137,142 @@ mod tests {
         (answers, forms_rx.try_recv().ok())
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_question_the_client_answers_is_asked_as_a_form() {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let (answered, form) = ask_over_acp(
-                true,
-                accepted(vec![
-                    (
-                        "question_1",
-                        ElicitationContentValue::String("Safe".to_string()),
-                    ),
-                    (
-                        "question_2",
-                        ElicitationContentValue::StringArray(vec!["test".to_string()]),
-                    ),
-                ]),
-            )
-            .await;
-            assert_eq!(
-                answered.expect("the client answered the questions").answers,
-                vec![vec!["Safe".to_string()], vec!["test".to_string()]]
-            );
-            let form = form.expect("the client received a form");
-            assert_eq!(
-                form.message,
-                "Which parser path should run?\nWhich checks should run?"
-            );
-        })
-        .await
-        .expect("the question round trip timed out");
-    }
+    mod integration_tests {
+        use super::*;
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_declined_form_leaves_the_questions_unanswered() {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let (answered, _) = ask_over_acp(
-                true,
-                CreateElicitationResponse::new(ElicitationAction::Decline),
-            )
-            .await;
-            assert_eq!(
-                answered.expect_err("the client declined"),
-                "the user declined to answer the questions"
-            );
-        })
-        .await
-        .expect("the question round trip timed out");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_client_without_form_elicitation_is_refused_explicitly() {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let (answered, form) = ask_over_acp(
-                false,
-                CreateElicitationResponse::new(ElicitationAction::Decline),
-            )
-            .await;
-            assert_eq!(
-                answered.expect_err("the questions were refused"),
-                QUESTIONS_UNSUPPORTED
-            );
-            assert!(form.is_none(), "the client was asked nothing");
-        })
-        .await
-        .expect("the question round trip timed out");
-    }
-
-    /// An interrupted run answers the prompt the client is waiting on.
-    ///
-    /// The engine reports an interrupt with `Interrupted` and never follows it
-    /// with `Done`. A frontend that settles turns only on `Done` leaves that
-    /// prompt unanswered, and the client's next prompts queue behind it forever.
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_interrupted_turn_is_answered_as_cancelled() {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let (agent_transport, client_transport) = Channel::duplex();
-            let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
-
-            let agent = Agent
-                .builder()
-                .on_receive_request(
-                    {
-                        let requests_tx = requests_tx.clone();
-                        async move |request: PromptRequest, responder, _connection| {
-                            let content = prompt_content(&request.prompt)?;
-                            requests_tx
-                                .send(DriverRequest::Prompt {
-                                    session_id: request.session_id,
-                                    content,
-                                    responder,
-                                })
-                                .map_err(Error::into_internal_error)?;
-                            Ok(())
-                        }
-                    },
-                    agent_client_protocol::on_receive_request!(),
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_question_the_client_answers_is_asked_as_a_form() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let (answered, form) = ask_over_acp(
+                    true,
+                    accepted(vec![
+                        (
+                            "question_1",
+                            ElicitationContentValue::String("Safe".to_string()),
+                        ),
+                        (
+                            "question_2",
+                            ElicitationContentValue::StringArray(vec!["test".to_string()]),
+                        ),
+                    ]),
                 )
-                .connect_with(agent_transport, async move |connection| {
-                    let (_engine, ingress, _egress) = SessionEngine::new();
-                    let mut driver = driver(false);
-                    // Registering the turn before the interrupt keeps the two
-                    // steps in the order the engine reports them. No `Done`
-                    // follows the interrupt, because the engine never sends one.
-                    let request = requests_rx.recv().await.expect("the client sent a prompt");
-                    driver.handle_request(&connection, &ingress, request)?;
-                    driver
-                        .handle_event(&connection, &ingress, SessionTransportEvent::Interrupted)
-                        .await?;
-                    connection.incoming_closed().await;
-                    Ok(())
-                });
+                .await;
+                assert_eq!(
+                    answered.expect("the client answered the questions").answers,
+                    vec![vec!["Safe".to_string()], vec!["test".to_string()]]
+                );
+                let form = form.expect("the client received a form");
+                assert_eq!(
+                    form.message,
+                    "Which parser path should run?\nWhich checks should run?"
+                );
+            })
+            .await
+            .expect("the question round trip timed out");
+        }
 
-            let client = Client
-                .builder()
-                .connect_with(client_transport, async move |connection| {
-                    let response = connection
-                        .send_request(PromptRequest::new(
-                            SessionId::new("session-1"),
-                            vec![text_block("hello")],
-                        ))
-                        .block_task()
-                        .await
-                        .expect("the interrupted turn was answered");
-                    assert_eq!(response.stop_reason, StopReason::Cancelled);
-                    Ok(())
-                });
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_declined_form_leaves_the_questions_unanswered() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let (answered, _) = ask_over_acp(
+                    true,
+                    CreateElicitationResponse::new(ElicitationAction::Decline),
+                )
+                .await;
+                assert_eq!(
+                    answered.expect_err("the client declined"),
+                    "the user declined to answer the questions"
+                );
+            })
+            .await
+            .expect("the question round trip timed out");
+        }
 
-            let (agent_result, client_result) = tokio::join!(agent, client);
-            agent_result.expect("ACP agent connection failed");
-            client_result.expect("ACP client connection failed");
-        })
-        .await
-        .expect("the interrupted turn timed out");
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_client_without_form_elicitation_is_refused_explicitly() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let (answered, form) = ask_over_acp(
+                    false,
+                    CreateElicitationResponse::new(ElicitationAction::Decline),
+                )
+                .await;
+                assert_eq!(
+                    answered.expect_err("the questions were refused"),
+                    QUESTIONS_UNSUPPORTED
+                );
+                assert!(form.is_none(), "the client was asked nothing");
+            })
+            .await
+            .expect("the question round trip timed out");
+        }
+
+        /// An interrupted run answers the prompt the client is waiting on.
+        ///
+        /// The engine reports an interrupt with `Interrupted` and never follows it
+        /// with `Done`. A frontend that settles turns only on `Done` leaves that
+        /// prompt unanswered, and the client's next prompts queue behind it forever.
+        #[tokio::test(flavor = "current_thread")]
+        async fn an_interrupted_turn_is_answered_as_cancelled() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let (agent_transport, client_transport) = Channel::duplex();
+                let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
+
+                let agent = Agent
+                    .builder()
+                    .on_receive_request(
+                        {
+                            let requests_tx = requests_tx.clone();
+                            async move |request: PromptRequest, responder, _connection| {
+                                let content = prompt_content(&request.prompt)?;
+                                requests_tx
+                                    .send(DriverRequest::Prompt {
+                                        session_id: request.session_id,
+                                        content,
+                                        responder,
+                                    })
+                                    .map_err(Error::into_internal_error)?;
+                                Ok(())
+                            }
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .connect_with(agent_transport, async move |connection| {
+                        let (_engine, ingress, _egress) = SessionEngine::new();
+                        let mut driver = driver(false);
+                        // Registering the turn before the interrupt keeps the two
+                        // steps in the order the engine reports them. No `Done`
+                        // follows the interrupt, because the engine never sends one.
+                        let request = requests_rx.recv().await.expect("the client sent a prompt");
+                        driver.handle_request(&connection, &ingress, request)?;
+                        driver
+                            .handle_event(&connection, &ingress, SessionTransportEvent::Interrupted)
+                            .await?;
+                        connection.incoming_closed().await;
+                        Ok(())
+                    });
+
+                let client =
+                    Client
+                        .builder()
+                        .connect_with(client_transport, async move |connection| {
+                            let response = connection
+                                .send_request(PromptRequest::new(
+                                    SessionId::new("session-1"),
+                                    vec![text_block("hello")],
+                                ))
+                                .block_task()
+                                .await
+                                .expect("the interrupted turn was answered");
+                            assert_eq!(response.stop_reason, StopReason::Cancelled);
+                            Ok(())
+                        });
+
+                let (agent_result, client_result) = tokio::join!(agent, client);
+                agent_result.expect("ACP agent connection failed");
+                client_result.expect("ACP client connection failed");
+            })
+            .await
+            .expect("the interrupted turn timed out");
+        }
     }
 }

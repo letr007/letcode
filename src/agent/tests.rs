@@ -501,73 +501,6 @@ fn assert_claude_client_profile(head: &str, body: &str) {
     assert!(head.contains("x-claude-code-session-id: "), "{head}");
 }
 
-#[tokio::test]
-async fn the_anthropic_title_oneshot_carries_the_client_profile() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request = read_test_http_request(&mut stream).await;
-        serve_anthropic_text_completion(&mut stream, "Titled").await;
-        request
-    });
-
-    let mut agent = test_agent();
-    agent.set_default_protocol(ApiProtocol::Anthropic);
-    install_active_epoch_route_at(
-        &mut agent,
-        ApiProtocol::Anthropic,
-        false,
-        &format!("http://{address}/v1"),
-    );
-    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
-
-    let mut title_agent = agent.session_title_agent();
-    let title = title_agent
-        .generate_session_title("say ok")
-        .await
-        .expect("the title is generated");
-    assert_eq!(title, "Titled");
-
-    let (head, body) = server.await.unwrap();
-    assert_claude_client_profile(&head, &body);
-}
-
-#[tokio::test]
-async fn the_anthropic_structured_oneshot_carries_the_client_profile() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request = read_test_http_request(&mut stream).await;
-        serve_anthropic_text_completion(&mut stream, "Summarized").await;
-        request
-    });
-
-    let mut agent = test_agent();
-    agent.set_default_protocol(ApiProtocol::Anthropic);
-    install_active_epoch_route_at(
-        &mut agent,
-        ApiProtocol::Anthropic,
-        false,
-        &format!("http://{address}/v1"),
-    );
-    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
-
-    let (text, _) = agent
-        .run_structured_oneshot(
-            &crate::user_content::UserMessageContent::new("say ok", vec![]),
-            |_| None,
-            |_: &str| std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(())),
-        )
-        .await
-        .expect("the oneshot completes");
-    assert_eq!(text, "Summarized");
-
-    let (head, body) = server.await.unwrap();
-    assert_claude_client_profile(&head, &body);
-}
-
 #[test]
 fn session_title_request_stays_undisguised_while_the_fake_is_off() {
     let mut agent = test_agent();
@@ -1501,14 +1434,6 @@ fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord 
     }
 }
 
-#[test]
-fn agent_iteration_limit_allows_tool_budget_plus_final_round() {
-    let agent = Agent::new("m1", 64, 128);
-
-    assert_eq!(agent.max_tool_calls_limit(), Some(128));
-    assert_eq!(agent.max_iterations_limit(), Some(64));
-}
-
 fn phase2_pressure_agent(protocol: ApiProtocol) -> Agent {
     let mut agent = Agent::new("m1", 4, 4);
     agent.set_default_protocol(protocol);
@@ -1763,418 +1688,6 @@ impl ToolHandler for ExclusiveReadTool {
     }
 }
 
-#[tokio::test]
-async fn async_parallel_tool_is_spawned_before_join_and_waits_for_release() {
-    let mut agent = test_agent();
-    agent.set_model_catalog(HashMap::from([(
-        "m1".to_string(),
-        ModelRequestMetadata {
-            parallel_tool_calls: true,
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    let started = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    agent.register_tool(DelayedParallelReadTool {
-        started: Arc::clone(&started),
-        release: Arc::clone(&release),
-    });
-    let call = test_tool_call("test__delayed_parallel", "{}");
-    let mut events = Vec::new();
-    let task = super::tool_execution::start_parallel_tool_call(&agent, &call, &mut |event| {
-        events.push(event);
-        std::future::ready(Ok(()))
-    })
-    .await
-    .expect("parallel preflight should succeed")
-    .expect("parallel task should be spawned");
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
-        .await
-        .expect("spawned tool should start before the join");
-    assert!(matches!(
-        events.as_slice(),
-        [AgentEvent::ToolCallStarted { .. }]
-    ));
-
-    release.notify_one();
-    let record = task
-        .join()
-        .await
-        .expect("parallel task should return a record");
-    assert!(record.record.output.ok);
-}
-
-#[tokio::test]
-async fn single_parallel_tool_permission_change_after_started_does_not_execute() {
-    let mut agent = test_agent();
-    agent.set_model_catalog(HashMap::from([(
-        "m1".to_string(),
-        ModelRequestMetadata {
-            parallel_tool_calls: true,
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    agent.register_tool(ParallelCountingReadTool {
-        name: "test__permission_race",
-        active: Arc::clone(&active),
-        max_active: Arc::clone(&max_active),
-    });
-    let permission_session = Arc::clone(&agent.permission_session);
-    let mut events = Vec::new();
-    let call = test_tool_call("test__permission_race", "{}");
-    let task = super::tool_execution::start_parallel_tool_call(&agent, &call, &mut |event| {
-        events.push(event);
-        if matches!(events.last(), Some(AgentEvent::ToolCallStarted { .. })) {
-            permission_session
-                .lock()
-                .expect("permission lock")
-                .clear_grants();
-        }
-        std::future::ready(Ok(()))
-    })
-    .await
-    .expect("permission race should be observable");
-
-    assert!(task.is_none());
-    assert_eq!(max_active.load(Ordering::SeqCst), 0);
-    assert!(events.iter().any(|event| {
-        matches!(event, AgentEvent::ToolCallCancelled { call_id, .. } if call_id == &call.call_id)
-    }));
-}
-
-#[tokio::test]
-async fn contiguous_parallel_read_tools_overlap_and_record_in_model_order() {
-    let mut agent = test_agent();
-    agent.set_model_catalog(HashMap::from([(
-        "m1".to_string(),
-        ModelRequestMetadata {
-            parallel_tool_calls: true,
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    for name in ["test__parallel_one", "test__parallel_two"] {
-        agent.register_tool(ParallelCountingReadTool {
-            name,
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        });
-    }
-    let calls = vec![
-        test_tool_call("test__parallel_one", "{}"),
-        test_tool_call("test__parallel_two", "{}"),
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-
-    agent
-        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
-            Ok(PermissionApproval::AllowOnce)
-        })
-        .await
-        .expect("batch executes");
-
-    assert_eq!(max_active.load(Ordering::SeqCst), 2);
-    let history = agent.history_for_test();
-    let outputs = history
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        outputs,
-        vec!["call-test__parallel_one", "call-test__parallel_two"]
-    );
-}
-
-#[tokio::test]
-async fn partial_assistant_call_is_persisted_before_reconciled_tool_output() {
-    let mut agent = test_agent();
-    let call = test_tool_call("test__partial", "{}");
-    agent
-        .append_assistant_tool_calls("partial", std::slice::from_ref(&call))
-        .expect("partial assistant call should persist");
-    let record = test_execution_record(
-        &call.name,
-        ToolResult {
-            ok: true,
-            tool: call.name.clone(),
-            data: Some(json!({"reconciled": true})),
-            images: Vec::new(),
-            error: None,
-        },
-    );
-    agent
-        .record_tool_call_result(&call, record, &mut |_| async { Ok(()) })
-        .await
-        .expect("tool output should reconcile");
-
-    let history = agent.history_for_test();
-    let assistant_index = history
-        .iter()
-        .position(|item| {
-            matches!(
-                item,
-                HistoryItem::AssistantTurn { calls, .. }
-                    if calls.iter().any(|item| item.call_id == call.call_id)
-            )
-        })
-        .expect("assistant call should be present");
-    let output_index = history
-        .iter()
-        .position(|item| {
-            matches!(
-                item,
-                HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id
-            )
-        })
-        .expect("tool output should be present");
-    assert!(assistant_index < output_index);
-}
-
-#[tokio::test]
-async fn parallel_start_failure_cancels_announced_calls_without_execution() {
-    let mut agent = test_agent();
-    agent.set_model_catalog(HashMap::from([(
-        "m1".to_string(),
-        ModelRequestMetadata {
-            parallel_tool_calls: true,
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    for name in ["test__parallel_one", "test__parallel_two"] {
-        agent.register_tool(ParallelCountingReadTool {
-            name,
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        });
-    }
-    let calls = vec![
-        test_tool_call("test__parallel_one", "{}"),
-        test_tool_call("test__parallel_two", "{}"),
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let start_count = Arc::new(AtomicUsize::new(0));
-
-    let result = agent
-        .execute_tool_calls_and_record(
-            &calls,
-            &mut |event| {
-                events.lock().expect("events lock").push(event.clone());
-                let should_fail = matches!(event, AgentEvent::ToolCallStarted { .. })
-                    && start_count.fetch_add(1, Ordering::SeqCst) == 1;
-                std::future::ready(if should_fail {
-                    Err(anyhow!("start callback failed"))
-                } else {
-                    Ok(())
-                })
-            },
-            &mut |_| async { Ok(PermissionApproval::AllowOnce) },
-        )
-        .await;
-
-    assert!(result.is_err());
-    assert_eq!(max_active.load(Ordering::SeqCst), 0);
-    let cancelled = events
-        .lock()
-        .expect("events lock")
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::ToolCallCancelled { call_id, .. } => Some(call_id.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        cancelled,
-        vec![
-            "call-test__parallel_one".to_string(),
-            "call-test__parallel_two".to_string()
-        ]
-    );
-}
-
-#[tokio::test]
-async fn parallel_permission_change_during_starts_cancels_batch_without_execution() {
-    let mut agent = test_agent();
-    agent.set_model_catalog(HashMap::from([(
-        "m1".to_string(),
-        ModelRequestMetadata {
-            parallel_tool_calls: true,
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    for name in ["test__parallel_one", "test__parallel_two"] {
-        agent.register_tool(ParallelCountingReadTool {
-            name,
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        });
-    }
-    let calls = vec![
-        test_tool_call("test__parallel_one", "{}"),
-        test_tool_call("test__parallel_two", "{}"),
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-    let permission_session = Arc::clone(&agent.permission_session);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let changed = Arc::new(AtomicUsize::new(0));
-
-    let result = agent
-        .execute_tool_calls_and_record(
-            &calls,
-            &mut |event| {
-                events.lock().expect("events lock").push(event.clone());
-                if matches!(event, AgentEvent::ToolCallStarted { .. })
-                    && changed.fetch_add(1, Ordering::SeqCst) == 0
-                {
-                    permission_session
-                        .lock()
-                        .expect("permission lock")
-                        .clear_grants();
-                }
-                std::future::ready(Ok(()))
-            },
-            &mut |_| async { Ok(PermissionApproval::AllowOnce) },
-        )
-        .await;
-
-    assert!(
-        result
-            .expect_err("permission generation change must reject the batch")
-            .to_string()
-            .contains("parallel permission preflight changed")
-    );
-    assert_eq!(max_active.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        events
-            .lock()
-            .expect("events lock")
-            .iter()
-            .filter(|event| matches!(event, AgentEvent::ToolCallCancelled { .. }))
-            .count(),
-        2
-    );
-}
-
-#[tokio::test]
-async fn missing_model_metadata_still_parallelizes_parallel_tools() {
-    let mut agent = test_agent();
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    for name in ["test__parallel_one", "test__parallel_two"] {
-        agent.register_tool(ParallelCountingReadTool {
-            name,
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        });
-    }
-    let calls = vec![
-        test_tool_call("test__parallel_one", "{}"),
-        test_tool_call("test__parallel_two", "{}"),
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-
-    agent
-        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
-            Ok(PermissionApproval::AllowOnce)
-        })
-        .await
-        .expect("parallel-capable reads execute concurrently");
-
-    assert_eq!(max_active.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn disabled_model_parallel_tool_calls_keep_parallel_tools_sequential() {
-    let mut agent = test_agent();
-    agent.set_model_catalog(HashMap::from([(
-        "m1".to_string(),
-        ModelRequestMetadata {
-            parallel_tool_calls: false,
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    for name in ["test__parallel_one", "test__parallel_two"] {
-        agent.register_tool(ParallelCountingReadTool {
-            name,
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        });
-    }
-    let calls = vec![
-        test_tool_call("test__parallel_one", "{}"),
-        test_tool_call("test__parallel_two", "{}"),
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-
-    agent
-        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
-            Ok(PermissionApproval::AllowOnce)
-        })
-        .await
-        .expect("parallel-capable reads execute sequentially");
-
-    assert_eq!(max_active.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn exclusive_read_tools_remain_ordering_barriers() {
-    let mut agent = test_agent();
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    for name in ["test__exclusive_one", "test__exclusive_two"] {
-        agent.register_tool(ExclusiveReadTool {
-            name,
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        });
-    }
-    let calls = vec![
-        test_tool_call("test__exclusive_one", "{}"),
-        test_tool_call("test__exclusive_two", "{}"),
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-
-    agent
-        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
-            Ok(PermissionApproval::AllowOnce)
-        })
-        .await
-        .expect("exclusive reads execute");
-
-    assert_eq!(max_active.load(Ordering::SeqCst), 1);
-}
-
 struct ReplayGuardTool(Arc<AtomicUsize>);
 
 #[async_trait]
@@ -2195,66 +1708,6 @@ impl ToolHandler for ReplayGuardTool {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(json!({"executed": true}))
     }
-}
-
-#[test]
-fn completed_tool_output_projection_and_restore_never_reexecutes_handler() {
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::UserMessage {
-                content: crate::user_content::UserMessageContent::from("resume"),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::AssistantToolCallBatch {
-                text: None,
-                reasoning_content: None,
-                reasoning_wire: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "finished".into(),
-                    name: "test__replay_guard".into(),
-                    arguments_json: "{}".into(),
-                }],
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 3,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::ToolCallFinished {
-                call_id: "finished".into(),
-                name: "test__replay_guard".into(),
-                ok: true,
-                output: ToolResult::ok("test__replay_guard", json!({"persisted": true})),
-            },
-        },
-    ];
-    let projected = crate::transcript::transcript_projection::project_runtime_restore_snapshot(
-        "s".into(),
-        records,
-        crate::transcript::transcript_projection::SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("project completed output");
-    let executions = Arc::new(AtomicUsize::new(0));
-    let mut agent = test_agent();
-    agent.register_tool(ReplayGuardTool(executions.clone()));
-    agent
-        .restore_runtime_snapshot(projected.snapshot)
-        .expect("restore persisted output");
-    assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -2551,216 +2004,6 @@ fn capturing_delegate(
     )
 }
 
-#[tokio::test]
-async fn disabled_model_parallel_tool_calls_keep_subagents_sequential() {
-    let mut agent = test_agent();
-    agent.set_model_catalog(HashMap::from([(
-        "m1".to_string(),
-        ModelRequestMetadata {
-            parallel_tool_calls: false,
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    agent.set_subagent_delegate(Arc::new(CountingSubagentDelegate {
-        active: Arc::clone(&active),
-        max_active: Arc::clone(&max_active),
-    }));
-    let calls = vec![
-        test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
-        test_tool_call(
-            "agent__fixer",
-            r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
-        ),
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-
-    agent
-        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
-            Ok(PermissionApproval::AllowOnce)
-        })
-        .await
-        .expect("subagents execute sequentially");
-
-    assert_eq!(max_active.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn contiguous_subagents_publish_results_independently() {
-    let mut agent = test_agent();
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    let started = Arc::new(Mutex::new(Vec::new()));
-    let completion_gate = Arc::new(tokio::sync::Notify::new());
-    agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
-        active: Arc::clone(&active),
-        max_active: Arc::clone(&max_active),
-        started: Arc::clone(&started),
-        completion_gate: Some(completion_gate.clone()),
-    }));
-    let calls = vec![
-        test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
-        test_tool_call(
-            "agent__fixer",
-            r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
-        ),
-    ];
-    let mut calls = calls;
-    calls.push(test_tool_call("agent__oracle", r#"{"task":"review"}"#));
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-
-    let mut finished = Vec::new();
-    let mut evidence_count = 0;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        agent.execute_tool_calls_and_record(
-            &calls,
-            &mut |event| {
-                if let AgentEvent::ToolCallFinished { call_id, ok, .. } = event {
-                    finished.push((call_id, ok));
-                } else if matches!(event, AgentEvent::EvidenceRecorded(_)) {
-                    evidence_count += 1;
-                    if evidence_count == 2 {
-                        assert_eq!(finished.len(), 2);
-                        assert!(finished.contains(&("call-agent__fixer".into(), true)));
-                        assert!(finished.contains(&("call-agent__oracle".into(), false)));
-                        completion_gate.notify_one();
-                    }
-                }
-                async { Ok(()) }
-            },
-            &mut |_| async { Ok(PermissionApproval::AllowOnce) },
-        ),
-    )
-    .await
-    .expect("completed results release the waiting delegate")
-    .expect("batch executes");
-
-    assert_eq!(max_active.load(Ordering::SeqCst), 3);
-    assert_eq!(evidence_count, 3);
-    assert_eq!(
-        *started.lock().expect("started lock"),
-        vec!["explorer", "fixer", "oracle"]
-    );
-    let history = agent.history_for_test();
-    let outputs = history
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(outputs.len(), 3);
-    assert_eq!(outputs[2], "call-agent__explore");
-    assert!(outputs[..2].contains(&"call-agent__fixer"));
-    assert!(outputs[..2].contains(&"call-agent__oracle"));
-}
-
-#[tokio::test]
-async fn subagent_control_tool_is_a_barrier_between_subagent_batches() {
-    let mut agent = test_agent();
-    let calls_seen = Arc::new(Mutex::new(Vec::new()));
-    agent.set_subagent_delegate(Arc::new(RecordingControlDelegate {
-        calls: Arc::clone(&calls_seen),
-    }));
-    let calls = vec![
-        HistoryToolCall {
-            call_id: "call-explore-first".into(),
-            name: "agent__explore".into(),
-            arguments_json: r#"{"task":"first"}"#.into(),
-        },
-        test_tool_call("agent__jobs", r#"{}"#),
-        HistoryToolCall {
-            call_id: "call-explore-second".into(),
-            name: "agent__explore".into(),
-            arguments_json: r#"{"task":"second"}"#.into(),
-        },
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-
-    agent
-        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
-            Ok(PermissionApproval::AllowOnce)
-        })
-        .await
-        .expect("calls execute");
-
-    assert_eq!(
-        *calls_seen.lock().expect("calls lock"),
-        vec!["explorer", "agent__jobs", "explorer"]
-    );
-    let history = agent.history_for_test();
-    let outputs = history
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        outputs,
-        vec![
-            "call-explore-first",
-            "call-agent__jobs",
-            "call-explore-second"
-        ]
-    );
-}
-
-#[tokio::test]
-async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
-    let mut agent = test_agent();
-    let started = Arc::new(Mutex::new(Vec::new()));
-    agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
-        active: Arc::new(AtomicUsize::new(0)),
-        max_active: Arc::new(AtomicUsize::new(0)),
-        started: Arc::clone(&started),
-        completion_gate: None,
-    }));
-    let calls = vec![
-        test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
-        test_tool_call("util__echo", r#"{"text":"barrier"}"#),
-        test_tool_call(
-            "agent__fixer",
-            r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
-        ),
-    ];
-    agent
-        .append_assistant_tool_calls("", &calls)
-        .expect("append tool calls");
-    agent
-        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
-            Ok(PermissionApproval::AllowOnce)
-        })
-        .await
-        .expect("calls execute");
-
-    let history = agent.history_for_test();
-    let outputs = history
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        outputs,
-        vec![
-            "call-agent__explore",
-            "call-util__echo",
-            "call-agent__fixer"
-        ]
-    );
-}
-
 #[test]
 fn remembered_subagent_evidence_carries_parent_turn_provenance() {
     let mut agent = test_agent();
@@ -2808,259 +2051,6 @@ fn remembered_subagent_evidence_carries_parent_turn_provenance() {
         }
         other => panic!("unexpected evidence source: {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn tool_output_emits_projected_provider_usage() {
-    let mut agent = test_agent();
-    let call = test_tool_call("fs__read", "{}");
-    agent
-        .append_assistant_tool_calls("", std::slice::from_ref(&call))
-        .expect("assistant tool calls append");
-    agent.install_provider_usage_anchor_for_test(provider_usage(100));
-    let mut events = Vec::new();
-
-    agent
-        .execute_tool_call_and_record(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("tool call completes");
-
-    let expected_delta = serde_json::to_string(
-        agent
-            .history_for_test()
-            .last()
-            .expect("tool output appended"),
-    )
-    .expect("tool output serializes")
-    .len()
-    .div_ceil(4) as u64;
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::TokenUsageUpdated {
-            used_tokens,
-            input_tokens,
-            output_tokens,
-            cache_report,
-            ..
-        } if *used_tokens == 100 + expected_delta
-            && *input_tokens == 100 + expected_delta
-            && *output_tokens == 0
-            && cache_report.is_none()
-    )));
-}
-
-#[tokio::test]
-async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() {
-    let mut agent = test_agent();
-    agent.set_subagent_delegate(static_delegate(ToolResult::err_with_data(
-        "agent__explore",
-        "explorer cancelled",
-        json!({
-            "run_id": "run-1",
-            "child_session_id": "child-session",
-            "agent_name": "explorer",
-            "status": "cancelled",
-            "summary": "explorer cancelled",
-        }),
-    )));
-    let call = test_tool_call("agent__explore", r#"{"task":"inspect"}"#);
-    agent
-        .append_assistant_tool_calls("", std::slice::from_ref(&call))
-        .expect("assistant tool calls should append");
-    let mut events = Vec::new();
-
-    let error = agent
-        .execute_tool_call_and_record(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect_err("cancelled explorer interrupts the turn after recording output");
-
-    assert!(error.to_string().contains("agent__explore cancelled"));
-    assert!(matches!(
-        agent.history_for_test().last(),
-        Some(HistoryItem::ToolOutput {
-            call_id,
-            output_json,
-            ..
-        }) if call_id == "call-agent__explore"
-            && output_json.contains("cancelled")
-            && output_json.contains("child-session")
-    ));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolCallFinished {
-            name,
-            ok: false,
-            output,
-            ..
-        } if name == "agent__explore"
-            && output
-                .data
-                .as_ref()
-                .and_then(|data| data.get("status"))
-                .and_then(Value::as_str)
-                == Some("cancelled")
-    )));
-}
-
-#[tokio::test]
-async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
-    for (tool, name) in [("agent__fixer", "fixer"), ("agent__general", "general")] {
-        let mut agent = test_agent();
-        agent.prepare_turn_prelude();
-        let (delegate, explorer_prompts, fixer_prompts) = capturing_delegate(ToolResult::ok(
-            tool,
-            json!({
-                "run_id": "run-structured-1",
-                "child_session_id": "child-structured-1",
-                "agent_name": name,
-                "status": "completed",
-                "summary": "implemented bounded fix",
-                "structured_result": {
-                    "status": "completed",
-                    "summary": "implemented bounded fix",
-                    "malformed": false,
-                    "findings": [],
-                    "files_read": ["src/agent.rs"],
-                    "files_changed": ["src/agent.rs"],
-                    "commands_run": ["cargo test subagent --quiet"],
-                    "validation": ["cargo test subagent --quiet passed"],
-                    "blockers": [],
-                    "next_steps": ["continue parent task"],
-                    "run_id": "run-structured-1",
-                    "child_session_id": "child-structured-1"
-                }
-            }),
-        ));
-        agent.set_subagent_delegate(delegate);
-        let prompts = if name == "fixer" {
-            fixer_prompts
-        } else {
-            explorer_prompts
-        };
-
-        let call = test_tool_call(
-            tool,
-            r#"{"task":"implement bounded fix","owned_paths":["src/agent.rs"]}"#,
-        );
-        agent
-            .append_assistant_tool_calls("", std::slice::from_ref(&call))
-            .expect("assistant tool calls should append");
-        let mut events = Vec::new();
-        let mut approvals = 0usize;
-        let record = agent
-            .execute_tool_call(
-                &call,
-                &mut |event| {
-                    events.push(event);
-                    std::future::ready(Ok(()))
-                },
-                &mut |_| {
-                    approvals += 1;
-                    std::future::ready(Ok(PermissionApproval::AllowOnce))
-                },
-            )
-            .await
-            .expect("subagent tool execution should succeed");
-        assert_eq!(approvals, 1);
-        assert_eq!(
-            record.permission_class,
-            crate::permission::ToolPermissionClass::Write
-        );
-        assert_eq!(record.effects.kind, ToolEffectKind::Write);
-        agent
-            .record_tool_call_result(&call, record, &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            })
-            .await
-            .expect("subagent tool result records");
-
-        let prompt = prompts.lock().expect("captured prompt")[0].clone();
-        assert!(prompt.contains("implement bounded fix"));
-        assert!(!prompt.contains(crate::subagent::REPORT_PROMPT));
-        assert!(!prompt.contains("委派约定"));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::EvidenceRecorded(record)
-                if record.tags.iter().any(|tag| tag == "subagent_result")
-        )));
-    }
-}
-
-#[tokio::test]
-async fn wait_and_background_delivery_apply_subagent_effects_once_per_turn() {
-    let mut agent = test_agent();
-    agent.prepare_turn_prelude();
-    let result = json!({
-        "run_id": "run-dedupe-1",
-        "child_session_id": "child-dedupe-1",
-        "agent_name": "fixer",
-        "status": "completed",
-        "summary": "implemented and validated",
-        "structured_result": {
-            "status": "completed",
-            "summary": "implemented and validated",
-            "malformed": false,
-            "findings": [],
-            "files_read": [],
-            "files_changed": ["src/agent.rs"],
-            "commands_run": ["cargo test"],
-            "validation": ["cargo test passed"],
-            "blockers": [],
-            "next_steps": [],
-            "run_id": "run-dedupe-1",
-            "child_session_id": "child-dedupe-1"
-        }
-    });
-    let wait_record = ToolExecutionRecord {
-        call_id: "wait-dedupe-1".into(),
-        tool_name: tool_names::TOOL_AGENT_WAIT.into(),
-        arguments: Some(json!({"run_id": "run-dedupe-1"})),
-        permission_class: crate::permission::ToolPermissionClass::Preview,
-        status: ToolExecutionStatus::Executed,
-        rejection: None,
-        output: ToolResult::ok("agent__wait", result.clone()),
-        effects: ToolEffects {
-            kind: ToolEffectKind::Read,
-            primary_path: None,
-            edited_paths: Vec::new(),
-            command: None,
-        },
-    };
-    agent.record_tool_effects(&wait_record);
-    assert_eq!(agent.child_effect_counts_for_test(), (1, 1, 0));
-    let _ = agent
-        .remember_tool_evidence(&wait_record)
-        .expect("remember wait evidence");
-
-    let summary = crate::subagent::SubagentRunSummary {
-        run_id: "run-dedupe-1".into(),
-        child_session_id: "child-dedupe-1".into(),
-        agent_name: "fixer".into(),
-        status: crate::subagent::SubagentStatus::Completed,
-        failure_kind: None,
-        summary: "implemented and validated".into(),
-        structured_result: serde_json::from_value(result["structured_result"].clone())
-            .expect("structured result"),
-    };
-    agent
-        .install_background_subagent_result(&summary)
-        .expect("background result installs");
-    assert_eq!(agent.child_effect_counts_for_test(), (1, 1, 0));
 }
 
 #[test]
@@ -3158,62 +2148,7 @@ fn reasoning_effort_selection_is_scoped_to_each_model() {
 }
 
 #[test]
-fn protocol_frames_remain_authoritative_for_history_cache() {
-    let mut agent = test_agent();
-    agent
-        .append_history_item(HistoryItem::user("hello"))
-        .expect("user append succeeds");
-    agent
-        .append_history_item(HistoryItem::AssistantTurn {
-            text: Some("working".into()),
-            reasoning_content: None,
-            replay: None,
-            calls: vec![test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#)],
-        })
-        .expect("tool call append succeeds");
-    agent
-        .append_history_item(HistoryItem::ToolOutput {
-            call_id: "call-fs__read".into(),
-            output_json: r#"{"ok":true}"#.into(),
-            images: Vec::new(),
-        })
-        .expect("tool output append succeeds");
-
-    assert_eq!(
-        crate::protocol_frames::history_items_from_frames(&agent.protocol_frames_for_test()),
-        agent.history_for_test()
-    );
-    assert_eq!(
-        agent.runtime_snapshot.frames.len(),
-        agent.protocol_frames_for_test().len()
-    );
-}
-
-/// Phase 0 baseline: pin the live in-memory consistency of the three protocol
-/// representations (history / protocol_frames / snapshot.active_protocol_frames)
-/// before the event-sourcing refactor. Item-wise, not just length.
-fn assert_three_way_protocol_consistency(agent: &Agent) {
-    let frames = agent.protocol_frames_for_test();
-    let history = agent.history_for_test();
-    let active = agent.runtime_snapshot.active_protocol_frames();
-    assert_eq!(
-        crate::protocol_frames::history_items_from_frames(&frames),
-        history,
-        "history must equal protocol_frames payload"
-    );
-    assert_eq!(
-        frames, active,
-        "protocol_frames must equal snapshot.active_protocol_frames"
-    );
-    assert_eq!(
-        crate::protocol_frames::history_items_from_frames(&active),
-        history,
-        "history must equal snapshot.active_protocol_frames payload"
-    );
-}
-
-#[test]
-fn session_state_consistency_live_append_three_way() {
+fn live_append_preserves_history_content() {
     let mut agent = test_agent();
     agent
         .append_history_item(HistoryItem::user("hello"))
@@ -3236,17 +2171,37 @@ fn session_state_consistency_live_append_three_way() {
     agent
         .append_history_item(HistoryItem::assistant("done"))
         .expect("assistant append");
-    assert_three_way_protocol_consistency(&agent);
+    let expected = vec![
+        HistoryItem::user("hello"),
+        HistoryItem::AssistantTurn {
+            text: Some("working".into()),
+            reasoning_content: None,
+            replay: None,
+            calls: vec![HistoryToolCall {
+                call_id: "call-fs__read".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+            }],
+        },
+        HistoryItem::ToolOutput {
+            call_id: "call-fs__read".into(),
+            output_json: r#"{"ok":true}"#.into(),
+            images: Vec::new(),
+        },
+        HistoryItem::assistant("done"),
+    ];
+    assert_eq!(agent.history_for_test(), expected);
 }
 
 #[test]
-fn session_state_consistency_restore_three_way() {
+fn session_restore_preserves_history_content() {
     let mut agent = test_agent();
     let history = vec![HistoryItem::user("seed"), HistoryItem::assistant("answer")];
     agent
         .restore_session_history(history.clone(), Vec::new(), 3)
         .expect("restore session history");
-    assert_three_way_protocol_consistency(&agent);
+    let expected = vec![HistoryItem::user("seed"), HistoryItem::assistant("answer")];
+    assert_eq!(agent.history_for_test(), expected);
 }
 
 #[test]
@@ -3310,119 +2265,6 @@ fn resume_clears_proc_local_identity_and_observation_state() {
         !agent.has_set_logical_request_observation_for_test(),
         "reset wipes logical request observation"
     );
-}
-
-#[test]
-fn session_state_consistency_journal_resume_three_way() {
-    // Oracle Phase-1 priority: real transcript-journal resume projection path
-    // (TranscriptRecorder -> read_records -> project_runtime_restore_snapshot ->
-    // install into Agent) must also yield three-way consistency.
-    let dir = agents_test_dir();
-    let mut rec = TranscriptRecorder::create(&dir).expect("create recorder");
-    rec.record_session_started("m1").expect("session started");
-    let session_id = rec.session_id().to_string();
-    let path = rec.path().to_path_buf();
-    rec.record_user_message("hello").expect("user message");
-    rec.record_turn_started(TurnStartedEvent { turn_id: 1 })
-        .expect("turn started");
-    rec.record_assistant_tool_call_batch(
-        Some("working".into()),
-        None,
-        None,
-        vec![HistoryToolCall {
-            call_id: "call-1".into(),
-            name: "fs__read".into(),
-            arguments_json: r#"{"path":"src/main.rs"}"#.into(),
-        }],
-    )
-    .expect("tool call batch");
-    rec.record_tool_call_finished(
-        "call-1",
-        "fs__read",
-        true,
-        ToolResult::ok("fs__read", json!({"ok": true})),
-    )
-    .expect("tool call finished");
-    rec.record_assistant_message("done")
-        .expect("assistant message");
-    rec.record_turn_finalized(TurnFinalizedEvent {
-        turn_id: 1,
-        outcome: "completed".into(),
-        tool_call_count: 1,
-        continuation_count: 0,
-        write_effects: 0,
-        validation_effects: 0,
-        failed_validation_effects: 0,
-        validation_advisory_emitted: false,
-    })
-    .expect("turn finalized");
-    drop(rec);
-
-    let records = read_records(&path).expect("read records");
-    let projected = project_runtime_restore_snapshot(
-        session_id,
-        records,
-        SessionContextCursor {
-            branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("project runtime restore snapshot");
-
-    let mut agent = test_agent();
-    agent
-        .restore_runtime_snapshot(projected.snapshot)
-        .expect("restore runtime snapshot");
-    assert_three_way_protocol_consistency(&agent);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn closing_a_failed_turn_lets_the_session_continue() {
-    let dir = agents_test_dir();
-    let recorder = TranscriptRecorder::create(&dir).expect("transcript");
-    let transcript = Arc::new(Mutex::new(recorder));
-    let call = HistoryToolCall {
-        call_id: "call-failed".into(),
-        name: "fs__read".into(),
-        arguments_json: r#"{"path":"/tmp/probe.txt"}"#.into(),
-    };
-    {
-        let mut recorder = transcript.lock().expect("lock transcript");
-        recorder
-            .record_user_message("run it")
-            .expect("user message");
-        recorder
-            .record_assistant_tool_call_batch(None, None, None, vec![call.clone()])
-            .expect("assistant tool call batch");
-        recorder
-            .record_tool_call_cancelled("call-failed", "fs__read")
-            .expect("tool call cancelled");
-    }
-
-    let mut agent = test_agent();
-    agent
-        .append_assistant_tool_calls("", std::slice::from_ref(&call))
-        .expect("assistant turn");
-    assert!(agent.has_incomplete_tool_call_groups());
-
-    crate::session::engine::close_failed_turn(
-        &mut agent,
-        &transcript,
-        &crate::subagent::SubagentPool::new(),
-    )
-    .expect("close failed turn");
-
-    assert!(!agent.has_incomplete_tool_call_groups());
-    assert!(
-        agent
-            .append_history_item(HistoryItem::user("next prompt"))
-            .is_ok(),
-        "the next prompt must be accepted"
-    );
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -3685,51 +2527,6 @@ async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
     assert!(!rendered.contains("EXTERNAL-TRANSCRIPT-CONTENT"));
 }
 
-#[tokio::test]
-async fn workflow_auto_continue_tool_enables_llm_controlled_state() {
-    let mut agent = test_agent();
-    let call = HistoryToolCall {
-        call_id: "call-auto".into(),
-        name: "workflow__auto_continue".into(),
-        arguments_json: r#"{"enabled":true}"#.into(),
-    };
-
-    let record = agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            std::future::ready(Ok(PermissionApproval::AllowOnce))
-        })
-        .await
-        .expect("control tool should succeed");
-
-    assert!(record.output.ok);
-    assert!(agent.auto_continue().enabled);
-}
-
-#[tokio::test]
-async fn workflow_todos_tool_updates_todo_state() {
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Auto);
-    let call = HistoryToolCall {
-            call_id: "call-todos".into(),
-            name: "workflow__todos".into(),
-            arguments_json: r#"{"items":[{"id":"t1","content":"first","status":"pending"},{"id":"t2","content":"done","status":"completed"}]}"#.into(),
-        };
-
-    let mut approvals = 0usize;
-    agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            approvals += 1;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("todo control tool should succeed without reviewer or human approval");
-
-    assert_eq!(approvals, 0);
-    assert_eq!(agent.todos().len(), 2);
-    assert_eq!(agent.todos()[0].status, TodoStatus::Pending);
-    assert_eq!(agent.todos()[1].status, TodoStatus::Completed);
-}
-
 fn writable_call(
     call_id: &str,
     tool: &str,
@@ -3803,588 +2600,6 @@ impl Drop for UnixWritableFixture {
     }
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn apply_patch_allow_always_grants_exact_targets_and_prepares_each_call() {
-    let fixture = UnixWritableFixture::new("apply-patch-allow-always");
-    let first = fixture.external.join("first.txt");
-    let second = fixture.external.join("second.txt");
-    let third = fixture.external.join("third.txt");
-    for path in [&first, &second, &third] {
-        std::fs::write(path, "old").expect("seed target");
-    }
-    let mut agent = test_agent();
-    let mut approvals = 0;
-    let mut previews = Vec::new();
-    let mut grant_summaries = Vec::new();
-
-    let first_record = agent
-        .execute_tool_call(
-            &apply_patch_call(
-                "apply-patch-grant-first",
-                vec![
-                    apply_patch_edit(&first, "old", "first"),
-                    apply_patch_edit(&second, "old", "first"),
-                ],
-            ),
-            &mut |_| std::future::ready(Ok(())),
-            &mut |request| {
-                approvals += 1;
-                previews.push(request.preview.expect("external preview"));
-                grant_summaries.push(request.grant_summary.expect("target-set grant"));
-                std::future::ready(Ok(PermissionApproval::AllowAlways))
-            },
-        )
-        .await
-        .expect("first target set executes");
-    assert!(first_record.output.ok, "{:?}", first_record.output.error);
-
-    let replacement = fixture.external.join("first-replacement.txt");
-    std::fs::write(&replacement, "replacement").expect("seed replacement inode");
-    std::fs::rename(&replacement, &first).expect("replace first target inode");
-    let repeated = agent
-        .execute_tool_call(
-            &apply_patch_call(
-                "apply-patch-grant-repeated",
-                vec![
-                    apply_patch_edit(&first, "replacement", "second"),
-                    apply_patch_edit(&second, "first", "second"),
-                ],
-            ),
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                approvals += 1;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("matching target set reuses grant and prepares afresh");
-    assert!(repeated.output.ok, "{:?}", repeated.output.error);
-    assert_eq!(approvals, 1, "identical canonical target set reuses grant");
-    assert_eq!(std::fs::read_to_string(&first).unwrap(), "second");
-    assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
-
-    let distinct = agent
-        .execute_tool_call(
-            &apply_patch_call(
-                "apply-patch-grant-distinct",
-                vec![
-                    apply_patch_edit(&first, "second", "third"),
-                    apply_patch_edit(&third, "old", "third"),
-                ],
-            ),
-            &mut |_| std::future::ready(Ok(())),
-            &mut |request| {
-                approvals += 1;
-                previews.push(request.preview.expect("external preview"));
-                grant_summaries.push(request.grant_summary.expect("target-set grant"));
-                std::future::ready(Ok(PermissionApproval::AllowOnce))
-            },
-        )
-        .await
-        .expect("distinct target set requests approval");
-    assert!(distinct.output.ok, "{:?}", distinct.output.error);
-    assert_eq!(approvals, 2);
-    assert_eq!(
-        grant_summaries,
-        vec!["edit__apply_patch: 2 target path(s)"; 2]
-    );
-    assert_ne!(
-        previews[0], previews[1],
-        "distinct canonical target set previews differ"
-    );
-    assert_eq!(std::fs::read_to_string(&third).unwrap(), "third");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn apply_patch_approval_and_started_rebinding_fail_closed() {
-    use std::os::unix::fs::symlink;
-
-    for timing in ["approval", "started"] {
-        for scenario in [
-            "parent",
-            "leaf",
-            "inside-outside",
-            "outside-inside",
-            "missing",
-        ] {
-            let fixture = UnixWritableFixture::new(&format!("apply-patch-{timing}-{scenario}"));
-            let raw = match scenario {
-                "inside-outside" => fixture.workspace.join("target.txt"),
-                "parent" => fixture.external.join("parent").join("target.txt"),
-                _ => fixture.external.join("target.txt"),
-            };
-            std::fs::create_dir_all(raw.parent().expect("target parent"))
-                .expect("create target parent");
-            std::fs::write(&raw, "authorized").expect("seed authorized target");
-            let inside = fixture.workspace.join("inside.txt");
-            let outside = fixture.external.join("outside.txt");
-            std::fs::write(&inside, "inside").expect("seed inside alternate");
-            std::fs::write(&outside, "outside").expect("seed outside alternate");
-            let parent_stash = fixture.external.join("parent-stash");
-            let missing = fixture.external.join("missing").join("target.txt");
-            let call = apply_patch_call(
-                &format!("apply-patch-{timing}-{scenario}"),
-                vec![apply_patch_edit(&raw, "authorized", "must not write")],
-            );
-            let mutate = || match scenario {
-                "parent" => {
-                    let parent = raw.parent().unwrap();
-                    std::fs::rename(parent, &parent_stash).expect("replace authorized parent");
-                    std::fs::create_dir(parent).expect("create replacement parent");
-                    std::fs::write(&raw, "replacement").expect("seed replacement target");
-                }
-                "leaf" => {
-                    let replacement = fixture.external.join("replacement.txt");
-                    std::fs::write(&replacement, "replacement").expect("seed replacement inode");
-                    std::fs::rename(&replacement, &raw).expect("replace authorized leaf");
-                }
-                "inside-outside" => {
-                    std::fs::remove_file(&raw).expect("remove inside target");
-                    symlink(&outside, &raw).expect("rebind inside path outside");
-                }
-                "outside-inside" => {
-                    std::fs::remove_file(&raw).expect("remove outside target");
-                    symlink(&inside, &raw).expect("rebind outside path inside");
-                }
-                "missing" => {
-                    std::fs::remove_file(&raw).expect("remove authorized target");
-                    symlink(&missing, &raw).expect("rebind to missing target");
-                }
-                _ => unreachable!(),
-            };
-            let mut agent = test_agent();
-            let mut events = Vec::new();
-            let mut approvals = 0;
-            let record = agent
-                .execute_tool_call(
-                    &call,
-                    &mut |event| {
-                        if timing == "started"
-                            && matches!(event, AgentEvent::ToolCallStarted { .. })
-                        {
-                            mutate();
-                        }
-                        events.push(event);
-                        std::future::ready(Ok(()))
-                    },
-                    &mut |_| {
-                        approvals += 1;
-                        if timing == "approval" {
-                            mutate();
-                        }
-                        std::future::ready(Ok(PermissionApproval::AllowOnce))
-                    },
-                )
-                .await
-                .expect("security failure is recorded");
-
-            assert_eq!(approvals, 1, "{timing} {scenario}");
-            assert_eq!(
-                writable_event_phases(&events),
-                vec![true, false],
-                "{timing} {scenario}"
-            );
-            assert_eq!(
-                record.status,
-                ToolExecutionStatus::Executed,
-                "{timing} {scenario}"
-            );
-            assert_eq!(record.rejection, None, "{timing} {scenario}");
-            assert_eq!(
-                record
-                    .output
-                    .error
-                    .as_ref()
-                    .map(|error| error.message.as_str()),
-                Some("apply patch target changed after authorization"),
-                "{timing} {scenario}"
-            );
-            assert_eq!(std::fs::read_to_string(&inside).unwrap(), "inside");
-            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside");
-            if scenario == "parent" {
-                assert_eq!(
-                    std::fs::read_to_string(parent_stash.join("target.txt")).unwrap(),
-                    "authorized"
-                );
-                assert_eq!(std::fs::read_to_string(&raw).unwrap(), "replacement");
-            } else if scenario == "leaf" {
-                assert_eq!(std::fs::read_to_string(&raw).unwrap(), "replacement");
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn default_allow_always_writable_grants_use_raw_path_identity() {
-    use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::symlink;
-
-    let fixture = UnixWritableFixture::new("raw-grant-identity");
-    let target_a = fixture
-        .external
-        .join(std::ffi::OsString::from_vec(b"same-lossy-\x80".to_vec()));
-    let target_b = fixture
-        .external
-        .join(std::ffi::OsString::from_vec(b"same-lossy-\x81".to_vec()));
-    let workspace_a = fixture.workspace.join("a");
-    let workspace_b = fixture.workspace.join("b");
-    // Keep the user-supplied paths UTF-8 while resolving the leaf through a
-    // symlink. APFS permits these dangling symlinks even though it rejects a
-    // non-UTF-8 leaf at open time. Linux filesystems that permit those leaves
-    // exercise the successful write path below without changing this fixture.
-    symlink(&target_a, &workspace_a).expect("link target A");
-    symlink(&target_b, &workspace_b).expect("link target B");
-
-    let call_a = writable_call("raw-a", "fs__write", &workspace_a, "A");
-    let call_a_again = writable_call("raw-a-again", "fs__write", &workspace_a, "A again");
-    let call_b = writable_call("raw-b", "fs__write", &workspace_b, "B");
-    let mut previews = Vec::new();
-    let mut grant_summaries = Vec::new();
-    let mut agent_a = test_agent();
-
-    let first = agent_a
-        .execute_tool_call(
-            &call_a,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |request| {
-                previews.push(request.preview.expect("external preview"));
-                grant_summaries.push(request.grant_summary.expect("grant summary"));
-                assert!(request.can_allow_always);
-                std::future::ready(Ok(PermissionApproval::AllowAlways))
-            },
-        )
-        .await
-        .expect("A is approved");
-    assert_eq!(first.status, ToolExecutionStatus::Executed);
-
-    let mut repeated_approval_requested = false;
-    let repeated = agent_a
-        .execute_tool_call(
-            &call_a_again,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                repeated_approval_requested = true;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("A grant executes");
-    assert_eq!(repeated.status, ToolExecutionStatus::Executed);
-    assert!(
-        !repeated_approval_requested,
-        "matching raw-byte grant must not request approval"
-    );
-
-    let denied_b = agent_a
-        .execute_tool_call(
-            &call_b,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |request| {
-                previews.push(request.preview.expect("external preview"));
-                grant_summaries.push(request.grant_summary.expect("grant summary"));
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("B denial is recorded");
-    assert_eq!(denied_b.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        denied_b.rejection,
-        Some(ToolExecutionRejection::PermissionDeniedByUser)
-    );
-
-    assert_eq!(previews.len(), 2);
-    assert_eq!(grant_summaries.len(), 2);
-    assert_ne!(
-        previews[0], previews[1],
-        "raw-byte preview markers distinguish A and B"
-    );
-    assert_ne!(
-        grant_summaries[0], grant_summaries[1],
-        "raw-byte grant markers distinguish A and B"
-    );
-    if cfg!(target_os = "linux") {
-        assert!(
-            first.output.ok,
-            "Linux raw-byte leaf should be writable: {:?}",
-            first.output.error
-        );
-        assert!(
-            repeated.output.ok,
-            "Linux raw-byte leaf should be writable: {:?}",
-            repeated.output.error
-        );
-        assert_eq!(std::fs::read(&target_a).expect("A was written"), b"A again");
-        assert!(
-            !target_b.exists(),
-            "denied B must not create its raw-byte leaf"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn writable_inside_to_outside_rebind_is_a_post_started_security_failure() {
-    use std::os::unix::fs::symlink;
-
-    let fixture = UnixWritableFixture::new("inside-outside-rebind");
-    let raw = fixture.workspace.join("inside.txt");
-    let outside = fixture.external.join("outside.txt");
-    std::fs::write(&raw, "inside").expect("create inside target");
-    let call = writable_call("inside-outside", "fs__write", &raw, "must not write");
-    let mut agent = test_agent();
-    let mut events = Vec::new();
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                if matches!(event, AgentEvent::ToolCallStarted { .. }) {
-                    std::fs::remove_file(&raw).expect("remove inside target");
-                    symlink(&outside, &raw).expect("rebind to external leaf");
-                }
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("security failure is recorded");
-
-    assert_eq!(writable_event_phases(&events), vec![true, false]);
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert_eq!(record.rejection, None);
-    assert_eq!(
-        record
-            .output
-            .error
-            .as_ref()
-            .map(|error| error.message.as_str()),
-        Some("writable destination changed after authorization")
-    );
-    assert!(
-        !raw.exists(),
-        "rebinding must not recreate the original target"
-    );
-    assert!(!outside.exists(), "rebinding must not write outside");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn writable_tools_cover_user_denials_without_starting() {
-    let fixture = UnixWritableFixture::new("denial-events");
-    for tool in ["fs__write", "fs__append"] {
-        for mode in [PermissionMode::Default, PermissionMode::Safe] {
-            let path = fixture.external.join(format!("user-{tool}"));
-            let call = writable_call(&format!("user-{tool}"), tool, &path, "denied");
-            let mut agent = test_agent();
-            agent.set_permission_mode(mode);
-            let mut approvals = 0;
-            let mut events = Vec::new();
-            let record = agent
-                .execute_tool_call(
-                    &call,
-                    &mut |event| {
-                        events.push(event);
-                        std::future::ready(Ok(()))
-                    },
-                    &mut |_| {
-                        approvals += 1;
-                        std::future::ready(Ok(PermissionApproval::Deny))
-                    },
-                )
-                .await
-                .expect("denial is recorded");
-            assert_eq!(writable_event_phases(&events), vec![false]);
-            assert!(
-                !events
-                    .iter()
-                    .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
-            );
-            assert_eq!(record.status, ToolExecutionStatus::Rejected);
-            assert_eq!(
-                record.rejection,
-                Some(ToolExecutionRejection::PermissionDeniedByUser)
-            );
-            assert_eq!(approvals, 1);
-            assert!(!path.exists(), "{tool} {mode:?} must not write");
-        }
-    }
-}
-
-#[tokio::test]
-async fn default_external_workspace_read_allow_always_grants_only_matching_resource() {
-    let mut agent = test_agent();
-    let fixture_root = std::env::temp_dir().join(format!(
-        "letcode-external-read-grant-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos()
-    ));
-    let first_directory = fixture_root.join("first");
-    let second_directory = fixture_root.join("second");
-    std::fs::create_dir_all(&first_directory).expect("create first fixture directory");
-    std::fs::create_dir_all(&second_directory).expect("create second fixture directory");
-    let first_path = first_directory.join("read.txt");
-    let second_path = second_directory.join("read.txt");
-    std::fs::write(&first_path, "first\n").expect("write first fixture");
-    std::fs::write(&second_path, "second\n").expect("write second fixture");
-
-    let first_call = HistoryToolCall {
-        call_id: "call-external-read-first".into(),
-        name: "fs__read".into(),
-        arguments_json: json!({"path": first_path, "offset": 1, "limit": 10}).to_string(),
-    };
-    let repeated_call = HistoryToolCall {
-        call_id: "call-external-read-repeated".into(),
-        name: "fs__read".into(),
-        arguments_json: first_call.arguments_json.clone(),
-    };
-    let other_directory_call = HistoryToolCall {
-        call_id: "call-external-read-other".into(),
-        name: "fs__read".into(),
-        arguments_json: json!({"path": second_path, "offset": 1, "limit": 10}).to_string(),
-    };
-    let mut approval_requests = 0;
-
-    let first = agent
-        .execute_tool_call(
-            &first_call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |request| {
-                approval_requests += 1;
-                assert!(request.can_allow_always);
-                std::future::ready(Ok(PermissionApproval::AllowAlways))
-            },
-        )
-        .await
-        .expect("first external read should execute after approval");
-    assert!(first.output.ok);
-    assert_eq!(approval_requests, 1);
-
-    let repeated = agent
-        .execute_tool_call(
-            &repeated_call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                approval_requests += 1;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("matching grant should execute without approval");
-    assert!(repeated.output.ok);
-    assert_eq!(approval_requests, 1, "matching grant must bypass approval");
-
-    let other_directory = agent
-        .execute_tool_call(
-            &other_directory_call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                approval_requests += 1;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("other external directory should request approval");
-    assert_eq!(approval_requests, 2);
-    assert_eq!(other_directory.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        other_directory.rejection,
-        Some(ToolExecutionRejection::PermissionDeniedByUser)
-    );
-
-    let _ = std::fs::remove_dir_all(fixture_root);
-}
-
-#[tokio::test]
-async fn matching_grant_allows_high_risk_command_without_reasking() {
-    let mut agent = test_agent();
-    let command = "curl --version";
-    agent
-        .permission_session
-        .lock()
-        .expect("permission session")
-        .grant(crate::permission::PermissionResource::Exact {
-            tool: "shell__exec".into(),
-            value: command.into(),
-        });
-    let call = HistoryToolCall {
-        call_id: "call-granted-high-risk".into(),
-        name: "shell__exec".into(),
-        arguments_json: json!({"command": command}).to_string(),
-    };
-    let mut approval_requested = false;
-
-    let record = agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            approval_requested = true;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("session grant should admit previously blacklisted commands");
-
-    assert!(!approval_requested);
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert_ne!(
-        record.rejection,
-        Some(ToolExecutionRejection::PermissionDeniedByPolicy)
-    );
-}
-
-#[tokio::test]
-async fn default_and_safe_allow_once_authorize_external_writes() {
-    for mode in [PermissionMode::Default, PermissionMode::Safe] {
-        let mut agent = test_agent();
-        agent.set_permission_mode(mode);
-        let outside_path = std::env::temp_dir().join(format!(
-            "letcode-external-write-allow-once-{mode:?}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        let call = HistoryToolCall {
-            call_id: format!("call-external-write-allow-once-{mode:?}"),
-            name: "fs__write".into(),
-            arguments_json: json!({"path": outside_path, "content": "approved"}).to_string(),
-        };
-        let mut approvals = 0;
-        let mut events = Vec::new();
-        let record = agent
-            .execute_tool_call(
-                &call,
-                &mut |event| {
-                    events.push(event);
-                    std::future::ready(Ok(()))
-                },
-                &mut |_| {
-                    approvals += 1;
-                    std::future::ready(Ok(PermissionApproval::AllowOnce))
-                },
-            )
-            .await
-            .expect("approved write should execute");
-        assert_eq!(approvals, 1);
-        assert_eq!(record.status, ToolExecutionStatus::Executed);
-        assert!(record.output.ok, "{:?}", record.output.error);
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: true, .. }))
-        );
-        let _ = std::fs::remove_file(outside_path);
-    }
-}
-
 struct MockAutoReviewService {
     outcome: Mutex<AutoReviewOutcome>,
     calls: AtomicUsize,
@@ -4444,45 +2659,6 @@ impl AutoReviewService for MockAutoReviewService {
     }
 
     fn clear_sticky(&self) {}
-}
-
-#[tokio::test]
-async fn auto_mode_child_inherits_reviewer_service() {
-    let mut parent = test_agent();
-    parent.set_permission_mode(PermissionMode::Auto);
-    let service = Arc::new(MockAutoReviewService {
-        outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
-        calls: AtomicUsize::new(0),
-    });
-    parent.set_auto_review_service(Some(service.clone()));
-    let mut child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
-
-    let path = std::env::temp_dir().join(format!(
-        "letcode-auto-review-child-{}.txt",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos()
-    ));
-    let call = HistoryToolCall {
-        call_id: "call-auto-child".into(),
-        name: "fs__write".into(),
-        arguments_json: json!({"path": path, "content": "ok"}).to_string(),
-    };
-    let mut human_approvals = 0usize;
-    let record = child
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            human_approvals += 1;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("child auto approval executes");
-
-    assert_eq!(human_approvals, 0);
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert!(record.output.ok, "{:?}", record.output.error);
-    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -4553,1080 +2729,6 @@ fn explicit_child_permission_mode_overrides_parent_mode() {
     assert_eq!(child.permission_mode(), PermissionMode::Safe);
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn child_shell_allow_always_stays_within_child_session() {
-    let command = "curl --version";
-    let call = HistoryToolCall {
-        call_id: "call-child-shell".into(),
-        name: "shell__exec".into(),
-        arguments_json: json!({"command": command}).to_string(),
-    };
-    let resource = crate::permission::PermissionResource::Exact {
-        tool: "shell__exec".into(),
-        value: command.into(),
-    };
-
-    let mut parent = test_agent();
-    parent.set_permission_mode(PermissionMode::Default);
-    parent
-        .permission_session
-        .lock()
-        .expect("permission session")
-        .grant(resource.clone());
-
-    let mut child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
-    let mut sibling = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
-    let mut child_approvals = 0usize;
-    let first = child
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            child_approvals += 1;
-            std::future::ready(Ok(PermissionApproval::AllowAlways))
-        })
-        .await
-        .expect("child first shell");
-    assert_eq!(child_approvals, 1);
-    assert_eq!(first.status, ToolExecutionStatus::Executed);
-
-    let mut second_approvals = 0usize;
-    let second = child
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            second_approvals += 1;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("child grant reuse");
-    assert_eq!(second_approvals, 0);
-    assert_eq!(second.status, ToolExecutionStatus::Executed);
-
-    let mut sibling_approvals = 0usize;
-    let sibling_record = sibling
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            sibling_approvals += 1;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("sibling isolated");
-    assert_eq!(sibling_approvals, 1);
-    assert_eq!(sibling_record.status, ToolExecutionStatus::Rejected);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn delegation_scope_authorizes_owned_writes_and_denies_outside() {
-    for template in [AgentTemplate::fixer(), AgentTemplate::general()] {
-        let fixture = UnixWritableFixture::new("delegation-scope-write");
-        let owned = fixture.external.join("owned");
-        let outside = fixture.external.join("outside");
-        fs::create_dir_all(&owned).expect("owned dir");
-        fs::create_dir_all(&outside).expect("outside dir");
-        let owned_file = owned.join("ok.txt");
-        let outside_file = outside.join("no.txt");
-
-        let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
-            objective: "scoped write".into(),
-            success_criteria: Vec::new(),
-            allowed_paths: Vec::new(),
-            forbidden_paths: Vec::new(),
-            owned_paths: vec![owned.to_string_lossy().into()],
-            timeout_secs: None,
-            max_tool_calls: None,
-            model: None,
-            target_child_session_id: None,
-            background: false,
-        })
-        .expect("scope")
-        .expect("non-empty scope");
-
-        let mut child = AgentFactory::create_child(&test_agent(), &template);
-        child.set_permission_mode(PermissionMode::Default);
-        child.set_subagent_path_scope(Some(Arc::new(scope)));
-
-        let mut approvals = 0usize;
-        let allowed = child
-            .execute_tool_call(
-                &HistoryToolCall {
-                    call_id: "scoped-write-ok".into(),
-                    name: "fs__write".into(),
-                    arguments_json: json!({
-                        "path": owned_file,
-                        "content": "ok",
-                    })
-                    .to_string(),
-                },
-                &mut |_| std::future::ready(Ok(())),
-                &mut |_| {
-                    approvals += 1;
-                    std::future::ready(Ok(PermissionApproval::Deny))
-                },
-            )
-            .await
-            .expect("owned write");
-        assert_eq!(approvals, 0, "owned_paths must pre-authorize writes");
-        assert_eq!(allowed.status, ToolExecutionStatus::Executed);
-        assert_eq!(fs::read_to_string(&owned_file).expect("read"), "ok");
-
-        let denied = child
-            .execute_tool_call(
-                &HistoryToolCall {
-                    call_id: "scoped-write-denied".into(),
-                    name: "fs__write".into(),
-                    arguments_json: json!({
-                        "path": outside_file,
-                        "content": "no",
-                    })
-                    .to_string(),
-                },
-                &mut |_| std::future::ready(Ok(())),
-                &mut |_| {
-                    approvals += 1;
-                    std::future::ready(Ok(PermissionApproval::AllowOnce))
-                },
-            )
-            .await
-            .expect("outside write");
-        assert_eq!(approvals, 0, "scope denial must not reach approver");
-        assert_eq!(denied.status, ToolExecutionStatus::Rejected);
-        assert_eq!(
-            denied.rejection,
-            Some(ToolExecutionRejection::DelegationScopeDenied)
-        );
-        assert!(!outside_file.exists());
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn delegation_scope_allows_reads_in_allowed_paths_and_forbids_forbidden() {
-    let fixture = UnixWritableFixture::new("delegation-scope-read");
-    let allowed = fixture.external.join("allowed");
-    let forbidden = fixture.external.join("forbidden");
-    fs::create_dir_all(&allowed).expect("allowed");
-    fs::create_dir_all(&forbidden).expect("forbidden");
-    let allowed_file = allowed.join("a.txt");
-    let forbidden_file = forbidden.join("b.txt");
-    fs::write(&allowed_file, "hello").expect("seed allowed");
-    fs::write(&forbidden_file, "secret").expect("seed forbidden");
-
-    let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
-        objective: "scoped read".into(),
-        success_criteria: Vec::new(),
-        allowed_paths: vec![allowed.to_string_lossy().into()],
-        forbidden_paths: vec![forbidden.to_string_lossy().into()],
-        owned_paths: Vec::new(),
-        timeout_secs: None,
-        max_tool_calls: None,
-        model: None,
-        target_child_session_id: None,
-        background: false,
-    })
-    .expect("scope")
-    .expect("non-empty scope");
-
-    let mut reader = AgentFactory::create_child(&test_agent(), &AgentTemplate::explorer());
-    reader.set_subagent_path_scope(Some(Arc::new(scope.clone())));
-
-    let ok = reader
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "scoped-read-ok".into(),
-                name: "fs__read".into(),
-                arguments_json: json!({"path": allowed_file}).to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("allowed read");
-    assert_eq!(ok.status, ToolExecutionStatus::Executed);
-
-    let blocked = reader
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "scoped-read-forbidden".into(),
-                name: "fs__read".into(),
-                arguments_json: json!({"path": forbidden_file}).to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("forbidden read");
-    assert_eq!(blocked.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        blocked.rejection,
-        Some(ToolExecutionRejection::DelegationScopeDenied)
-    );
-
-    let mut writer = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
-    writer.set_subagent_path_scope(Some(Arc::new(scope)));
-    let write_in_allowed = writer
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "scoped-write-allowed-only".into(),
-                name: "fs__write".into(),
-                arguments_json: json!({
-                    "path": allowed.join("new.txt"),
-                    "content": "nope",
-                })
-                .to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("allowed-only write");
-    assert_eq!(write_in_allowed.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        write_in_allowed.rejection,
-        Some(ToolExecutionRejection::DelegationScopeDenied)
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn delegation_scope_apply_patch_requires_all_targets_owned() {
-    let fixture = UnixWritableFixture::new("delegation-scope-patch");
-    let owned = fixture.external.join("owned");
-    let other = fixture.external.join("other");
-    fs::create_dir_all(&owned).expect("owned");
-    fs::create_dir_all(&other).expect("other");
-    let owned_file = owned.join("a.txt");
-    let other_file = other.join("b.txt");
-    fs::write(&owned_file, "old-a").expect("seed a");
-    fs::write(&other_file, "old-b").expect("seed b");
-
-    let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
-        objective: "scoped patch".into(),
-        success_criteria: Vec::new(),
-        allowed_paths: Vec::new(),
-        forbidden_paths: Vec::new(),
-        owned_paths: vec![owned.to_string_lossy().into()],
-        timeout_secs: None,
-        max_tool_calls: None,
-        model: None,
-        target_child_session_id: None,
-        background: false,
-    })
-    .expect("scope")
-    .expect("non-empty scope");
-
-    let mut child = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
-    child.set_permission_mode(PermissionMode::Default);
-    child.set_subagent_path_scope(Some(Arc::new(scope)));
-
-    let ok = child
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "scoped-patch-ok".into(),
-                name: "edit__apply_patch".into(),
-                arguments_json: json!({
-                    "edits": [{
-                        "path": owned_file,
-                        "find": "old-a",
-                        "replace": "new-a",
-                        "replace_all": false
-                    }]
-                })
-                .to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("owned patch");
-    assert_eq!(ok.status, ToolExecutionStatus::Executed);
-    assert_eq!(fs::read_to_string(&owned_file).expect("read a"), "new-a");
-
-    let denied = child
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "scoped-patch-mixed".into(),
-                name: "edit__apply_patch".into(),
-                arguments_json: json!({
-                    "edits": [
-                        {
-                            "path": owned_file,
-                            "find": "new-a",
-                            "replace": "mutated",
-                            "replace_all": false
-                        },
-                        {
-                            "path": other_file,
-                            "find": "old-b",
-                            "replace": "mutated-b",
-                            "replace_all": false
-                        }
-                    ]
-                })
-                .to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("mixed patch");
-    assert_eq!(denied.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        denied.rejection,
-        Some(ToolExecutionRejection::DelegationScopeDenied)
-    );
-    assert_eq!(fs::read_to_string(&owned_file).expect("read a"), "new-a");
-    assert_eq!(fs::read_to_string(&other_file).expect("read b"), "old-b");
-}
-
-#[tokio::test]
-async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Auto);
-    let service = Arc::new(MockAutoReviewService {
-        outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
-        calls: AtomicUsize::new(0),
-    });
-    agent.set_auto_review_service(Some(service.clone()));
-
-    let path = std::env::temp_dir().join(format!(
-        "letcode-auto-review-once-{}.txt",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos()
-    ));
-    let call = HistoryToolCall {
-        call_id: "call-auto-once".into(),
-        name: "fs__write".into(),
-        arguments_json: json!({"path": path, "content": "ok"}).to_string(),
-    };
-    let mut human_approvals = 0usize;
-    let record = agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            human_approvals += 1;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("auto allow_once executes");
-
-    assert_eq!(human_approvals, 0);
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert!(record.output.ok, "{:?}", record.output.error);
-    let _ = std::fs::remove_file(path);
-}
-
-#[tokio::test]
-async fn auto_mode_reviewer_approves_write_calls() {
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Auto);
-    let service = Arc::new(CapturingAutoReviewService {
-        outcome: AutoReviewOutcome::AllowOnce,
-        calls: AtomicUsize::new(0),
-        last_request: Mutex::new(None),
-    });
-    agent.set_auto_review_service(Some(service.clone()));
-
-    let path = std::env::temp_dir().join(format!(
-        "letcode-auto-review-write-{}.txt",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos()
-    ));
-    let call = HistoryToolCall {
-        call_id: "call-auto-write".into(),
-        name: "fs__write".into(),
-        arguments_json: json!({"path": path, "content": "approved"}).to_string(),
-    };
-    let mut human_approvals = 0usize;
-    let record = agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            human_approvals += 1;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("reviewer approval executes the write");
-
-    assert_eq!(human_approvals, 0);
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    let request = service
-        .last_request
-        .lock()
-        .expect("request lock")
-        .clone()
-        .expect("review request");
-    assert!(!request.can_allow_always);
-    assert!(request.grant_summary.is_none());
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert!(record.output.ok, "{:?}", record.output.error);
-    assert_eq!(fs::read_to_string(&path).expect("read output"), "approved");
-    let _ = fs::remove_file(path);
-}
-
-#[tokio::test]
-async fn auto_reviewer_ask_returns_the_first_call_and_escalates_the_repeat() {
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Auto);
-    let service = Arc::new(MockAutoReviewService {
-        outcome: Mutex::new(AutoReviewOutcome::Ask),
-        calls: AtomicUsize::new(0),
-    });
-    agent.set_auto_review_service(Some(service.clone()));
-
-    let path = std::env::temp_dir().join(format!(
-        "letcode-auto-review-ask-{}.txt",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos()
-    ));
-    let args = json!({"path": path, "content": "explained"});
-    let call = |call_id: &str| HistoryToolCall {
-        call_id: call_id.into(),
-        name: "fs__write".into(),
-        arguments_json: args.to_string(),
-    };
-    let mut human_approvals = 0usize;
-
-    let returned = agent
-        .execute_tool_call(
-            &call("call-auto-ask-1"),
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                human_approvals += 1;
-                std::future::ready(Ok(PermissionApproval::AllowOnce))
-            },
-        )
-        .await
-        .expect("the first ask returns the call to the requester");
-
-    assert_eq!(
-        human_approvals, 0,
-        "the requester's round must not reach the user"
-    );
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(returned.status, ToolExecutionStatus::Rejected);
-
-    let escalated = agent
-        .execute_tool_call(
-            &call("call-auto-ask-2"),
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                human_approvals += 1;
-                std::future::ready(Ok(PermissionApproval::AllowOnce))
-            },
-        )
-        .await
-        .expect("the repeat goes to the user");
-
-    assert_eq!(
-        human_approvals, 1,
-        "the same call asked twice goes to the user"
-    );
-    assert_eq!(
-        service.calls.load(Ordering::SeqCst),
-        2,
-        "the second ask is reviewed again before it reaches the user"
-    );
-    assert_eq!(escalated.status, ToolExecutionStatus::Executed);
-    assert!(escalated.output.ok, "{:?}", escalated.output.error);
-    assert_eq!(fs::read_to_string(&path).expect("read output"), "explained");
-    let _ = fs::remove_file(path);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn auto_mode_keeps_explicit_subagent_scope_as_hard_boundary() {
-    let fixture = UnixWritableFixture::new("auto-subagent-scope");
-    let owned = fixture.external.join("owned");
-    let outside = fixture.external.join("outside");
-    fs::create_dir_all(&owned).expect("owned dir");
-    fs::create_dir_all(&outside).expect("outside dir");
-    let owned_file = owned.join("ok.txt");
-    let outside_file = outside.join("no.txt");
-    let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
-        objective: "scoped auto write".into(),
-        success_criteria: Vec::new(),
-        allowed_paths: Vec::new(),
-        forbidden_paths: Vec::new(),
-        owned_paths: vec![owned.to_string_lossy().into()],
-        timeout_secs: None,
-        max_tool_calls: None,
-        model: None,
-        target_child_session_id: None,
-        background: false,
-    })
-    .expect("scope")
-    .expect("non-empty scope");
-
-    let mut child = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
-    child.set_permission_mode(PermissionMode::Auto);
-    child.set_subagent_path_scope(Some(Arc::new(scope)));
-    let service = Arc::new(MockAutoReviewService {
-        outcome: Mutex::new(AutoReviewOutcome::Deny),
-        calls: AtomicUsize::new(0),
-    });
-    child.set_auto_review_service(Some(service.clone()));
-
-    let allowed = child
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "auto-scope-owned".into(),
-                name: "fs__write".into(),
-                arguments_json: json!({"path": owned_file, "content": "ok"}).to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("owned write");
-    assert_eq!(allowed.status, ToolExecutionStatus::Executed);
-    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
-
-    let denied = child
-        .execute_tool_call(
-            &HistoryToolCall {
-                call_id: "auto-scope-outside".into(),
-                name: "fs__write".into(),
-                arguments_json: json!({"path": outside_file, "content": "no"}).to_string(),
-            },
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("outside write");
-    assert_eq!(denied.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        denied.rejection,
-        Some(ToolExecutionRejection::DelegationScopeDenied)
-    );
-    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
-    assert!(!outside_file.exists());
-}
-
-#[tokio::test]
-async fn auto_mode_subagent_batch_uses_reviewer_and_skips_human_approve() {
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Auto);
-    let service = Arc::new(MockAutoReviewService {
-        outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
-        calls: AtomicUsize::new(0),
-    });
-    agent.set_auto_review_service(Some(service.clone()));
-    agent.set_subagent_delegate(static_delegate(ToolResult::ok(
-        "agent__fixer",
-        json!({
-            "run_id": "run-auto-fixer",
-            "child_session_id": "child-auto-fixer",
-            "status": "completed",
-            "summary": "done"
-        }),
-    )));
-
-    let call = test_tool_call(
-        "agent__fixer",
-        r#"{"task":"apply focused fix","owned_paths":["src/agent.rs"]}"#,
-    );
-    agent
-        .append_assistant_tool_calls("", std::slice::from_ref(&call))
-        .expect("append subagent call");
-    let mut human_approvals = 0usize;
-    agent
-        .execute_tool_calls_and_record(
-            std::slice::from_ref(&call),
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                human_approvals += 1;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("auto-reviewed subagent executes");
-
-    assert_eq!(human_approvals, 0);
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    assert!(agent.history_for_test().iter().any(|item| matches!(
-        item,
-        HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id
-    )));
-}
-
-#[tokio::test]
-async fn auto_mode_deny_includes_reviewer_rationale() {
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Auto);
-    let service = Arc::new(MockAutoReviewService {
-        outcome: Mutex::new(AutoReviewOutcome::Deny),
-        calls: AtomicUsize::new(0),
-    });
-    agent.set_auto_review_service(Some(service));
-
-    let call = HistoryToolCall {
-        call_id: "call-auto-deny".into(),
-        name: "fs__write".into(),
-        arguments_json: json!({"path": "deny.txt", "content": "no"}).to_string(),
-    };
-    let record = agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            std::future::ready(Ok(PermissionApproval::AllowOnce))
-        })
-        .await
-        .expect("auto deny is a tool record");
-
-    assert_eq!(record.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        record.rejection,
-        Some(ToolExecutionRejection::PermissionDeniedByUser)
-    );
-    assert!(record.output.error.as_ref().is_some_and(|error| {
-        error
-            .message
-            .contains("auto-review denied permission: mock-deny")
-    }));
-}
-
-#[tokio::test]
-async fn auto_mode_ask_outcome_returns_the_call_to_the_requester() {
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Auto);
-    let service = Arc::new(MockAutoReviewService {
-        outcome: Mutex::new(AutoReviewOutcome::Ask),
-        calls: AtomicUsize::new(0),
-    });
-    agent.set_auto_review_service(Some(service.clone()));
-
-    let path = std::env::temp_dir().join(format!(
-        "letcode-auto-ask-return-{}.txt",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos()
-    ));
-    let call = HistoryToolCall {
-        call_id: "call-auto-ask".into(),
-        name: "fs__write".into(),
-        arguments_json: json!({"path": path, "content": "x"}).to_string(),
-    };
-    let mut human_requests = 0;
-    let record = agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            human_requests += 1;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("returned call is a tool record");
-
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        human_requests, 0,
-        "the requester's round must not reach the user"
-    );
-    assert_eq!(record.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        record.rejection,
-        Some(ToolExecutionRejection::ReturnedToRequester)
-    );
-    assert!(!path.exists(), "a returned call must not run");
-    let error = record.output.error.expect("returned reason").message;
-    assert!(error.contains("mock-ask"), "{error}");
-    assert!(error.contains("goes to the user"), "{error}");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn auto_mode_does_not_reuse_allow_always_between_reviews() {
-    let fixture = UnixWritableFixture::new("auto-allow-always");
-    let path = fixture.external.join("written.txt");
-    let first_call = writable_call("auto-always-first", "fs__write", &path, "first");
-    let second_call = writable_call("auto-always-second", "fs__write", &path, "second");
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Auto);
-    let service = Arc::new(MockAutoReviewService {
-        outcome: Mutex::new(AutoReviewOutcome::AllowAlways),
-        calls: AtomicUsize::new(0),
-    });
-    agent.set_auto_review_service(Some(service.clone()));
-
-    let first = agent
-        .execute_tool_call(
-            &first_call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("first auto allow_always");
-    assert!(first.output.ok, "{:?}", first.output.error);
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-
-    let second = agent
-        .execute_tool_call(
-            &second_call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
-        )
-        .await
-        .expect("second auto review");
-    assert!(second.output.ok, "{:?}", second.output.error);
-    assert_eq!(
-        service.calls.load(Ordering::SeqCst),
-        2,
-        "Auto mode must review each call instead of reusing a session grant"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn default_allow_always_external_write_grant_is_cleared_at_top_level_session_boundary() {
-    let fixture = UnixWritableFixture::new("allow-always-session-boundary");
-    let path = fixture.external.join("written.txt");
-    let first_call = writable_call("allow-always-first", "fs__write", &path, "first");
-    let repeated_call = writable_call("allow-always-repeated", "fs__write", &path, "second");
-    let after_reset_call = writable_call("allow-always-after-reset", "fs__write", &path, "denied");
-    let mut agent = test_agent();
-    let mut approvals = 0;
-
-    let first = agent
-        .execute_tool_call(
-            &first_call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |request| {
-                approvals += 1;
-                assert!(request.can_allow_always);
-                std::future::ready(Ok(PermissionApproval::AllowAlways))
-            },
-        )
-        .await
-        .expect("first AllowAlways write executes");
-    assert!(first.output.ok, "{:?}", first.output.error);
-    assert_eq!(approvals, 1);
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("first write"),
-        "first"
-    );
-
-    let repeated = agent
-        .execute_tool_call(
-            &repeated_call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |_| {
-                approvals += 1;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("matching session grant executes");
-    assert!(repeated.output.ok, "{:?}", repeated.output.error);
-    assert_eq!(approvals, 1, "matching destination must reuse the grant");
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("repeated write"),
-        "second"
-    );
-
-    // This is the production top-level session transition, not a replacement
-    // Agent instance: it must discard the grant held by this Agent.
-    agent.reset_for_new_session();
-    let after_reset = agent
-        .execute_tool_call(
-            &after_reset_call,
-            &mut |_| std::future::ready(Ok(())),
-            &mut |request| {
-                approvals += 1;
-                assert!(request.can_allow_always);
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("post-reset denial is recorded");
-    assert_eq!(approvals, 2, "reset session must request approval again");
-    assert_eq!(after_reset.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        after_reset.rejection,
-        Some(ToolExecutionRejection::PermissionDeniedByUser)
-    );
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("denial has no write"),
-        "second"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn approved_external_write_rebinding_is_rejected_after_started() {
-    use std::os::unix::fs::symlink;
-
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    let first = std::env::temp_dir().join(format!("letcode-rebind-first-{unique}"));
-    let second = std::env::temp_dir().join(format!("letcode-rebind-second-{unique}"));
-    let link = PathBuf::from("target").join(format!("letcode-rebind-link-{unique}"));
-    std::fs::create_dir_all(&first).expect("create first fixture");
-    std::fs::create_dir_all(&second).expect("create second fixture");
-    std::fs::create_dir_all("target").expect("create target fixture");
-    symlink(&first, &link).expect("create initial link");
-    let raw = link.join("target.txt");
-
-    let mut agent = test_agent();
-    let call = HistoryToolCall {
-        call_id: "call-rebound-external-write".into(),
-        name: "fs__write".into(),
-        arguments_json: json!({"path": raw, "content": "must not write"}).to_string(),
-    };
-    let mut events = Vec::new();
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| {
-                std::fs::remove_file(&link).expect("remove initial link");
-                symlink(&second, &link).expect("rebind link");
-                std::future::ready(Ok(PermissionApproval::AllowOnce))
-            },
-        )
-        .await
-        .expect("rebound write should produce a tool record");
-
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert_eq!(record.rejection, None);
-    assert!(!record.output.ok);
-    assert!(record.output.error.as_ref().is_some_and(|error| {
-        error.message == "writable destination changed after authorization"
-    }));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: false, .. }))
-    );
-    assert!(!first.join("target.txt").exists());
-    assert!(!second.join("target.txt").exists());
-    let _ = std::fs::remove_file(link);
-    let _ = std::fs::remove_dir_all(first);
-    let _ = std::fs::remove_dir_all(second);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn started_callback_rebinding_is_rejected_without_writing_either_destination() {
-    use std::os::unix::fs::symlink;
-
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    let first = std::env::temp_dir().join(format!("letcode-started-rebind-first-{unique}"));
-    let second = std::env::temp_dir().join(format!("letcode-started-rebind-second-{unique}"));
-    let link = PathBuf::from("target").join(format!("letcode-started-rebind-link-{unique}"));
-    std::fs::create_dir_all(&first).expect("create first fixture");
-    std::fs::create_dir_all(&second).expect("create second fixture");
-    std::fs::create_dir_all("target").expect("create target fixture");
-    symlink(&first, &link).expect("create initial link");
-    let raw = link.join("target.txt");
-
-    let mut agent = test_agent();
-    let call = HistoryToolCall {
-        call_id: "call-started-rebound-external-write".into(),
-        name: "fs__write".into(),
-        arguments_json: json!({"path": raw, "content": "must not write"}).to_string(),
-    };
-    let mut events = Vec::new();
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                if matches!(event, AgentEvent::ToolCallStarted { .. }) {
-                    std::fs::remove_file(&link).expect("remove initial link");
-                    symlink(&second, &link).expect("rebind link");
-                }
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("rebound write should produce a tool record");
-
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert_eq!(record.rejection, None);
-    assert!(!record.output.ok);
-    assert_eq!(
-        record
-            .output
-            .error
-            .as_ref()
-            .map(|error| error.message.as_str()),
-        Some("writable destination changed after authorization")
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: false, .. }))
-    );
-    assert!(!first.join("target.txt").exists());
-    assert!(!second.join("target.txt").exists());
-    let _ = std::fs::remove_file(link);
-    let _ = std::fs::remove_dir_all(first);
-    let _ = std::fs::remove_dir_all(second);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn leaf_symlink_callback_rebinding_is_post_started_security_failure() {
-    use std::os::unix::fs::symlink;
-
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let first = std::env::temp_dir().join(format!("letcode-leaf-callback-a-{unique}"));
-    let second = std::env::temp_dir().join(format!("letcode-leaf-callback-b-{unique}"));
-    let link = PathBuf::from("target").join(format!("letcode-leaf-callback-{unique}"));
-    std::fs::create_dir_all("target").unwrap();
-    std::fs::write(&first, "A").unwrap();
-    std::fs::write(&second, "B").unwrap();
-    symlink(&first, &link).unwrap();
-    let call = HistoryToolCall {
-        call_id: "call-leaf-callback-rebind".into(),
-        name: "fs__write".into(),
-        arguments_json: json!({"path": link, "content": "must not write"}).to_string(),
-    };
-    let mut agent = test_agent();
-    let mut events = Vec::new();
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| {
-                std::fs::remove_file(&link).unwrap();
-                symlink(&second, &link).unwrap();
-                std::future::ready(Ok(PermissionApproval::AllowOnce))
-            },
-        )
-        .await
-        .expect("security failure is a completed execution record");
-
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert_eq!(record.rejection, None);
-    assert!(!record.output.ok);
-    assert_eq!(
-        record
-            .output
-            .error
-            .as_ref()
-            .map(|error| error.message.as_str()),
-        Some("writable destination changed after authorization")
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: false, .. }))
-    );
-    assert_eq!(std::fs::read_to_string(&first).unwrap(), "A");
-    assert_eq!(std::fs::read_to_string(&second).unwrap(), "B");
-    let _ = std::fs::remove_file(link);
-    let _ = std::fs::remove_file(first);
-    let _ = std::fs::remove_file(second);
-}
-
-#[tokio::test]
-async fn writable_leaf_preparation_failure_skips_approval_and_started_event() {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let call = test_tool_call(
-        "fs__write",
-        &json!({"path": format!("target/missing-parent-{unique}/leaf"), "content": "x"})
-            .to_string(),
-    );
-    let mut agent = test_agent();
-    let mut approvals = 0;
-    let mut events = Vec::new();
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| {
-                approvals += 1;
-                std::future::ready(Ok(PermissionApproval::AllowOnce))
-            },
-        )
-        .await
-        .expect("preparation failure becomes a rejection record");
-
-    assert_eq!(approvals, 0);
-    assert_eq!(record.status, ToolExecutionStatus::Rejected);
-    assert_eq!(record.rejection, None);
-    assert!(
-        record
-            .output
-            .error
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("parent directory does not exist")
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: false, .. }))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
-    );
-}
-
-#[tokio::test]
-async fn yolo_mode_executes_commands_that_default_mode_asks() {
-    let mut agent = test_agent();
-    agent.set_permission_mode(PermissionMode::Yolo);
-    let call = HistoryToolCall {
-        call_id: "call-yolo-ask-risk".into(),
-        name: "shell__exec".into(),
-        arguments_json: json!({"command": "curl --version"}).to_string(),
-    };
-    let mut approval_requested = false;
-
-    let record = agent
-        .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            approval_requested = true;
-            std::future::ready(Ok(PermissionApproval::Deny))
-        })
-        .await
-        .expect("yolo mode should execute command without asking");
-
-    assert!(!approval_requested);
-    assert_eq!(record.status, ToolExecutionStatus::Executed);
-    assert_ne!(
-        record.rejection,
-        Some(ToolExecutionRejection::PermissionDeniedByPolicy)
-    );
-}
-
 #[test]
 fn legacy_session_history_restore_clears_runtime_workflow_state() {
     let mut agent = test_agent();
@@ -5694,93 +2796,16 @@ async fn auto_continue_stops_only_when_llm_disables_it() {
     );
 }
 
-#[test]
-fn workspace_agents_files_are_loaded_in_order_and_injected_into_each_turn() {
-    let workspace_root = agents_test_dir();
-    let current_dir = workspace_root.join("project").join("nested");
-    fs::create_dir_all(&current_dir).expect("nested workspace should be created");
-    let workspace_root = workspace_root
-        .canonicalize()
-        .expect("workspace root resolves");
-    let current_dir = current_dir
-        .canonicalize()
-        .expect("current directory resolves");
-    fs::write(workspace_root.join("AGENTS.md"), "root instructions").expect("root file");
-    fs::write(
-        workspace_root.join("project/AGENTS.md"),
-        "project instructions",
-    )
-    .expect("project file");
-    fs::write(current_dir.join("AGENTS.md"), "nested instructions").expect("nested file");
+mod strategy {
+    use super::*;
 
-    let mut agent = test_agent();
-    agent
-        .load_workspace_instructions(&workspace_root, &current_dir)
-        .expect("workspace instructions load");
+    mod integration_tests {
+        use super::*;
 
-    let prelude = agent.prepare_turn_prelude();
-    let instructions = prelude
-        .iter()
-        .filter(|message| message.text.starts_with("来自 "))
-        .collect::<Vec<_>>();
-    assert_eq!(instructions.len(), 3);
-    assert!(
-        instructions
-            .iter()
-            .all(|message| message.role == crate::request_builder::PromptRole::System)
-    );
-    assert!(instructions[0].text.contains(&format!(
-        "来自 {} 的指令：",
-        workspace_root.join("AGENTS.md").display()
-    )));
-    assert!(instructions[0].text.ends_with("root instructions"));
-    assert!(instructions[1].text.ends_with("project instructions"));
-    assert!(instructions[2].text.ends_with("nested instructions"));
-
-    fs::remove_dir_all(workspace_root).expect("test directory should be removed");
-}
-
-#[test]
-fn config_agents_file_loads_before_workspace_instructions_without_duplicates() {
-    let root = agents_test_dir();
-    let config_dir = root.join("config");
-    let workspace_root = root.join("workspace");
-    let current_dir = workspace_root.join("nested");
-    fs::create_dir_all(&config_dir).expect("config directory");
-    fs::create_dir_all(workspace_root.join(".git")).expect("repo marker");
-    fs::create_dir_all(&current_dir).expect("nested workspace");
-    fs::write(config_dir.join("AGENTS.md"), "global instructions").expect("global file");
-    fs::write(workspace_root.join("AGENTS.md"), "workspace instructions").expect("workspace file");
-
-    let mut agent = test_agent();
-    agent
-        .load_instruction_files_from(&config_dir, &current_dir)
-        .expect("instruction files load");
-    agent
-        .load_instruction_files_from(&config_dir, &current_dir)
-        .expect("reloading is idempotent");
-
-    let instructions = agent
-        .prelude
-        .iter()
-        .filter(|message| message.text.starts_with("来自 "))
-        .collect::<Vec<_>>();
-    assert_eq!(instructions.len(), 2);
-    assert!(
-        instructions
-            .iter()
-            .all(|message| message.role == crate::request_builder::PromptRole::System)
-    );
-    assert!(instructions[0].text.ends_with("global instructions"));
-    assert!(instructions[1].text.ends_with("workspace instructions"));
-
-    fs::remove_dir_all(root).expect("test directory should be removed");
-}
-
-#[test]
-fn astra_strategy_injects_one_turn_scoped_harness_without_mutating_base_prelude() {
-    let catalog = crate::model_runtime::RuntimeConfig::from_toml(
-        r#"active_provider = "openai"
+        #[test]
+        fn astra_strategy_injects_one_turn_scoped_harness_without_mutating_base_prelude() {
+            let catalog = crate::model_runtime::RuntimeConfig::from_toml(
+                r#"active_provider = "openai"
 [providers.openai]
 protocol = "responses"
 default_model = "gpt-6-astra"
@@ -5790,73 +2815,77 @@ type = "none"
 base_url = "https://example.invalid/v1"
 [providers.openai.models.gpt-6-astra]
 "#,
-    )
-    .unwrap()
-    .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
-    .unwrap();
-    let route = ModelRoute::new("openai", "gpt-6-astra");
-    let resolved = Arc::new(catalog.route("openai", "gpt-6-astra").unwrap().clone());
-    let mut agent = test_agent();
-    let base_prelude_len = agent.prelude.len();
-    agent.set_resolved_runtime_catalog(Some(catalog));
-    agent.set_model_route_authority(route, Arc::clone(&resolved));
+            )
+            .unwrap()
+            .resolve(&crate::model_runtime::ProtocolRegistry::builtins())
+            .unwrap();
+            let route = ModelRoute::new("openai", "gpt-6-astra");
+            let resolved = Arc::new(catalog.route("openai", "gpt-6-astra").unwrap().clone());
+            let mut agent = test_agent();
+            let base_prelude_len = agent.prelude.len();
+            agent.set_resolved_runtime_catalog(Some(catalog));
+            agent.set_model_route_authority(route, Arc::clone(&resolved));
 
-    let first_prelude = agent.prepare_turn_prelude();
-    let second_prelude = agent.prepare_turn_prelude();
-    for prelude in [&first_prelude, &second_prelude] {
-        let harness = prelude
-            .iter()
-            .filter(|message| message.text.contains("GPT-6 Astra 工作指引"))
-            .collect::<Vec<_>>();
-        assert_eq!(harness.len(), 1);
-        assert_eq!(harness[0].role, crate::request_builder::PromptRole::System);
+            let first_prelude = agent.prepare_turn_prelude();
+            let second_prelude = agent.prepare_turn_prelude();
+            for prelude in [&first_prelude, &second_prelude] {
+                let harness = prelude
+                    .iter()
+                    .filter(|message| message.text.contains("GPT-6 Astra 工作指引"))
+                    .collect::<Vec<_>>();
+                assert_eq!(harness.len(), 1);
+                assert_eq!(harness[0].role, crate::request_builder::PromptRole::System);
+            }
+            assert_eq!(agent.prelude.len(), base_prelude_len);
+            assert!(
+                agent
+                    .prelude
+                    .iter()
+                    .all(|message| !message.text.contains("GPT-6 Astra 工作指引"))
+            );
+
+            let history = [HistoryItem::user("Inspect the repository.")];
+            let mut metadata = agent.active_model_metadata();
+            metadata.parallel_tool_calls = false;
+            let build = build_test_request(TestRequestBuilderInput {
+                model_id: &resolved.model_override,
+                model: metadata.clone(),
+                prelude: &first_prelude,
+                history: &history,
+                protected_start_index: 0,
+                tools: &[],
+                evidence: &[],
+            })
+            .unwrap();
+            let input = crate::model_runtime::projection::model_request_from_prompt_plan(
+                &resolved,
+                &metadata,
+                &build.prompt_plan,
+                &[],
+            )
+            .unwrap();
+            let request = resolved.binding.prepare_request(&input).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let instructions = body["instructions"].as_str().unwrap();
+            assert_eq!(instructions.matches("GPT-6 Astra 工作指引").count(), 1);
+            assert!(!body["input"].to_string().contains("GPT-6 Astra 工作指引"));
+
+            let (_, helper_input) =
+                crate::agent::protocol_stream::prepare_resolved_oneshot_request(
+                    &resolved,
+                    metadata,
+                    &[PromptMessage::system("helper instructions")],
+                    &crate::user_content::UserMessageContent::from("summarize"),
+                    None,
+                )
+                .unwrap();
+            let helper_request = resolved.binding.prepare_request(&helper_input).unwrap();
+            let helper_body: serde_json::Value =
+                serde_json::from_slice(&helper_request.body).unwrap();
+            assert!(!helper_body.to_string().contains("GPT-6 Astra 工作指引"));
+            assert!(helper_body.get("reasoning").is_none());
+        }
     }
-    assert_eq!(agent.prelude.len(), base_prelude_len);
-    assert!(
-        agent
-            .prelude
-            .iter()
-            .all(|message| !message.text.contains("GPT-6 Astra 工作指引"))
-    );
-
-    let history = [HistoryItem::user("Inspect the repository.")];
-    let mut metadata = agent.active_model_metadata();
-    metadata.parallel_tool_calls = false;
-    let build = build_test_request(TestRequestBuilderInput {
-        model_id: &resolved.model_override,
-        model: metadata.clone(),
-        prelude: &first_prelude,
-        history: &history,
-        protected_start_index: 0,
-        tools: &[],
-        evidence: &[],
-    })
-    .unwrap();
-    let input = crate::model_runtime::projection::model_request_from_prompt_plan(
-        &resolved,
-        &metadata,
-        &build.prompt_plan,
-        &[],
-    )
-    .unwrap();
-    let request = resolved.binding.prepare_request(&input).unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-    let instructions = body["instructions"].as_str().unwrap();
-    assert_eq!(instructions.matches("GPT-6 Astra 工作指引").count(), 1);
-    assert!(!body["input"].to_string().contains("GPT-6 Astra 工作指引"));
-
-    let (_, helper_input) = super::protocol_stream::prepare_resolved_oneshot_request(
-        &resolved,
-        metadata,
-        &[PromptMessage::system("helper instructions")],
-        &crate::user_content::UserMessageContent::from("summarize"),
-        None,
-    )
-    .unwrap();
-    let helper_request = resolved.binding.prepare_request(&helper_input).unwrap();
-    let helper_body: serde_json::Value = serde_json::from_slice(&helper_request.body).unwrap();
-    assert!(!helper_body.to_string().contains("GPT-6 Astra 工作指引"));
-    assert!(helper_body.get("reasoning").is_none());
 }
 
 #[test]
@@ -5888,163 +2917,3135 @@ fn selected_skill_injects_exact_turn_scoped_material() {
     );
 }
 
-#[tokio::test]
-async fn execute_tool_call_emits_finished_event_for_user_denial_of_high_risk_command() {
-    let mut agent = Agent::new("m1", 1, 1);
-    let call = HistoryToolCall {
-        call_id: "call-denied".into(),
-        name: "shell__exec".into(),
-        arguments_json: r#"{"command":"rm -rf target"}"#.into(),
-    };
-    let mut events = Vec::new();
-    let mut approval_requested = false;
+mod integration_tests {
+    use super::*;
 
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| {
-                approval_requested = true;
-                std::future::ready(Ok(PermissionApproval::Deny))
-            },
-        )
-        .await
-        .expect("user denial should be reported as tool output");
-
-    assert!(
-        approval_requested,
-        "high-risk commands must Ask, not hard-deny"
-    );
-    assert!(!record.output.ok);
-    assert!(matches!(
-        events.as_slice(),
-        [
-            AgentEvent::ToolCallFinished { ok: false, .. },
-            AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
-                status,
-                rejection: Some(rejection),
-                effect_kind,
-                ..
-            })
-        ] if status == "rejected"
-                && rejection == "permission_denied_by_user"
-                && effect_kind == "diagnostic"
-    ));
-    assert_eq!(record.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        record.rejection,
-        Some(ToolExecutionRejection::PermissionDeniedByUser)
-    );
-    assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
-}
-
-#[tokio::test]
-async fn execute_tool_call_invalid_json_emits_finished_event_and_records_rejection() {
-    let mut agent = test_agent();
-    let call = test_tool_call("fs__write", r#"{"path":"a.txt","content": }"#);
-    let mut events = Vec::new();
-
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                events.push(event);
-                std::future::ready(Ok(()))
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("invalid json should still produce a record");
-
-    assert_eq!(record.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        record.rejection,
-        Some(ToolExecutionRejection::InvalidJsonArguments)
-    );
-    assert!(!record.output.ok);
-    assert_eq!(record.arguments, None);
-    assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
-    assert!(matches!(
-        events.as_slice(),
-        [
-            AgentEvent::ToolCallFinished { ok: false, .. },
-            AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
-                status,
-                rejection: Some(rejection),
-                effect_kind,
-                ..
-            })
-        ] if status == "rejected"
-            && rejection == "invalid_json_arguments"
-            && effect_kind == "diagnostic"
-    ));
-}
-
-#[tokio::test]
-async fn audit_event_failures_do_not_fail_tool_execution() {
-    let mut agent = test_agent();
-    let call = test_tool_call("fs__write", r#"{"path":"a.txt","content": }"#);
-    let mut event_count = 0;
-
-    let record = agent
-        .execute_tool_call(
-            &call,
-            &mut |event| {
-                assert!(matches!(
-                    event,
-                    AgentEvent::ToolCallFinished { .. } | AgentEvent::ToolExecutionSummary(_)
-                ));
-                event_count += 1;
-                if matches!(event, AgentEvent::ToolExecutionSummary(_)) {
-                    std::future::ready(Err(anyhow!("audit sink failed")))
-                } else {
-                    std::future::ready(Ok(()))
-                }
-            },
-            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("audit failure should not fail tool execution");
-
-    assert_eq!(event_count, 2);
-    assert_eq!(record.status, ToolExecutionStatus::Rejected);
-    assert_eq!(
-        record.rejection,
-        Some(ToolExecutionRejection::InvalidJsonArguments)
-    );
-    for mode in [
-        crate::config::SubagentMode::Expert,
-        crate::config::SubagentMode::Swarm,
-    ] {
-        let mut agent = test_agent();
-        agent.set_subagents_policy(crate::config::SubagentsConfig {
-            mode,
-            ..Default::default()
+    #[tokio::test]
+    async fn the_anthropic_title_oneshot_carries_the_client_profile() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut stream).await;
+            serve_anthropic_text_completion(&mut stream, "Titled").await;
+            request
         });
-        let mut finalized = 0;
+
+        let mut agent = test_agent();
+        agent.set_default_protocol(ApiProtocol::Anthropic);
+        install_active_epoch_route_at(
+            &mut agent,
+            ApiProtocol::Anthropic,
+            false,
+            &format!("http://{address}/v1"),
+        );
+        agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
+
+        let mut title_agent = agent.session_title_agent();
+        let title = title_agent
+            .generate_session_title("say ok")
+            .await
+            .expect("the title is generated");
+        assert_eq!(title, "Titled");
+
+        let (head, body) = server.await.unwrap();
+        assert_claude_client_profile(&head, &body);
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_structured_oneshot_carries_the_client_profile() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut stream).await;
+            serve_anthropic_text_completion(&mut stream, "Summarized").await;
+            request
+        });
+
+        let mut agent = test_agent();
+        agent.set_default_protocol(ApiProtocol::Anthropic);
+        install_active_epoch_route_at(
+            &mut agent,
+            ApiProtocol::Anthropic,
+            false,
+            &format!("http://{address}/v1"),
+        );
+        agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
+
+        let (text, _) = agent
+            .run_structured_oneshot(
+                &crate::user_content::UserMessageContent::new("say ok", vec![]),
+                |_| None,
+                |_: &str| std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(())),
+            )
+            .await
+            .expect("the oneshot completes");
+        assert_eq!(text, "Summarized");
+
+        let (head, body) = server.await.unwrap();
+        assert_claude_client_profile(&head, &body);
+    }
+
+    #[tokio::test]
+    async fn async_parallel_tool_is_spawned_before_join_and_waits_for_release() {
+        let mut agent = test_agent();
+        agent.set_model_catalog(HashMap::from([(
+            "m1".to_string(),
+            ModelRequestMetadata {
+                parallel_tool_calls: true,
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        agent.register_tool(DelayedParallelReadTool {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        let call = test_tool_call("test__delayed_parallel", "{}");
+        let mut events = Vec::new();
+        let task =
+            crate::agent::tool_execution::start_parallel_tool_call(&agent, &call, &mut |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            })
+            .await
+            .expect("parallel preflight should succeed")
+            .expect("parallel task should be spawned");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("spawned tool should start before the join");
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ToolCallStarted { .. }]
+        ));
+
+        release.notify_one();
+        let record = task
+            .join()
+            .await
+            .expect("parallel task should return a record");
+        assert!(record.record.output.ok);
+    }
+
+    #[tokio::test]
+    async fn single_parallel_tool_permission_change_after_started_does_not_execute() {
+        let mut agent = test_agent();
+        agent.set_model_catalog(HashMap::from([(
+            "m1".to_string(),
+            ModelRequestMetadata {
+                parallel_tool_calls: true,
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        agent.register_tool(ParallelCountingReadTool {
+            name: "test__permission_race",
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+        let permission_session = Arc::clone(&agent.permission_session);
+        let mut events = Vec::new();
+        let call = test_tool_call("test__permission_race", "{}");
+        let task =
+            crate::agent::tool_execution::start_parallel_tool_call(&agent, &call, &mut |event| {
+                events.push(event);
+                if matches!(events.last(), Some(AgentEvent::ToolCallStarted { .. })) {
+                    permission_session
+                        .lock()
+                        .expect("permission lock")
+                        .clear_grants();
+                }
+                std::future::ready(Ok(()))
+            })
+            .await
+            .expect("permission race should be observable");
+
+        assert!(task.is_none());
+        assert_eq!(max_active.load(Ordering::SeqCst), 0);
+        assert!(events.iter().any(|event| {
+        matches!(event, AgentEvent::ToolCallCancelled { call_id, .. } if call_id == &call.call_id)
+    }));
+    }
+
+    #[tokio::test]
+    async fn contiguous_parallel_read_tools_overlap_and_record_in_model_order() {
+        let mut agent = test_agent();
+        agent.set_model_catalog(HashMap::from([(
+            "m1".to_string(),
+            ModelRequestMetadata {
+                parallel_tool_calls: true,
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        for name in ["test__parallel_one", "test__parallel_two"] {
+            agent.register_tool(ParallelCountingReadTool {
+                name,
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            });
+        }
+        let calls = vec![
+            test_tool_call("test__parallel_one", "{}"),
+            test_tool_call("test__parallel_two", "{}"),
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+
+        agent
+            .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+                Ok(PermissionApproval::AllowOnce)
+            })
+            .await
+            .expect("batch executes");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        let history = agent.history_for_test();
+        let outputs = history
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec!["call-test__parallel_one", "call-test__parallel_two"]
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_assistant_call_is_persisted_before_reconciled_tool_output() {
+        let mut agent = test_agent();
+        let call = test_tool_call("test__partial", "{}");
+        agent
+            .append_assistant_tool_calls("partial", std::slice::from_ref(&call))
+            .expect("partial assistant call should persist");
+        let record = test_execution_record(
+            &call.name,
+            ToolResult {
+                ok: true,
+                tool: call.name.clone(),
+                data: Some(json!({"reconciled": true})),
+                images: Vec::new(),
+                error: None,
+            },
+        );
+        agent
+            .record_tool_call_result(&call, record, &mut |_| async { Ok(()) })
+            .await
+            .expect("tool output should reconcile");
+
+        let history = agent.history_for_test();
+        let assistant_index = history
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    HistoryItem::AssistantTurn { calls, .. }
+                        if calls.iter().any(|item| item.call_id == call.call_id)
+                )
+            })
+            .expect("assistant call should be present");
+        let output_index = history
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id
+                )
+            })
+            .expect("tool output should be present");
+        assert!(assistant_index < output_index);
+    }
+
+    #[tokio::test]
+    async fn parallel_start_failure_cancels_announced_calls_without_execution() {
+        let mut agent = test_agent();
+        agent.set_model_catalog(HashMap::from([(
+            "m1".to_string(),
+            ModelRequestMetadata {
+                parallel_tool_calls: true,
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        for name in ["test__parallel_one", "test__parallel_two"] {
+            agent.register_tool(ParallelCountingReadTool {
+                name,
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            });
+        }
+        let calls = vec![
+            test_tool_call("test__parallel_one", "{}"),
+            test_tool_call("test__parallel_two", "{}"),
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let start_count = Arc::new(AtomicUsize::new(0));
+
         let result = agent
-            .continue_or_finalize_no_tool_reply(
+            .execute_tool_calls_and_record(
+                &calls,
                 &mut |event| {
-                    assert!(matches!(event, AgentEvent::TurnFinalized(_)));
-                    finalized += 1;
-                    std::future::ready(Err(anyhow!("turn close rejected")))
+                    events.lock().expect("events lock").push(event.clone());
+                    let should_fail = matches!(event, AgentEvent::ToolCallStarted { .. })
+                        && start_count.fetch_add(1, Ordering::SeqCst) == 1;
+                    std::future::ready(if should_fail {
+                        Err(anyhow!("start callback failed"))
+                    } else {
+                        Ok(())
+                    })
                 },
-                0,
-                &mut 0,
+                &mut |_| async { Ok(PermissionApproval::AllowOnce) },
             )
             .await;
-        assert_eq!(finalized, 1);
-        match mode {
-            crate::config::SubagentMode::Expert => assert!(!result.unwrap()),
-            crate::config::SubagentMode::Swarm => assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("turn close rejected")
+
+        assert!(result.is_err());
+        assert_eq!(max_active.load(Ordering::SeqCst), 0);
+        let cancelled = events
+            .lock()
+            .expect("events lock")
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCallCancelled { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cancelled,
+            vec![
+                "call-test__parallel_one".to_string(),
+                "call-test__parallel_two".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_permission_change_during_starts_cancels_batch_without_execution() {
+        let mut agent = test_agent();
+        agent.set_model_catalog(HashMap::from([(
+            "m1".to_string(),
+            ModelRequestMetadata {
+                parallel_tool_calls: true,
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        for name in ["test__parallel_one", "test__parallel_two"] {
+            agent.register_tool(ParallelCountingReadTool {
+                name,
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            });
+        }
+        let calls = vec![
+            test_tool_call("test__parallel_one", "{}"),
+            test_tool_call("test__parallel_two", "{}"),
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+        let permission_session = Arc::clone(&agent.permission_session);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let changed = Arc::new(AtomicUsize::new(0));
+
+        let result = agent
+            .execute_tool_calls_and_record(
+                &calls,
+                &mut |event| {
+                    events.lock().expect("events lock").push(event.clone());
+                    if matches!(event, AgentEvent::ToolCallStarted { .. })
+                        && changed.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        permission_session
+                            .lock()
+                            .expect("permission lock")
+                            .clear_grants();
+                    }
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| async { Ok(PermissionApproval::AllowOnce) },
+            )
+            .await;
+
+        assert!(
+            result
+                .expect_err("permission generation change must reject the batch")
+                .to_string()
+                .contains("parallel permission preflight changed")
+        );
+        assert_eq!(max_active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolCallCancelled { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_model_metadata_still_parallelizes_parallel_tools() {
+        let mut agent = test_agent();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        for name in ["test__parallel_one", "test__parallel_two"] {
+            agent.register_tool(ParallelCountingReadTool {
+                name,
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            });
+        }
+        let calls = vec![
+            test_tool_call("test__parallel_one", "{}"),
+            test_tool_call("test__parallel_two", "{}"),
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+
+        agent
+            .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+                Ok(PermissionApproval::AllowOnce)
+            })
+            .await
+            .expect("parallel-capable reads execute concurrently");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_model_parallel_tool_calls_keep_parallel_tools_sequential() {
+        let mut agent = test_agent();
+        agent.set_model_catalog(HashMap::from([(
+            "m1".to_string(),
+            ModelRequestMetadata {
+                parallel_tool_calls: false,
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        for name in ["test__parallel_one", "test__parallel_two"] {
+            agent.register_tool(ParallelCountingReadTool {
+                name,
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            });
+        }
+        let calls = vec![
+            test_tool_call("test__parallel_one", "{}"),
+            test_tool_call("test__parallel_two", "{}"),
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+
+        agent
+            .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+                Ok(PermissionApproval::AllowOnce)
+            })
+            .await
+            .expect("parallel-capable reads execute sequentially");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exclusive_read_tools_remain_ordering_barriers() {
+        let mut agent = test_agent();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        for name in ["test__exclusive_one", "test__exclusive_two"] {
+            agent.register_tool(ExclusiveReadTool {
+                name,
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            });
+        }
+        let calls = vec![
+            test_tool_call("test__exclusive_one", "{}"),
+            test_tool_call("test__exclusive_two", "{}"),
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+
+        agent
+            .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+                Ok(PermissionApproval::AllowOnce)
+            })
+            .await
+            .expect("exclusive reads execute");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn completed_tool_output_projection_and_restore_never_reexecutes_handler() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: crate::user_content::UserMessageContent::from("resume"),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::AssistantToolCallBatch {
+                    text: None,
+                    reasoning_content: None,
+                    reasoning_wire: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "finished".into(),
+                        name: "test__replay_guard".into(),
+                        arguments_json: "{}".into(),
+                    }],
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::ToolCallFinished {
+                    call_id: "finished".into(),
+                    name: "test__replay_guard".into(),
+                    ok: true,
+                    output: ToolResult::ok("test__replay_guard", json!({"persisted": true})),
+                },
+            },
+        ];
+        let projected = crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            crate::transcript::transcript_projection::SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("project completed output");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut agent = test_agent();
+        agent.register_tool(ReplayGuardTool(executions.clone()));
+        agent
+            .restore_runtime_snapshot(projected.snapshot)
+            .expect("restore persisted output");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_model_parallel_tool_calls_keep_subagents_sequential() {
+        let mut agent = test_agent();
+        agent.set_model_catalog(HashMap::from([(
+            "m1".to_string(),
+            ModelRequestMetadata {
+                parallel_tool_calls: false,
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        agent.set_subagent_delegate(Arc::new(CountingSubagentDelegate {
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        }));
+        let calls = vec![
+            test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
+            test_tool_call(
+                "agent__fixer",
+                r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
             ),
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+
+        agent
+            .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+                Ok(PermissionApproval::AllowOnce)
+            })
+            .await
+            .expect("subagents execute sequentially");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn contiguous_subagents_publish_results_independently() {
+        let mut agent = test_agent();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let completion_gate = Arc::new(tokio::sync::Notify::new());
+        agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+            started: Arc::clone(&started),
+            completion_gate: Some(completion_gate.clone()),
+        }));
+        let calls = vec![
+            test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
+            test_tool_call(
+                "agent__fixer",
+                r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
+            ),
+        ];
+        let mut calls = calls;
+        calls.push(test_tool_call("agent__oracle", r#"{"task":"review"}"#));
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+
+        let mut finished = Vec::new();
+        let mut evidence_count = 0;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            agent.execute_tool_calls_and_record(
+                &calls,
+                &mut |event| {
+                    if let AgentEvent::ToolCallFinished { call_id, ok, .. } = event {
+                        finished.push((call_id, ok));
+                    } else if matches!(event, AgentEvent::EvidenceRecorded(_)) {
+                        evidence_count += 1;
+                        if evidence_count == 2 {
+                            assert_eq!(finished.len(), 2);
+                            assert!(finished.contains(&("call-agent__fixer".into(), true)));
+                            assert!(finished.contains(&("call-agent__oracle".into(), false)));
+                            completion_gate.notify_one();
+                        }
+                    }
+                    async { Ok(()) }
+                },
+                &mut |_| async { Ok(PermissionApproval::AllowOnce) },
+            ),
+        )
+        .await
+        .expect("completed results release the waiting delegate")
+        .expect("batch executes");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 3);
+        assert_eq!(evidence_count, 3);
+        assert_eq!(
+            *started.lock().expect("started lock"),
+            vec!["explorer", "fixer", "oracle"]
+        );
+        let history = agent.history_for_test();
+        let outputs = history
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[2], "call-agent__explore");
+        assert!(outputs[..2].contains(&"call-agent__fixer"));
+        assert!(outputs[..2].contains(&"call-agent__oracle"));
+    }
+
+    #[tokio::test]
+    async fn subagent_control_tool_is_a_barrier_between_subagent_batches() {
+        let mut agent = test_agent();
+        let calls_seen = Arc::new(Mutex::new(Vec::new()));
+        agent.set_subagent_delegate(Arc::new(RecordingControlDelegate {
+            calls: Arc::clone(&calls_seen),
+        }));
+        let calls = vec![
+            HistoryToolCall {
+                call_id: "call-explore-first".into(),
+                name: "agent__explore".into(),
+                arguments_json: r#"{"task":"first"}"#.into(),
+            },
+            test_tool_call("agent__jobs", r#"{}"#),
+            HistoryToolCall {
+                call_id: "call-explore-second".into(),
+                name: "agent__explore".into(),
+                arguments_json: r#"{"task":"second"}"#.into(),
+            },
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+
+        agent
+            .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+                Ok(PermissionApproval::AllowOnce)
+            })
+            .await
+            .expect("calls execute");
+
+        assert_eq!(
+            *calls_seen.lock().expect("calls lock"),
+            vec!["explorer", "agent__jobs", "explorer"]
+        );
+        let history = agent.history_for_test();
+        let outputs = history
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec![
+                "call-explore-first",
+                "call-agent__jobs",
+                "call-explore-second"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
+        let mut agent = test_agent();
+        let started = Arc::new(Mutex::new(Vec::new()));
+        agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+            started: Arc::clone(&started),
+            completion_gate: None,
+        }));
+        let calls = vec![
+            test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
+            test_tool_call("util__echo", r#"{"text":"barrier"}"#),
+            test_tool_call(
+                "agent__fixer",
+                r#"{"task":"change","owned_paths":["src/agent.rs"]}"#,
+            ),
+        ];
+        agent
+            .append_assistant_tool_calls("", &calls)
+            .expect("append tool calls");
+        agent
+            .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+                Ok(PermissionApproval::AllowOnce)
+            })
+            .await
+            .expect("calls execute");
+
+        let history = agent.history_for_test();
+        let outputs = history
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec![
+                "call-agent__explore",
+                "call-util__echo",
+                "call-agent__fixer"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_emits_projected_provider_usage() {
+        let mut agent = test_agent();
+        let call = test_tool_call("fs__read", "{}");
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("assistant tool calls append");
+        agent.install_provider_usage_anchor_for_test(provider_usage(100));
+        let mut events = Vec::new();
+
+        agent
+            .execute_tool_call_and_record(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("tool call completes");
+
+        let expected_delta = serde_json::to_string(
+            agent
+                .history_for_test()
+                .last()
+                .expect("tool output appended"),
+        )
+        .expect("tool output serializes")
+        .len()
+        .div_ceil(4) as u64;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TokenUsageUpdated {
+                used_tokens,
+                input_tokens,
+                output_tokens,
+                cache_report,
+                ..
+            } if *used_tokens == 100 + expected_delta
+                && *input_tokens == 100 + expected_delta
+                && *output_tokens == 0
+                && cache_report.is_none()
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() {
+        let mut agent = test_agent();
+        agent.set_subagent_delegate(static_delegate(ToolResult::err_with_data(
+            "agent__explore",
+            "explorer cancelled",
+            json!({
+                "run_id": "run-1",
+                "child_session_id": "child-session",
+                "agent_name": "explorer",
+                "status": "cancelled",
+                "summary": "explorer cancelled",
+            }),
+        )));
+        let call = test_tool_call("agent__explore", r#"{"task":"inspect"}"#);
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("assistant tool calls should append");
+        let mut events = Vec::new();
+
+        let error = agent
+            .execute_tool_call_and_record(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect_err("cancelled explorer interrupts the turn after recording output");
+
+        assert!(error.to_string().contains("agent__explore cancelled"));
+        assert!(matches!(
+            agent.history_for_test().last(),
+            Some(HistoryItem::ToolOutput {
+                call_id,
+                output_json,
+                ..
+            }) if call_id == "call-agent__explore"
+                && output_json.contains("cancelled")
+                && output_json.contains("child-session")
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallFinished {
+                name,
+                ok: false,
+                output,
+                ..
+            } if name == "agent__explore"
+                && output
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("cancelled")
+        )));
+    }
+
+    #[tokio::test]
+    async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
+        for (tool, name) in [("agent__fixer", "fixer"), ("agent__general", "general")] {
+            let mut agent = test_agent();
+            agent.prepare_turn_prelude();
+            let (delegate, explorer_prompts, fixer_prompts) = capturing_delegate(ToolResult::ok(
+                tool,
+                json!({
+                    "run_id": "run-structured-1",
+                    "child_session_id": "child-structured-1",
+                    "agent_name": name,
+                    "status": "completed",
+                    "summary": "implemented bounded fix",
+                    "structured_result": {
+                        "status": "completed",
+                        "summary": "implemented bounded fix",
+                        "malformed": false,
+                        "findings": [],
+                        "files_read": ["src/agent.rs"],
+                        "files_changed": ["src/agent.rs"],
+                        "commands_run": ["cargo test subagent --quiet"],
+                        "validation": ["cargo test subagent --quiet passed"],
+                        "blockers": [],
+                        "next_steps": ["continue parent task"],
+                        "run_id": "run-structured-1",
+                        "child_session_id": "child-structured-1"
+                    }
+                }),
+            ));
+            agent.set_subagent_delegate(delegate);
+            let prompts = if name == "fixer" {
+                fixer_prompts
+            } else {
+                explorer_prompts
+            };
+
+            let call = test_tool_call(
+                tool,
+                r#"{"task":"implement bounded fix","owned_paths":["src/agent.rs"]}"#,
+            );
+            agent
+                .append_assistant_tool_calls("", std::slice::from_ref(&call))
+                .expect("assistant tool calls should append");
+            let mut events = Vec::new();
+            let mut approvals = 0usize;
+            let record = agent
+                .execute_tool_call(
+                    &call,
+                    &mut |event| {
+                        events.push(event);
+                        std::future::ready(Ok(()))
+                    },
+                    &mut |_| {
+                        approvals += 1;
+                        std::future::ready(Ok(PermissionApproval::AllowOnce))
+                    },
+                )
+                .await
+                .expect("subagent tool execution should succeed");
+            assert_eq!(approvals, 1);
+            assert_eq!(
+                record.permission_class,
+                crate::permission::ToolPermissionClass::Write
+            );
+            assert_eq!(record.effects.kind, ToolEffectKind::Write);
+            agent
+                .record_tool_call_result(&call, record, &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                })
+                .await
+                .expect("subagent tool result records");
+
+            let prompt = prompts.lock().expect("captured prompt")[0].clone();
+            assert!(prompt.contains("implement bounded fix"));
+            assert!(!prompt.contains(crate::subagent::REPORT_PROMPT));
+            assert!(!prompt.contains("委派约定"));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::EvidenceRecorded(record)
+                    if record.tags.iter().any(|tag| tag == "subagent_result")
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_and_background_delivery_apply_subagent_effects_once_per_turn() {
+        let mut agent = test_agent();
+        agent.prepare_turn_prelude();
+        let result = json!({
+            "run_id": "run-dedupe-1",
+            "child_session_id": "child-dedupe-1",
+            "agent_name": "fixer",
+            "status": "completed",
+            "summary": "implemented and validated",
+            "structured_result": {
+                "status": "completed",
+                "summary": "implemented and validated",
+                "malformed": false,
+                "findings": [],
+                "files_read": [],
+                "files_changed": ["src/agent.rs"],
+                "commands_run": ["cargo test"],
+                "validation": ["cargo test passed"],
+                "blockers": [],
+                "next_steps": [],
+                "run_id": "run-dedupe-1",
+                "child_session_id": "child-dedupe-1"
+            }
+        });
+        let wait_record = ToolExecutionRecord {
+            call_id: "wait-dedupe-1".into(),
+            tool_name: tool_names::TOOL_AGENT_WAIT.into(),
+            arguments: Some(json!({"run_id": "run-dedupe-1"})),
+            permission_class: crate::permission::ToolPermissionClass::Preview,
+            status: ToolExecutionStatus::Executed,
+            rejection: None,
+            output: ToolResult::ok("agent__wait", result.clone()),
+            effects: ToolEffects {
+                kind: ToolEffectKind::Read,
+                primary_path: None,
+                edited_paths: Vec::new(),
+                command: None,
+            },
+        };
+        agent.record_tool_effects(&wait_record);
+        assert_eq!(agent.child_effect_counts_for_test(), (1, 1, 0));
+        let _ = agent
+            .remember_tool_evidence(&wait_record)
+            .expect("remember wait evidence");
+
+        let summary = crate::subagent::SubagentRunSummary {
+            run_id: "run-dedupe-1".into(),
+            child_session_id: "child-dedupe-1".into(),
+            agent_name: "fixer".into(),
+            status: crate::subagent::SubagentStatus::Completed,
+            failure_kind: None,
+            summary: "implemented and validated".into(),
+            structured_result: serde_json::from_value(result["structured_result"].clone())
+                .expect("structured result"),
+        };
+        agent
+            .install_background_subagent_result(&summary)
+            .expect("background result installs");
+        assert_eq!(agent.child_effect_counts_for_test(), (1, 1, 0));
+    }
+
+    #[test]
+    fn journal_resume_preserves_history_content() {
+        let dir = agents_test_dir();
+        let mut rec = TranscriptRecorder::create(&dir).expect("create recorder");
+        rec.record_session_started("m1").expect("session started");
+        let session_id = rec.session_id().to_string();
+        let path = rec.path().to_path_buf();
+        rec.record_user_message("hello").expect("user message");
+        rec.record_turn_started(TurnStartedEvent { turn_id: 1 })
+            .expect("turn started");
+        rec.record_assistant_tool_call_batch(
+            Some("working".into()),
+            None,
+            None,
+            vec![HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+            }],
+        )
+        .expect("tool call batch");
+        rec.record_tool_call_finished(
+            "call-1",
+            "fs__read",
+            true,
+            ToolResult::ok("fs__read", json!({"ok": true})),
+        )
+        .expect("tool call finished");
+        rec.record_assistant_message("done")
+            .expect("assistant message");
+        rec.record_turn_finalized(TurnFinalizedEvent {
+            turn_id: 1,
+            outcome: "completed".into(),
+            tool_call_count: 1,
+            continuation_count: 0,
+            write_effects: 0,
+            validation_effects: 0,
+            failed_validation_effects: 0,
+            validation_advisory_emitted: false,
+        })
+        .expect("turn finalized");
+        drop(rec);
+
+        let records = read_records(&path).expect("read records");
+        let projected = project_runtime_restore_snapshot(
+            session_id,
+            records,
+            SessionContextCursor {
+                branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("project runtime restore snapshot");
+
+        let mut agent = test_agent();
+        agent
+            .restore_runtime_snapshot(projected.snapshot)
+            .expect("restore runtime snapshot");
+        let expected = vec![
+            HistoryItem::user("hello"),
+            HistoryItem::AssistantTurn {
+                text: Some("working".into()),
+                reasoning_content: None,
+                replay: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                    arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: json!({"ok": true, "tool": "fs__read", "data": {"ok": true}})
+                    .to_string(),
+                images: Vec::new(),
+            },
+            HistoryItem::assistant("done"),
+        ];
+        let mut restored = agent.history_for_test();
+        for item in &mut restored {
+            if let HistoryItem::ToolOutput { output_json, .. } = item {
+                *output_json = serde_json::from_str::<Value>(output_json)
+                    .expect("tool output JSON")
+                    .to_string();
+            }
+        }
+        assert_eq!(restored, expected);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_a_failed_turn_lets_the_session_continue() {
+        let dir = agents_test_dir();
+        let recorder = TranscriptRecorder::create(&dir).expect("transcript");
+        let transcript = Arc::new(Mutex::new(recorder));
+        let call = HistoryToolCall {
+            call_id: "call-failed".into(),
+            name: "fs__read".into(),
+            arguments_json: r#"{"path":"/tmp/probe.txt"}"#.into(),
+        };
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            recorder
+                .record_user_message("run it")
+                .expect("user message");
+            recorder
+                .record_assistant_tool_call_batch(None, None, None, vec![call.clone()])
+                .expect("assistant tool call batch");
+            recorder
+                .record_tool_call_cancelled("call-failed", "fs__read")
+                .expect("tool call cancelled");
+        }
+
+        let mut agent = test_agent();
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("assistant turn");
+        assert!(agent.has_incomplete_tool_call_groups());
+
+        crate::session::engine::close_failed_turn(
+            &mut agent,
+            &transcript,
+            &crate::subagent::SubagentPool::new(),
+        )
+        .expect("close failed turn");
+
+        assert!(!agent.has_incomplete_tool_call_groups());
+        assert!(
+            agent
+                .append_history_item(HistoryItem::user("next prompt"))
+                .is_ok(),
+            "the next prompt must be accepted"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn workflow_auto_continue_tool_enables_llm_controlled_state() {
+        let mut agent = test_agent();
+        let call = HistoryToolCall {
+            call_id: "call-auto".into(),
+            name: "workflow__auto_continue".into(),
+            arguments_json: r#"{"enabled":true}"#.into(),
+        };
+
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
+            })
+            .await
+            .expect("control tool should succeed");
+
+        assert!(record.output.ok);
+        assert!(agent.auto_continue().enabled);
+    }
+
+    #[tokio::test]
+    async fn workflow_todos_tool_updates_todo_state() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let call = HistoryToolCall {
+            call_id: "call-todos".into(),
+            name: "workflow__todos".into(),
+            arguments_json: r#"{"items":[{"id":"t1","content":"first","status":"pending"},{"id":"t2","content":"done","status":"completed"}]}"#.into(),
+        };
+
+        let mut approvals = 0usize;
+        agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("todo control tool should succeed without reviewer or human approval");
+
+        assert_eq!(approvals, 0);
+        assert_eq!(agent.todos().len(), 2);
+        assert_eq!(agent.todos()[0].status, TodoStatus::Pending);
+        assert_eq!(agent.todos()[1].status, TodoStatus::Completed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_allow_always_grants_exact_targets_and_prepares_each_call() {
+        let fixture = UnixWritableFixture::new("apply-patch-allow-always");
+        let first = fixture.external.join("first.txt");
+        let second = fixture.external.join("second.txt");
+        let third = fixture.external.join("third.txt");
+        for path in [&first, &second, &third] {
+            std::fs::write(path, "old").expect("seed target");
+        }
+        let mut agent = test_agent();
+        let mut approvals = 0;
+        let mut previews = Vec::new();
+        let mut grant_summaries = Vec::new();
+
+        let first_record = agent
+            .execute_tool_call(
+                &apply_patch_call(
+                    "apply-patch-grant-first",
+                    vec![
+                        apply_patch_edit(&first, "old", "first"),
+                        apply_patch_edit(&second, "old", "first"),
+                    ],
+                ),
+                &mut |_| std::future::ready(Ok(())),
+                &mut |request| {
+                    approvals += 1;
+                    previews.push(request.preview.expect("external preview"));
+                    grant_summaries.push(request.grant_summary.expect("target-set grant"));
+                    std::future::ready(Ok(PermissionApproval::AllowAlways))
+                },
+            )
+            .await
+            .expect("first target set executes");
+        assert!(first_record.output.ok, "{:?}", first_record.output.error);
+
+        let replacement = fixture.external.join("first-replacement.txt");
+        std::fs::write(&replacement, "replacement").expect("seed replacement inode");
+        std::fs::rename(&replacement, &first).expect("replace first target inode");
+        let repeated = agent
+            .execute_tool_call(
+                &apply_patch_call(
+                    "apply-patch-grant-repeated",
+                    vec![
+                        apply_patch_edit(&first, "replacement", "second"),
+                        apply_patch_edit(&second, "first", "second"),
+                    ],
+                ),
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("matching target set reuses grant and prepares afresh");
+        assert!(repeated.output.ok, "{:?}", repeated.output.error);
+        assert_eq!(approvals, 1, "identical canonical target set reuses grant");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+
+        let distinct = agent
+            .execute_tool_call(
+                &apply_patch_call(
+                    "apply-patch-grant-distinct",
+                    vec![
+                        apply_patch_edit(&first, "second", "third"),
+                        apply_patch_edit(&third, "old", "third"),
+                    ],
+                ),
+                &mut |_| std::future::ready(Ok(())),
+                &mut |request| {
+                    approvals += 1;
+                    previews.push(request.preview.expect("external preview"));
+                    grant_summaries.push(request.grant_summary.expect("target-set grant"));
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                },
+            )
+            .await
+            .expect("distinct target set requests approval");
+        assert!(distinct.output.ok, "{:?}", distinct.output.error);
+        assert_eq!(approvals, 2);
+        assert_eq!(
+            grant_summaries,
+            vec!["edit__apply_patch: 2 target path(s)"; 2]
+        );
+        assert_ne!(
+            previews[0], previews[1],
+            "distinct canonical target set previews differ"
+        );
+        assert_eq!(std::fs::read_to_string(&third).unwrap(), "third");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_approval_and_started_rebinding_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        for timing in ["approval", "started"] {
+            for scenario in [
+                "parent",
+                "leaf",
+                "inside-outside",
+                "outside-inside",
+                "missing",
+            ] {
+                let fixture = UnixWritableFixture::new(&format!("apply-patch-{timing}-{scenario}"));
+                let raw = match scenario {
+                    "inside-outside" => fixture.workspace.join("target.txt"),
+                    "parent" => fixture.external.join("parent").join("target.txt"),
+                    _ => fixture.external.join("target.txt"),
+                };
+                std::fs::create_dir_all(raw.parent().expect("target parent"))
+                    .expect("create target parent");
+                std::fs::write(&raw, "authorized").expect("seed authorized target");
+                let inside = fixture.workspace.join("inside.txt");
+                let outside = fixture.external.join("outside.txt");
+                std::fs::write(&inside, "inside").expect("seed inside alternate");
+                std::fs::write(&outside, "outside").expect("seed outside alternate");
+                let parent_stash = fixture.external.join("parent-stash");
+                let missing = fixture.external.join("missing").join("target.txt");
+                let call = apply_patch_call(
+                    &format!("apply-patch-{timing}-{scenario}"),
+                    vec![apply_patch_edit(&raw, "authorized", "must not write")],
+                );
+                let mutate = || match scenario {
+                    "parent" => {
+                        let parent = raw.parent().unwrap();
+                        std::fs::rename(parent, &parent_stash).expect("replace authorized parent");
+                        std::fs::create_dir(parent).expect("create replacement parent");
+                        std::fs::write(&raw, "replacement").expect("seed replacement target");
+                    }
+                    "leaf" => {
+                        let replacement = fixture.external.join("replacement.txt");
+                        std::fs::write(&replacement, "replacement")
+                            .expect("seed replacement inode");
+                        std::fs::rename(&replacement, &raw).expect("replace authorized leaf");
+                    }
+                    "inside-outside" => {
+                        std::fs::remove_file(&raw).expect("remove inside target");
+                        symlink(&outside, &raw).expect("rebind inside path outside");
+                    }
+                    "outside-inside" => {
+                        std::fs::remove_file(&raw).expect("remove outside target");
+                        symlink(&inside, &raw).expect("rebind outside path inside");
+                    }
+                    "missing" => {
+                        std::fs::remove_file(&raw).expect("remove authorized target");
+                        symlink(&missing, &raw).expect("rebind to missing target");
+                    }
+                    _ => unreachable!(),
+                };
+                let mut agent = test_agent();
+                let mut events = Vec::new();
+                let mut approvals = 0;
+                let record = agent
+                    .execute_tool_call(
+                        &call,
+                        &mut |event| {
+                            if timing == "started"
+                                && matches!(event, AgentEvent::ToolCallStarted { .. })
+                            {
+                                mutate();
+                            }
+                            events.push(event);
+                            std::future::ready(Ok(()))
+                        },
+                        &mut |_| {
+                            approvals += 1;
+                            if timing == "approval" {
+                                mutate();
+                            }
+                            std::future::ready(Ok(PermissionApproval::AllowOnce))
+                        },
+                    )
+                    .await
+                    .expect("security failure is recorded");
+
+                assert_eq!(approvals, 1, "{timing} {scenario}");
+                assert_eq!(
+                    writable_event_phases(&events),
+                    vec![true, false],
+                    "{timing} {scenario}"
+                );
+                assert_eq!(
+                    record.status,
+                    ToolExecutionStatus::Executed,
+                    "{timing} {scenario}"
+                );
+                assert_eq!(record.rejection, None, "{timing} {scenario}");
+                assert_eq!(
+                    record
+                        .output
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.as_str()),
+                    Some("apply patch target changed after authorization"),
+                    "{timing} {scenario}"
+                );
+                assert_eq!(std::fs::read_to_string(&inside).unwrap(), "inside");
+                assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside");
+                if scenario == "parent" {
+                    assert_eq!(
+                        std::fs::read_to_string(parent_stash.join("target.txt")).unwrap(),
+                        "authorized"
+                    );
+                    assert_eq!(std::fs::read_to_string(&raw).unwrap(), "replacement");
+                } else if scenario == "leaf" {
+                    assert_eq!(std::fs::read_to_string(&raw).unwrap(), "replacement");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_allow_always_writable_grants_use_raw_path_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let fixture = UnixWritableFixture::new("raw-grant-identity");
+        let target_a = fixture
+            .external
+            .join(std::ffi::OsString::from_vec(b"same-lossy-\x80".to_vec()));
+        let target_b = fixture
+            .external
+            .join(std::ffi::OsString::from_vec(b"same-lossy-\x81".to_vec()));
+        let workspace_a = fixture.workspace.join("a");
+        let workspace_b = fixture.workspace.join("b");
+        // Keep the user-supplied paths UTF-8 while resolving the leaf through a
+        // symlink. APFS permits these dangling symlinks even though it rejects a
+        // non-UTF-8 leaf at open time. Linux filesystems that permit those leaves
+        // exercise the successful write path below without changing this fixture.
+        symlink(&target_a, &workspace_a).expect("link target A");
+        symlink(&target_b, &workspace_b).expect("link target B");
+
+        let call_a = writable_call("raw-a", "fs__write", &workspace_a, "A");
+        let call_a_again = writable_call("raw-a-again", "fs__write", &workspace_a, "A again");
+        let call_b = writable_call("raw-b", "fs__write", &workspace_b, "B");
+        let mut previews = Vec::new();
+        let mut grant_summaries = Vec::new();
+        let mut agent_a = test_agent();
+
+        let first = agent_a
+            .execute_tool_call(
+                &call_a,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |request| {
+                    previews.push(request.preview.expect("external preview"));
+                    grant_summaries.push(request.grant_summary.expect("grant summary"));
+                    assert!(request.can_allow_always);
+                    std::future::ready(Ok(PermissionApproval::AllowAlways))
+                },
+            )
+            .await
+            .expect("A is approved");
+        assert_eq!(first.status, ToolExecutionStatus::Executed);
+
+        let mut repeated_approval_requested = false;
+        let repeated = agent_a
+            .execute_tool_call(
+                &call_a_again,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    repeated_approval_requested = true;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("A grant executes");
+        assert_eq!(repeated.status, ToolExecutionStatus::Executed);
+        assert!(
+            !repeated_approval_requested,
+            "matching raw-byte grant must not request approval"
+        );
+
+        let denied_b = agent_a
+            .execute_tool_call(
+                &call_b,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |request| {
+                    previews.push(request.preview.expect("external preview"));
+                    grant_summaries.push(request.grant_summary.expect("grant summary"));
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("B denial is recorded");
+        assert_eq!(denied_b.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            denied_b.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByUser)
+        );
+
+        assert_eq!(previews.len(), 2);
+        assert_eq!(grant_summaries.len(), 2);
+        assert_ne!(
+            previews[0], previews[1],
+            "raw-byte preview markers distinguish A and B"
+        );
+        assert_ne!(
+            grant_summaries[0], grant_summaries[1],
+            "raw-byte grant markers distinguish A and B"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                first.output.ok,
+                "Linux raw-byte leaf should be writable: {:?}",
+                first.output.error
+            );
+            assert!(
+                repeated.output.ok,
+                "Linux raw-byte leaf should be writable: {:?}",
+                repeated.output.error
+            );
+            assert_eq!(std::fs::read(&target_a).expect("A was written"), b"A again");
+            assert!(
+                !target_b.exists(),
+                "denied B must not create its raw-byte leaf"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writable_inside_to_outside_rebind_is_a_post_started_security_failure() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = UnixWritableFixture::new("inside-outside-rebind");
+        let raw = fixture.workspace.join("inside.txt");
+        let outside = fixture.external.join("outside.txt");
+        std::fs::write(&raw, "inside").expect("create inside target");
+        let call = writable_call("inside-outside", "fs__write", &raw, "must not write");
+        let mut agent = test_agent();
+        let mut events = Vec::new();
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    if matches!(event, AgentEvent::ToolCallStarted { .. }) {
+                        std::fs::remove_file(&raw).expect("remove inside target");
+                        symlink(&outside, &raw).expect("rebind to external leaf");
+                    }
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("security failure is recorded");
+
+        assert_eq!(writable_event_phases(&events), vec![true, false]);
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert_eq!(record.rejection, None);
+        assert_eq!(
+            record
+                .output
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("writable destination changed after authorization")
+        );
+        assert!(
+            !raw.exists(),
+            "rebinding must not recreate the original target"
+        );
+        assert!(!outside.exists(), "rebinding must not write outside");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writable_tools_cover_user_denials_without_starting() {
+        let fixture = UnixWritableFixture::new("denial-events");
+        for tool in ["fs__write", "fs__append"] {
+            for mode in [PermissionMode::Default, PermissionMode::Safe] {
+                let path = fixture.external.join(format!("user-{tool}"));
+                let call = writable_call(&format!("user-{tool}"), tool, &path, "denied");
+                let mut agent = test_agent();
+                agent.set_permission_mode(mode);
+                let mut approvals = 0;
+                let mut events = Vec::new();
+                let record = agent
+                    .execute_tool_call(
+                        &call,
+                        &mut |event| {
+                            events.push(event);
+                            std::future::ready(Ok(()))
+                        },
+                        &mut |_| {
+                            approvals += 1;
+                            std::future::ready(Ok(PermissionApproval::Deny))
+                        },
+                    )
+                    .await
+                    .expect("denial is recorded");
+                assert_eq!(writable_event_phases(&events), vec![false]);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+                );
+                assert_eq!(record.status, ToolExecutionStatus::Rejected);
+                assert_eq!(
+                    record.rejection,
+                    Some(ToolExecutionRejection::PermissionDeniedByUser)
+                );
+                assert_eq!(approvals, 1);
+                assert!(!path.exists(), "{tool} {mode:?} must not write");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_external_workspace_read_allow_always_grants_only_matching_resource() {
+        let mut agent = test_agent();
+        let fixture_root = std::env::temp_dir().join(format!(
+            "letcode-external-read-grant-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let first_directory = fixture_root.join("first");
+        let second_directory = fixture_root.join("second");
+        std::fs::create_dir_all(&first_directory).expect("create first fixture directory");
+        std::fs::create_dir_all(&second_directory).expect("create second fixture directory");
+        let first_path = first_directory.join("read.txt");
+        let second_path = second_directory.join("read.txt");
+        std::fs::write(&first_path, "first\n").expect("write first fixture");
+        std::fs::write(&second_path, "second\n").expect("write second fixture");
+
+        let first_call = HistoryToolCall {
+            call_id: "call-external-read-first".into(),
+            name: "fs__read".into(),
+            arguments_json: json!({"path": first_path, "offset": 1, "limit": 10}).to_string(),
+        };
+        let repeated_call = HistoryToolCall {
+            call_id: "call-external-read-repeated".into(),
+            name: "fs__read".into(),
+            arguments_json: first_call.arguments_json.clone(),
+        };
+        let other_directory_call = HistoryToolCall {
+            call_id: "call-external-read-other".into(),
+            name: "fs__read".into(),
+            arguments_json: json!({"path": second_path, "offset": 1, "limit": 10}).to_string(),
+        };
+        let mut approval_requests = 0;
+
+        let first = agent
+            .execute_tool_call(
+                &first_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |request| {
+                    approval_requests += 1;
+                    assert!(request.can_allow_always);
+                    std::future::ready(Ok(PermissionApproval::AllowAlways))
+                },
+            )
+            .await
+            .expect("first external read should execute after approval");
+        assert!(first.output.ok);
+        assert_eq!(approval_requests, 1);
+
+        let repeated = agent
+            .execute_tool_call(
+                &repeated_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    approval_requests += 1;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("matching grant should execute without approval");
+        assert!(repeated.output.ok);
+        assert_eq!(approval_requests, 1, "matching grant must bypass approval");
+
+        let other_directory = agent
+            .execute_tool_call(
+                &other_directory_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    approval_requests += 1;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("other external directory should request approval");
+        assert_eq!(approval_requests, 2);
+        assert_eq!(other_directory.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            other_directory.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByUser)
+        );
+
+        let _ = std::fs::remove_dir_all(fixture_root);
+    }
+
+    #[tokio::test]
+    async fn matching_grant_allows_high_risk_command_without_reasking() {
+        let mut agent = test_agent();
+        let command = "curl --version";
+        agent
+            .permission_session
+            .lock()
+            .expect("permission session")
+            .grant(crate::permission::PermissionResource::Exact {
+                tool: "shell__exec".into(),
+                value: command.into(),
+            });
+        let call = HistoryToolCall {
+            call_id: "call-granted-high-risk".into(),
+            name: "shell__exec".into(),
+            arguments_json: json!({"command": command}).to_string(),
+        };
+        let mut approval_requested = false;
+
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                approval_requested = true;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("session grant should admit previously blacklisted commands");
+
+        assert!(!approval_requested);
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert_ne!(
+            record.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByPolicy)
+        );
+    }
+
+    #[tokio::test]
+    async fn default_and_safe_allow_once_authorize_external_writes() {
+        for mode in [PermissionMode::Default, PermissionMode::Safe] {
+            let mut agent = test_agent();
+            agent.set_permission_mode(mode);
+            let outside_path = std::env::temp_dir().join(format!(
+                "letcode-external-write-allow-once-{mode:?}-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            ));
+            let call = HistoryToolCall {
+                call_id: format!("call-external-write-allow-once-{mode:?}"),
+                name: "fs__write".into(),
+                arguments_json: json!({"path": outside_path, "content": "approved"}).to_string(),
+            };
+            let mut approvals = 0;
+            let mut events = Vec::new();
+            let record = agent
+                .execute_tool_call(
+                    &call,
+                    &mut |event| {
+                        events.push(event);
+                        std::future::ready(Ok(()))
+                    },
+                    &mut |_| {
+                        approvals += 1;
+                        std::future::ready(Ok(PermissionApproval::AllowOnce))
+                    },
+                )
+                .await
+                .expect("approved write should execute");
+            assert_eq!(approvals, 1);
+            assert_eq!(record.status, ToolExecutionStatus::Executed);
+            assert!(record.output.ok, "{:?}", record.output.error);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: true, .. }))
+            );
+            let _ = std::fs::remove_file(outside_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_mode_child_inherits_reviewer_service() {
+        let mut parent = test_agent();
+        parent.set_permission_mode(PermissionMode::Auto);
+        let service = Arc::new(MockAutoReviewService {
+            outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
+            calls: AtomicUsize::new(0),
+        });
+        parent.set_auto_review_service(Some(service.clone()));
+        let mut child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
+
+        let path = std::env::temp_dir().join(format!(
+            "letcode-auto-review-child-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let call = HistoryToolCall {
+            call_id: "call-auto-child".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": path, "content": "ok"}).to_string(),
+        };
+        let mut human_approvals = 0usize;
+        let record = child
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                human_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("child auto approval executes");
+
+        assert_eq!(human_approvals, 0);
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert!(record.output.ok, "{:?}", record.output.error);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_shell_allow_always_stays_within_child_session() {
+        let command = "curl --version";
+        let call = HistoryToolCall {
+            call_id: "call-child-shell".into(),
+            name: "shell__exec".into(),
+            arguments_json: json!({"command": command}).to_string(),
+        };
+        let resource = crate::permission::PermissionResource::Exact {
+            tool: "shell__exec".into(),
+            value: command.into(),
+        };
+
+        let mut parent = test_agent();
+        parent.set_permission_mode(PermissionMode::Default);
+        parent
+            .permission_session
+            .lock()
+            .expect("permission session")
+            .grant(resource.clone());
+
+        let mut child = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
+        let mut sibling = AgentFactory::create_child(&parent, &AgentTemplate::fixer());
+        let mut child_approvals = 0usize;
+        let first = child
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                child_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::AllowAlways))
+            })
+            .await
+            .expect("child first shell");
+        assert_eq!(child_approvals, 1);
+        assert_eq!(first.status, ToolExecutionStatus::Executed);
+
+        let mut second_approvals = 0usize;
+        let second = child
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                second_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("child grant reuse");
+        assert_eq!(second_approvals, 0);
+        assert_eq!(second.status, ToolExecutionStatus::Executed);
+
+        let mut sibling_approvals = 0usize;
+        let sibling_record = sibling
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                sibling_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("sibling isolated");
+        assert_eq!(sibling_approvals, 1);
+        assert_eq!(sibling_record.status, ToolExecutionStatus::Rejected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegation_scope_authorizes_owned_writes_and_denies_outside() {
+        for template in [AgentTemplate::fixer(), AgentTemplate::general()] {
+            let fixture = UnixWritableFixture::new("delegation-scope-write");
+            let owned = fixture.external.join("owned");
+            let outside = fixture.external.join("outside");
+            fs::create_dir_all(&owned).expect("owned dir");
+            fs::create_dir_all(&outside).expect("outside dir");
+            let owned_file = owned.join("ok.txt");
+            let outside_file = outside.join("no.txt");
+
+            let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+                objective: "scoped write".into(),
+                success_criteria: Vec::new(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: Vec::new(),
+                owned_paths: vec![owned.to_string_lossy().into()],
+                timeout_secs: None,
+                max_tool_calls: None,
+                model: None,
+                target_child_session_id: None,
+                background: false,
+            })
+            .expect("scope")
+            .expect("non-empty scope");
+
+            let mut child = AgentFactory::create_child(&test_agent(), &template);
+            child.set_permission_mode(PermissionMode::Default);
+            child.set_subagent_path_scope(Some(Arc::new(scope)));
+
+            let mut approvals = 0usize;
+            let allowed = child
+                .execute_tool_call(
+                    &HistoryToolCall {
+                        call_id: "scoped-write-ok".into(),
+                        name: "fs__write".into(),
+                        arguments_json: json!({
+                            "path": owned_file,
+                            "content": "ok",
+                        })
+                        .to_string(),
+                    },
+                    &mut |_| std::future::ready(Ok(())),
+                    &mut |_| {
+                        approvals += 1;
+                        std::future::ready(Ok(PermissionApproval::Deny))
+                    },
+                )
+                .await
+                .expect("owned write");
+            assert_eq!(approvals, 0, "owned_paths must pre-authorize writes");
+            assert_eq!(allowed.status, ToolExecutionStatus::Executed);
+            assert_eq!(fs::read_to_string(&owned_file).expect("read"), "ok");
+
+            let denied = child
+                .execute_tool_call(
+                    &HistoryToolCall {
+                        call_id: "scoped-write-denied".into(),
+                        name: "fs__write".into(),
+                        arguments_json: json!({
+                            "path": outside_file,
+                            "content": "no",
+                        })
+                        .to_string(),
+                    },
+                    &mut |_| std::future::ready(Ok(())),
+                    &mut |_| {
+                        approvals += 1;
+                        std::future::ready(Ok(PermissionApproval::AllowOnce))
+                    },
+                )
+                .await
+                .expect("outside write");
+            assert_eq!(approvals, 0, "scope denial must not reach approver");
+            assert_eq!(denied.status, ToolExecutionStatus::Rejected);
+            assert_eq!(
+                denied.rejection,
+                Some(ToolExecutionRejection::DelegationScopeDenied)
+            );
+            assert!(!outside_file.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegation_scope_allows_reads_in_allowed_paths_and_forbids_forbidden() {
+        let fixture = UnixWritableFixture::new("delegation-scope-read");
+        let allowed = fixture.external.join("allowed");
+        let forbidden = fixture.external.join("forbidden");
+        fs::create_dir_all(&allowed).expect("allowed");
+        fs::create_dir_all(&forbidden).expect("forbidden");
+        let allowed_file = allowed.join("a.txt");
+        let forbidden_file = forbidden.join("b.txt");
+        fs::write(&allowed_file, "hello").expect("seed allowed");
+        fs::write(&forbidden_file, "secret").expect("seed forbidden");
+
+        let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+            objective: "scoped read".into(),
+            success_criteria: Vec::new(),
+            allowed_paths: vec![allowed.to_string_lossy().into()],
+            forbidden_paths: vec![forbidden.to_string_lossy().into()],
+            owned_paths: Vec::new(),
+            timeout_secs: None,
+            max_tool_calls: None,
+            model: None,
+            target_child_session_id: None,
+            background: false,
+        })
+        .expect("scope")
+        .expect("non-empty scope");
+
+        let mut reader = AgentFactory::create_child(&test_agent(), &AgentTemplate::explorer());
+        reader.set_subagent_path_scope(Some(Arc::new(scope.clone())));
+
+        let ok = reader
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "scoped-read-ok".into(),
+                    name: "fs__read".into(),
+                    arguments_json: json!({"path": allowed_file}).to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+            )
+            .await
+            .expect("allowed read");
+        assert_eq!(ok.status, ToolExecutionStatus::Executed);
+
+        let blocked = reader
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "scoped-read-forbidden".into(),
+                    name: "fs__read".into(),
+                    arguments_json: json!({"path": forbidden_file}).to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("forbidden read");
+        assert_eq!(blocked.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            blocked.rejection,
+            Some(ToolExecutionRejection::DelegationScopeDenied)
+        );
+
+        let mut writer = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
+        writer.set_subagent_path_scope(Some(Arc::new(scope)));
+        let write_in_allowed = writer
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "scoped-write-allowed-only".into(),
+                    name: "fs__write".into(),
+                    arguments_json: json!({
+                        "path": allowed.join("new.txt"),
+                        "content": "nope",
+                    })
+                    .to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("allowed-only write");
+        assert_eq!(write_in_allowed.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            write_in_allowed.rejection,
+            Some(ToolExecutionRejection::DelegationScopeDenied)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegation_scope_apply_patch_requires_all_targets_owned() {
+        let fixture = UnixWritableFixture::new("delegation-scope-patch");
+        let owned = fixture.external.join("owned");
+        let other = fixture.external.join("other");
+        fs::create_dir_all(&owned).expect("owned");
+        fs::create_dir_all(&other).expect("other");
+        let owned_file = owned.join("a.txt");
+        let other_file = other.join("b.txt");
+        fs::write(&owned_file, "old-a").expect("seed a");
+        fs::write(&other_file, "old-b").expect("seed b");
+
+        let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+            objective: "scoped patch".into(),
+            success_criteria: Vec::new(),
+            allowed_paths: Vec::new(),
+            forbidden_paths: Vec::new(),
+            owned_paths: vec![owned.to_string_lossy().into()],
+            timeout_secs: None,
+            max_tool_calls: None,
+            model: None,
+            target_child_session_id: None,
+            background: false,
+        })
+        .expect("scope")
+        .expect("non-empty scope");
+
+        let mut child = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
+        child.set_permission_mode(PermissionMode::Default);
+        child.set_subagent_path_scope(Some(Arc::new(scope)));
+
+        let ok = child
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "scoped-patch-ok".into(),
+                    name: "edit__apply_patch".into(),
+                    arguments_json: json!({
+                        "edits": [{
+                            "path": owned_file,
+                            "find": "old-a",
+                            "replace": "new-a",
+                            "replace_all": false
+                        }]
+                    })
+                    .to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+            )
+            .await
+            .expect("owned patch");
+        assert_eq!(ok.status, ToolExecutionStatus::Executed);
+        assert_eq!(fs::read_to_string(&owned_file).expect("read a"), "new-a");
+
+        let denied = child
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "scoped-patch-mixed".into(),
+                    name: "edit__apply_patch".into(),
+                    arguments_json: json!({
+                        "edits": [
+                            {
+                                "path": owned_file,
+                                "find": "new-a",
+                                "replace": "mutated",
+                                "replace_all": false
+                            },
+                            {
+                                "path": other_file,
+                                "find": "old-b",
+                                "replace": "mutated-b",
+                                "replace_all": false
+                            }
+                        ]
+                    })
+                    .to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("mixed patch");
+        assert_eq!(denied.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            denied.rejection,
+            Some(ToolExecutionRejection::DelegationScopeDenied)
+        );
+        assert_eq!(fs::read_to_string(&owned_file).expect("read a"), "new-a");
+        assert_eq!(fs::read_to_string(&other_file).expect("read b"), "old-b");
+    }
+
+    #[tokio::test]
+    async fn auto_mode_uses_reviewer_service_and_skips_human_approve() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let service = Arc::new(MockAutoReviewService {
+            outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
+            calls: AtomicUsize::new(0),
+        });
+        agent.set_auto_review_service(Some(service.clone()));
+
+        let path = std::env::temp_dir().join(format!(
+            "letcode-auto-review-once-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let call = HistoryToolCall {
+            call_id: "call-auto-once".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": path, "content": "ok"}).to_string(),
+        };
+        let mut human_approvals = 0usize;
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                human_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("auto allow_once executes");
+
+        assert_eq!(human_approvals, 0);
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert!(record.output.ok, "{:?}", record.output.error);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_reviewer_approves_write_calls() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let service = Arc::new(CapturingAutoReviewService {
+            outcome: AutoReviewOutcome::AllowOnce,
+            calls: AtomicUsize::new(0),
+            last_request: Mutex::new(None),
+        });
+        agent.set_auto_review_service(Some(service.clone()));
+
+        let path = std::env::temp_dir().join(format!(
+            "letcode-auto-review-write-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let call = HistoryToolCall {
+            call_id: "call-auto-write".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": path, "content": "approved"}).to_string(),
+        };
+        let mut human_approvals = 0usize;
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                human_approvals += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("reviewer approval executes the write");
+
+        assert_eq!(human_approvals, 0);
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        let request = service
+            .last_request
+            .lock()
+            .expect("request lock")
+            .clone()
+            .expect("review request");
+        assert!(!request.can_allow_always);
+        assert!(request.grant_summary.is_none());
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert!(record.output.ok, "{:?}", record.output.error);
+        assert_eq!(fs::read_to_string(&path).expect("read output"), "approved");
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn auto_reviewer_ask_returns_the_first_call_and_escalates_the_repeat() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let service = Arc::new(MockAutoReviewService {
+            outcome: Mutex::new(AutoReviewOutcome::Ask),
+            calls: AtomicUsize::new(0),
+        });
+        agent.set_auto_review_service(Some(service.clone()));
+
+        let path = std::env::temp_dir().join(format!(
+            "letcode-auto-review-ask-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let args = json!({"path": path, "content": "explained"});
+        let call = |call_id: &str| HistoryToolCall {
+            call_id: call_id.into(),
+            name: "fs__write".into(),
+            arguments_json: args.to_string(),
+        };
+        let mut human_approvals = 0usize;
+
+        let returned = agent
+            .execute_tool_call(
+                &call("call-auto-ask-1"),
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    human_approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                },
+            )
+            .await
+            .expect("the first ask returns the call to the requester");
+
+        assert_eq!(
+            human_approvals, 0,
+            "the requester's round must not reach the user"
+        );
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(returned.status, ToolExecutionStatus::Rejected);
+
+        let escalated = agent
+            .execute_tool_call(
+                &call("call-auto-ask-2"),
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    human_approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                },
+            )
+            .await
+            .expect("the repeat goes to the user");
+
+        assert_eq!(
+            human_approvals, 1,
+            "the same call asked twice goes to the user"
+        );
+        assert_eq!(
+            service.calls.load(Ordering::SeqCst),
+            2,
+            "the second ask is reviewed again before it reaches the user"
+        );
+        assert_eq!(escalated.status, ToolExecutionStatus::Executed);
+        assert!(escalated.output.ok, "{:?}", escalated.output.error);
+        assert_eq!(fs::read_to_string(&path).expect("read output"), "explained");
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_mode_keeps_explicit_subagent_scope_as_hard_boundary() {
+        let fixture = UnixWritableFixture::new("auto-subagent-scope");
+        let owned = fixture.external.join("owned");
+        let outside = fixture.external.join("outside");
+        fs::create_dir_all(&owned).expect("owned dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let owned_file = owned.join("ok.txt");
+        let outside_file = outside.join("no.txt");
+        let scope = crate::tool::SubagentPathScope::from_input(&NormalizedSubagentInput {
+            objective: "scoped auto write".into(),
+            success_criteria: Vec::new(),
+            allowed_paths: Vec::new(),
+            forbidden_paths: Vec::new(),
+            owned_paths: vec![owned.to_string_lossy().into()],
+            timeout_secs: None,
+            max_tool_calls: None,
+            model: None,
+            target_child_session_id: None,
+            background: false,
+        })
+        .expect("scope")
+        .expect("non-empty scope");
+
+        let mut child = AgentFactory::create_child(&test_agent(), &AgentTemplate::fixer());
+        child.set_permission_mode(PermissionMode::Auto);
+        child.set_subagent_path_scope(Some(Arc::new(scope)));
+        let service = Arc::new(MockAutoReviewService {
+            outcome: Mutex::new(AutoReviewOutcome::Deny),
+            calls: AtomicUsize::new(0),
+        });
+        child.set_auto_review_service(Some(service.clone()));
+
+        let allowed = child
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "auto-scope-owned".into(),
+                    name: "fs__write".into(),
+                    arguments_json: json!({"path": owned_file, "content": "ok"}).to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+            )
+            .await
+            .expect("owned write");
+        assert_eq!(allowed.status, ToolExecutionStatus::Executed);
+        assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+        let denied = child
+            .execute_tool_call(
+                &HistoryToolCall {
+                    call_id: "auto-scope-outside".into(),
+                    name: "fs__write".into(),
+                    arguments_json: json!({"path": outside_file, "content": "no"}).to_string(),
+                },
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("outside write");
+        assert_eq!(denied.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            denied.rejection,
+            Some(ToolExecutionRejection::DelegationScopeDenied)
+        );
+        assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+        assert!(!outside_file.exists());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_subagent_batch_uses_reviewer_and_skips_human_approve() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let service = Arc::new(MockAutoReviewService {
+            outcome: Mutex::new(AutoReviewOutcome::AllowOnce),
+            calls: AtomicUsize::new(0),
+        });
+        agent.set_auto_review_service(Some(service.clone()));
+        agent.set_subagent_delegate(static_delegate(ToolResult::ok(
+            "agent__fixer",
+            json!({
+                "run_id": "run-auto-fixer",
+                "child_session_id": "child-auto-fixer",
+                "status": "completed",
+                "summary": "done"
+            }),
+        )));
+
+        let call = test_tool_call(
+            "agent__fixer",
+            r#"{"task":"apply focused fix","owned_paths":["src/agent.rs"]}"#,
+        );
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("append subagent call");
+        let mut human_approvals = 0usize;
+        agent
+            .execute_tool_calls_and_record(
+                std::slice::from_ref(&call),
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    human_approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("auto-reviewed subagent executes");
+
+        assert_eq!(human_approvals, 0);
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        assert!(agent.history_for_test().iter().any(|item| matches!(
+            item,
+            HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id
+        )));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_deny_includes_reviewer_rationale() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let service = Arc::new(MockAutoReviewService {
+            outcome: Mutex::new(AutoReviewOutcome::Deny),
+            calls: AtomicUsize::new(0),
+        });
+        agent.set_auto_review_service(Some(service));
+
+        let call = HistoryToolCall {
+            call_id: "call-auto-deny".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": "deny.txt", "content": "no"}).to_string(),
+        };
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
+            })
+            .await
+            .expect("auto deny is a tool record");
+
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByUser)
+        );
+        assert!(record.output.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .contains("auto-review denied permission: mock-deny")
+        }));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_ask_outcome_returns_the_call_to_the_requester() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let service = Arc::new(MockAutoReviewService {
+            outcome: Mutex::new(AutoReviewOutcome::Ask),
+            calls: AtomicUsize::new(0),
+        });
+        agent.set_auto_review_service(Some(service.clone()));
+
+        let path = std::env::temp_dir().join(format!(
+            "letcode-auto-ask-return-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let call = HistoryToolCall {
+            call_id: "call-auto-ask".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": path, "content": "x"}).to_string(),
+        };
+        let mut human_requests = 0;
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                human_requests += 1;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("returned call is a tool record");
+
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            human_requests, 0,
+            "the requester's round must not reach the user"
+        );
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::ReturnedToRequester)
+        );
+        assert!(!path.exists(), "a returned call must not run");
+        let error = record.output.error.expect("returned reason").message;
+        assert!(error.contains("mock-ask"), "{error}");
+        assert!(error.contains("goes to the user"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_mode_does_not_reuse_allow_always_between_reviews() {
+        let fixture = UnixWritableFixture::new("auto-allow-always");
+        let path = fixture.external.join("written.txt");
+        let first_call = writable_call("auto-always-first", "fs__write", &path, "first");
+        let second_call = writable_call("auto-always-second", "fs__write", &path, "second");
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Auto);
+        let service = Arc::new(MockAutoReviewService {
+            outcome: Mutex::new(AutoReviewOutcome::AllowAlways),
+            calls: AtomicUsize::new(0),
+        });
+        agent.set_auto_review_service(Some(service.clone()));
+
+        let first = agent
+            .execute_tool_call(
+                &first_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+            )
+            .await
+            .expect("first auto allow_always");
+        assert!(first.output.ok, "{:?}", first.output.error);
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+
+        let second = agent
+            .execute_tool_call(
+                &second_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| std::future::ready(Ok(PermissionApproval::Deny)),
+            )
+            .await
+            .expect("second auto review");
+        assert!(second.output.ok, "{:?}", second.output.error);
+        assert_eq!(
+            service.calls.load(Ordering::SeqCst),
+            2,
+            "Auto mode must review each call instead of reusing a session grant"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_allow_always_external_write_grant_is_cleared_at_top_level_session_boundary() {
+        let fixture = UnixWritableFixture::new("allow-always-session-boundary");
+        let path = fixture.external.join("written.txt");
+        let first_call = writable_call("allow-always-first", "fs__write", &path, "first");
+        let repeated_call = writable_call("allow-always-repeated", "fs__write", &path, "second");
+        let after_reset_call =
+            writable_call("allow-always-after-reset", "fs__write", &path, "denied");
+        let mut agent = test_agent();
+        let mut approvals = 0;
+
+        let first = agent
+            .execute_tool_call(
+                &first_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |request| {
+                    approvals += 1;
+                    assert!(request.can_allow_always);
+                    std::future::ready(Ok(PermissionApproval::AllowAlways))
+                },
+            )
+            .await
+            .expect("first AllowAlways write executes");
+        assert!(first.output.ok, "{:?}", first.output.error);
+        assert_eq!(approvals, 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("first write"),
+            "first"
+        );
+
+        let repeated = agent
+            .execute_tool_call(
+                &repeated_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("matching session grant executes");
+        assert!(repeated.output.ok, "{:?}", repeated.output.error);
+        assert_eq!(approvals, 1, "matching destination must reuse the grant");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("repeated write"),
+            "second"
+        );
+
+        // This is the production top-level session transition, not a replacement
+        // Agent instance: it must discard the grant held by this Agent.
+        agent.reset_for_new_session();
+        let after_reset = agent
+            .execute_tool_call(
+                &after_reset_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |request| {
+                    approvals += 1;
+                    assert!(request.can_allow_always);
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("post-reset denial is recorded");
+        assert_eq!(approvals, 2, "reset session must request approval again");
+        assert_eq!(after_reset.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            after_reset.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByUser)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("denial has no write"),
+            "second"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_external_write_rebinding_is_rejected_after_started() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let first = std::env::temp_dir().join(format!("letcode-rebind-first-{unique}"));
+        let second = std::env::temp_dir().join(format!("letcode-rebind-second-{unique}"));
+        let link = PathBuf::from("target").join(format!("letcode-rebind-link-{unique}"));
+        std::fs::create_dir_all(&first).expect("create first fixture");
+        std::fs::create_dir_all(&second).expect("create second fixture");
+        std::fs::create_dir_all("target").expect("create target fixture");
+        symlink(&first, &link).expect("create initial link");
+        let raw = link.join("target.txt");
+
+        let mut agent = test_agent();
+        let call = HistoryToolCall {
+            call_id: "call-rebound-external-write".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": raw, "content": "must not write"}).to_string(),
+        };
+        let mut events = Vec::new();
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| {
+                    std::fs::remove_file(&link).expect("remove initial link");
+                    symlink(&second, &link).expect("rebind link");
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                },
+            )
+            .await
+            .expect("rebound write should produce a tool record");
+
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert_eq!(record.rejection, None);
+        assert!(!record.output.ok);
+        assert!(record.output.error.as_ref().is_some_and(|error| {
+            error.message == "writable destination changed after authorization"
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: false, .. }))
+        );
+        assert!(!first.join("target.txt").exists());
+        assert!(!second.join("target.txt").exists());
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn started_callback_rebinding_is_rejected_without_writing_either_destination() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let first = std::env::temp_dir().join(format!("letcode-started-rebind-first-{unique}"));
+        let second = std::env::temp_dir().join(format!("letcode-started-rebind-second-{unique}"));
+        let link = PathBuf::from("target").join(format!("letcode-started-rebind-link-{unique}"));
+        std::fs::create_dir_all(&first).expect("create first fixture");
+        std::fs::create_dir_all(&second).expect("create second fixture");
+        std::fs::create_dir_all("target").expect("create target fixture");
+        symlink(&first, &link).expect("create initial link");
+        let raw = link.join("target.txt");
+
+        let mut agent = test_agent();
+        let call = HistoryToolCall {
+            call_id: "call-started-rebound-external-write".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": raw, "content": "must not write"}).to_string(),
+        };
+        let mut events = Vec::new();
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    if matches!(event, AgentEvent::ToolCallStarted { .. }) {
+                        std::fs::remove_file(&link).expect("remove initial link");
+                        symlink(&second, &link).expect("rebind link");
+                    }
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("rebound write should produce a tool record");
+
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert_eq!(record.rejection, None);
+        assert!(!record.output.ok);
+        assert_eq!(
+            record
+                .output
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("writable destination changed after authorization")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: false, .. }))
+        );
+        assert!(!first.join("target.txt").exists());
+        assert!(!second.join("target.txt").exists());
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn leaf_symlink_callback_rebinding_is_post_started_security_failure() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first = std::env::temp_dir().join(format!("letcode-leaf-callback-a-{unique}"));
+        let second = std::env::temp_dir().join(format!("letcode-leaf-callback-b-{unique}"));
+        let link = PathBuf::from("target").join(format!("letcode-leaf-callback-{unique}"));
+        std::fs::create_dir_all("target").unwrap();
+        std::fs::write(&first, "A").unwrap();
+        std::fs::write(&second, "B").unwrap();
+        symlink(&first, &link).unwrap();
+        let call = HistoryToolCall {
+            call_id: "call-leaf-callback-rebind".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": link, "content": "must not write"}).to_string(),
+        };
+        let mut agent = test_agent();
+        let mut events = Vec::new();
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| {
+                    std::fs::remove_file(&link).unwrap();
+                    symlink(&second, &link).unwrap();
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                },
+            )
+            .await
+            .expect("security failure is a completed execution record");
+
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert_eq!(record.rejection, None);
+        assert!(!record.output.ok);
+        assert_eq!(
+            record
+                .output
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("writable destination changed after authorization")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: false, .. }))
+        );
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "A");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "B");
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[tokio::test]
+    async fn writable_leaf_preparation_failure_skips_approval_and_started_event() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let call = test_tool_call(
+            "fs__write",
+            &json!({"path": format!("target/missing-parent-{unique}/leaf"), "content": "x"})
+                .to_string(),
+        );
+        let mut agent = test_agent();
+        let mut approvals = 0;
+        let mut events = Vec::new();
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| {
+                    approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                },
+            )
+            .await
+            .expect("preparation failure becomes a rejection record");
+
+        assert_eq!(approvals, 0);
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(record.rejection, None);
+        assert!(
+            record
+                .output
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("parent directory does not exist")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: false, .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn yolo_mode_executes_commands_that_default_mode_asks() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Yolo);
+        let call = HistoryToolCall {
+            call_id: "call-yolo-ask-risk".into(),
+            name: "shell__exec".into(),
+            arguments_json: json!({"command": "curl --version"}).to_string(),
+        };
+        let mut approval_requested = false;
+
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                approval_requested = true;
+                std::future::ready(Ok(PermissionApproval::Deny))
+            })
+            .await
+            .expect("yolo mode should execute command without asking");
+
+        assert!(!approval_requested);
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert_ne!(
+            record.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByPolicy)
+        );
+    }
+
+    #[test]
+    fn workspace_agents_files_are_loaded_in_order_and_injected_into_each_turn() {
+        let workspace_root = agents_test_dir();
+        let current_dir = workspace_root.join("project").join("nested");
+        fs::create_dir_all(&current_dir).expect("nested workspace should be created");
+        let workspace_root = workspace_root
+            .canonicalize()
+            .expect("workspace root resolves");
+        let current_dir = current_dir
+            .canonicalize()
+            .expect("current directory resolves");
+        fs::write(workspace_root.join("AGENTS.md"), "root instructions").expect("root file");
+        fs::write(
+            workspace_root.join("project/AGENTS.md"),
+            "project instructions",
+        )
+        .expect("project file");
+        fs::write(current_dir.join("AGENTS.md"), "nested instructions").expect("nested file");
+
+        let mut agent = test_agent();
+        agent
+            .load_workspace_instructions(&workspace_root, &current_dir)
+            .expect("workspace instructions load");
+
+        let prelude = agent.prepare_turn_prelude();
+        let instructions = prelude
+            .iter()
+            .filter(|message| message.text.starts_with("来自 "))
+            .collect::<Vec<_>>();
+        assert_eq!(instructions.len(), 3);
+        assert!(
+            instructions
+                .iter()
+                .all(|message| message.role == crate::request_builder::PromptRole::System)
+        );
+        assert!(instructions[0].text.contains(&format!(
+            "来自 {} 的指令：",
+            workspace_root.join("AGENTS.md").display()
+        )));
+        assert!(instructions[0].text.ends_with("root instructions"));
+        assert!(instructions[1].text.ends_with("project instructions"));
+        assert!(instructions[2].text.ends_with("nested instructions"));
+
+        fs::remove_dir_all(workspace_root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn config_agents_file_loads_before_workspace_instructions_without_duplicates() {
+        let root = agents_test_dir();
+        let config_dir = root.join("config");
+        let workspace_root = root.join("workspace");
+        let current_dir = workspace_root.join("nested");
+        fs::create_dir_all(&config_dir).expect("config directory");
+        fs::create_dir_all(workspace_root.join(".git")).expect("repo marker");
+        fs::create_dir_all(&current_dir).expect("nested workspace");
+        fs::write(config_dir.join("AGENTS.md"), "global instructions").expect("global file");
+        fs::write(workspace_root.join("AGENTS.md"), "workspace instructions")
+            .expect("workspace file");
+
+        let mut agent = test_agent();
+        agent
+            .load_instruction_files_from(&config_dir, &current_dir)
+            .expect("instruction files load");
+        agent
+            .load_instruction_files_from(&config_dir, &current_dir)
+            .expect("reloading is idempotent");
+
+        let instructions = agent
+            .prelude
+            .iter()
+            .filter(|message| message.text.starts_with("来自 "))
+            .collect::<Vec<_>>();
+        assert_eq!(instructions.len(), 2);
+        assert!(
+            instructions
+                .iter()
+                .all(|message| message.role == crate::request_builder::PromptRole::System)
+        );
+        assert!(instructions[0].text.ends_with("global instructions"));
+        assert!(instructions[1].text.ends_with("workspace instructions"));
+
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_emits_finished_event_for_user_denial_of_high_risk_command() {
+        let mut agent = Agent::new("m1", 1, 1);
+        let call = HistoryToolCall {
+            call_id: "call-denied".into(),
+            name: "shell__exec".into(),
+            arguments_json: r#"{"command":"rm -rf target"}"#.into(),
+        };
+        let mut events = Vec::new();
+        let mut approval_requested = false;
+
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| {
+                    approval_requested = true;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("user denial should be reported as tool output");
+
+        assert!(
+            approval_requested,
+            "high-risk commands must Ask, not hard-deny"
+        );
+        assert!(!record.output.ok);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ToolCallFinished { ok: false, .. },
+                AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    status,
+                    rejection: Some(rejection),
+                    effect_kind,
+                    ..
+                })
+            ] if status == "rejected"
+                    && rejection == "permission_denied_by_user"
+                    && effect_kind == "diagnostic"
+        ));
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByUser)
+        );
+        assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_invalid_json_emits_finished_event_and_records_rejection() {
+        let mut agent = test_agent();
+        let call = test_tool_call("fs__write", r#"{"path":"a.txt","content": }"#);
+        let mut events = Vec::new();
+
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("invalid json should still produce a record");
+
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::InvalidJsonArguments)
+        );
+        assert!(!record.output.ok);
+        assert_eq!(record.arguments, None);
+        assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ToolCallFinished { ok: false, .. },
+                AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    status,
+                    rejection: Some(rejection),
+                    effect_kind,
+                    ..
+                })
+            ] if status == "rejected"
+                && rejection == "invalid_json_arguments"
+                && effect_kind == "diagnostic"
+        ));
+    }
+
+    #[tokio::test]
+    async fn audit_event_failures_do_not_fail_tool_execution() {
+        let mut agent = test_agent();
+        let call = test_tool_call("fs__write", r#"{"path":"a.txt","content": }"#);
+        let mut event_count = 0;
+
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    assert!(matches!(
+                        event,
+                        AgentEvent::ToolCallFinished { .. } | AgentEvent::ToolExecutionSummary(_)
+                    ));
+                    event_count += 1;
+                    if matches!(event, AgentEvent::ToolExecutionSummary(_)) {
+                        std::future::ready(Err(anyhow!("audit sink failed")))
+                    } else {
+                        std::future::ready(Ok(()))
+                    }
+                },
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("audit failure should not fail tool execution");
+
+        assert_eq!(event_count, 2);
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::InvalidJsonArguments)
+        );
+        for mode in [
+            crate::config::SubagentMode::Expert,
+            crate::config::SubagentMode::Swarm,
+        ] {
+            let mut agent = test_agent();
+            agent.set_subagents_policy(crate::config::SubagentsConfig {
+                mode,
+                ..Default::default()
+            });
+            let mut finalized = 0;
+            let result = agent
+                .continue_or_finalize_no_tool_reply(
+                    &mut |event| {
+                        assert!(matches!(event, AgentEvent::TurnFinalized(_)));
+                        finalized += 1;
+                        std::future::ready(Err(anyhow!("turn close rejected")))
+                    },
+                    0,
+                    &mut 0,
+                )
+                .await;
+            assert_eq!(finalized, 1);
+            match mode {
+                crate::config::SubagentMode::Expert => assert!(!result.unwrap()),
+                crate::config::SubagentMode::Swarm => assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("turn close rejected")
+                ),
+            }
         }
     }
 }

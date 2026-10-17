@@ -662,6 +662,7 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use anyhow::Context;
     use serde_json::json;
     use std::path::PathBuf;
@@ -776,54 +777,58 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn streaming_shell_command_honors_explicit_timeout() {
-        use super::ToolHandler;
+    mod integration_tests {
+        use super::*;
 
-        let mut emit = |_stream, _chunk| Ok(());
-        let result = super::RunCommandTool
-            .execute_streaming(
-                json!({"command": "sleep 2", "timeout_secs": 1}),
-                super::ToolExecutionContext::default(),
-                &mut emit,
-            )
-            .await
-            .expect("shell tool result");
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn streaming_shell_command_honors_explicit_timeout() {
+            use crate::tool::ToolHandler;
 
-        assert!(result.ok);
-        assert_eq!(
-            result
-                .data
-                .as_ref()
-                .and_then(|data| data.get("error"))
-                .and_then(serde_json::Value::as_str),
-            Some("command timed out after 1s")
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_streaming_shell_command_kills_process_group() {
-        let dir = process_fixture_dir("streaming-drop");
-        let ready = dir.join("ready");
-        let release = dir.join("release");
-        let marker = dir.join("marker");
-        let script = delayed_side_effect_command(&ready, &release, &marker);
-        let task = tokio::spawn(async move {
             let mut emit = |_stream, _chunk| Ok(());
-            super::run_workspace_shell_command_streaming(&script, 30, &mut emit).await
-        });
-        wait_for_file(&ready).await;
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("task should be cancelled")
-                .is_cancelled()
-        );
-        std::fs::write(&release, "go").expect("release side effect");
-        assert_file_does_not_appear(&marker).await;
-        let _ = std::fs::remove_dir_all(dir);
+            let result = RunCommandTool
+                .execute_streaming(
+                    json!({"command": "sleep 2", "timeout_secs": 1}),
+                    ToolExecutionContext::default(),
+                    &mut emit,
+                )
+                .await
+                .expect("shell tool result");
+
+            assert!(result.ok);
+            assert_eq!(
+                result
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("error"))
+                    .and_then(serde_json::Value::as_str),
+                Some("command timed out after 1s")
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn dropping_streaming_shell_command_kills_process_group() {
+            let dir = process_fixture_dir("streaming-drop");
+            let ready = dir.join("ready");
+            let release = dir.join("release");
+            let marker = dir.join("marker");
+            let script = delayed_side_effect_command(&ready, &release, &marker);
+            let task = tokio::spawn(async move {
+                let mut emit = |_stream, _chunk| Ok(());
+                run_workspace_shell_command_streaming(&script, 30, &mut emit).await
+            });
+            wait_for_file(&ready).await;
+            task.abort();
+            assert!(
+                task.await
+                    .expect_err("task should be cancelled")
+                    .is_cancelled()
+            );
+            std::fs::write(&release, "go").expect("release side effect");
+            assert_file_does_not_appear(&marker).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[tokio::test]
@@ -870,47 +875,55 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn streaming_shell_command_folds_large_output() {
-        use super::ToolHandler;
+    mod output {
+        use super::*;
 
-        let mut emit = |_stream, _chunk| Ok(());
-        let result = super::RunCommandTool
-            .execute_streaming(
-                json!({"command": "yes x | head -c 70000", "timeout_secs": 30}),
-                super::ToolExecutionContext::default(),
-                &mut emit,
-            )
-            .await
-            .expect("shell tool result");
+        mod integration_tests {
+            use super::*;
 
-        assert!(result.ok);
-        let data = result.data.as_ref().expect("data");
-        assert_eq!(
-            data.get("status").and_then(serde_json::Value::as_i64),
-            Some(0)
-        );
-        assert_eq!(
-            data.get("stdout_folded")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            data.get("stdout_truncated")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        let path = data
-            .get("stdout_local_path")
-            .and_then(serde_json::Value::as_str)
-            .expect("local path");
-        let on_disk = tokio::fs::read(path).await.expect("read artifact");
-        assert_eq!(on_disk.len(), 70000);
-        assert!(
-            on_disk.iter().all(|&b| b == b'x' || b == b'\n'),
-            "yes emits x per line"
-        );
-        let _ = tokio::fs::remove_file(path).await;
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn streaming_shell_command_folds_large_output() {
+                use crate::tool::ToolHandler;
+
+                let mut emit = |_stream, _chunk| Ok(());
+                let result = RunCommandTool
+                    .execute_streaming(
+                        json!({"command": "yes x | head -c 70000", "timeout_secs": 30}),
+                        ToolExecutionContext::default(),
+                        &mut emit,
+                    )
+                    .await
+                    .expect("shell tool result");
+
+                assert!(result.ok);
+                let data = result.data.as_ref().expect("data");
+                assert_eq!(
+                    data.get("status").and_then(serde_json::Value::as_i64),
+                    Some(0)
+                );
+                assert_eq!(
+                    data.get("stdout_folded")
+                        .and_then(serde_json::Value::as_bool),
+                    Some(true)
+                );
+                assert_eq!(
+                    data.get("stdout_truncated")
+                        .and_then(serde_json::Value::as_bool),
+                    Some(true)
+                );
+                let path = data
+                    .get("stdout_local_path")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("local path");
+                let on_disk = tokio::fs::read(path).await.expect("read artifact");
+                assert_eq!(on_disk.len(), 70000);
+                assert!(
+                    on_disk.iter().all(|&b| b == b'x' || b == b'\n'),
+                    "yes emits x per line"
+                );
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
     }
 }

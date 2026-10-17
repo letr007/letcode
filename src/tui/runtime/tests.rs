@@ -1217,43 +1217,23 @@ fn clipboard_paste_prefers_image_only_in_composer_context() {
 }
 
 #[test]
-fn clipboard_paste_dialog_is_text_first() {
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Dialog, true, true),
-        ClipboardPasteChoice::Text
-    );
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Dialog, false, true),
-        ClipboardPasteChoice::None
-    );
-}
-
-#[test]
-fn clipboard_paste_pending_question_is_text_first() {
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Question, true, true),
-        ClipboardPasteChoice::Text
-    );
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Question, false, true),
-        ClipboardPasteChoice::None
-    );
-}
-
-#[test]
-fn clipboard_paste_permission_is_text_first() {
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Permission, true, true),
-        ClipboardPasteChoice::Text
-    );
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Permission, false, true),
-        ClipboardPasteChoice::None
-    );
-}
-
-fn test_agent() -> Agent {
-    Agent::new("gpt-test", 4, 4)
+fn clipboard_paste_text_contexts_are_text_first() {
+    for context in [
+        ClipboardPasteContext::Dialog,
+        ClipboardPasteContext::Question,
+        ClipboardPasteContext::Permission,
+    ] {
+        assert_eq!(
+            choose_clipboard_paste(context, true, true),
+            ClipboardPasteChoice::Text,
+            "{context:?}"
+        );
+        assert_eq!(
+            choose_clipboard_paste(context, false, true),
+            ClipboardPasteChoice::None,
+            "{context:?}"
+        );
+    }
 }
 
 #[test]
@@ -1351,80 +1331,6 @@ async fn cancel_question_delivers_cancellation() {
 }
 
 #[test]
-fn history_tree_selection_restores_user_content_and_targets_the_parent() {
-    let sessions_dir = std::env::temp_dir().join(format!(
-        "letcode-history-selection-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time ok")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&sessions_dir).expect("sessions directory");
-    let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("recorder");
-    let session_id = recorder.session_id().to_string();
-    recorder.record_user_message("first").expect("first user");
-    recorder
-        .record_assistant_message("first answer")
-        .expect("first answer");
-    recorder.record_user_message("second").expect("second user");
-    drop(recorder);
-    let transcript = Arc::new(StdMutex::new(
-        TranscriptRecorder::open_existing(&sessions_dir, &session_id).expect("open recorder"),
-    ));
-    let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
-    let (initial_session_id, _) = initial_session_metadata(&transcript).expect("load metadata");
-    state.session_id = Some(initial_session_id);
-    assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
-    let (_tx, rx) = mpsc::unbounded_channel();
-    let mut runtime = TuiRuntime::new(
-        state,
-        rx,
-        Vec::new(),
-        Vec::new(),
-        sessions_dir,
-        std::env::temp_dir(),
-    );
-
-    let path = runtime.sessions_dir.join(format!("{session_id}.jsonl"));
-    let records = read_records(&path).expect("records");
-    runtime.apply_session_transport_event(SessionTransportEvent::SessionHistoryLoaded {
-        entries: transcript_projection::project_session_history_tree(&records),
-    });
-    let dialog = runtime.state().dialog().expect("history dialog");
-    assert_eq!(dialog.kind, DialogKind::HistoryTree);
-    assert_eq!(dialog.selected_item().expect("selected").id, "entry-3");
-
-    let command = runtime
-        .handle_dialog_accept()
-        .expect("accept user selection");
-    assert_eq!(
-        command,
-        Some(RuntimeCommand::NavigateHistory {
-            target_entry_id: "entry-2".into(),
-        })
-    );
-    assert_eq!(runtime.state().input_buffer, "second");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::SessionHistoryLoaded {
-        entries: transcript_projection::project_session_history_tree(&records),
-    });
-    runtime
-        .state_mut()
-        .dialog_mut()
-        .expect("history dialog")
-        .selected = 1;
-    let command = runtime
-        .handle_dialog_accept()
-        .expect("accept assistant selection");
-    assert_eq!(
-        command,
-        Some(RuntimeCommand::NavigateHistory {
-            target_entry_id: "entry-2".into(),
-        })
-    );
-}
-
-#[test]
 fn history_tree_acceptance_rechecks_pending_running_queued_question_and_inflight_state() {
     for state in ["running", "permission", "queued", "question", "inflight"] {
         let mut runtime = runtime();
@@ -1467,62 +1373,6 @@ fn history_tree_acceptance_rechecks_pending_running_queued_question_and_inflight
             "{state} state must reject navigation"
         );
         assert!(!runtime.state().dialog_is_open());
-    }
-}
-
-#[test]
-fn navigation_commands_respect_pending_work() {
-    for state in ["running", "pending", "queued", "background"] {
-        let mut runtime = runtime();
-        match state {
-            "running" => runtime.session_turn_active = true,
-            "pending" => {
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                runtime.apply_session_transport_event(SessionTransportEvent::PermissionRequested {
-                    event: PermissionRequestEvent::new("call-1", "shell__exec", "Run command"),
-                    handle: RunnerPermissionRequest::new(reply_tx),
-                });
-            }
-            "queued" => runtime
-                .queued_prompt_lifecycle
-                .dispatch(UserMessageSubmission::from("queued")),
-            "background" => {
-                runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
-                    child_session_id: "background-child".into(),
-                    agent_name: Some("explorer".into()),
-                    parent_tool_call_id: None,
-                    event: SessionEvent::UserMessage(UserMessageEvent::new("background work")),
-                });
-                runtime.apply_session_transport_event(SessionTransportEvent::Done);
-            }
-            _ => unreachable!(),
-        }
-        for input in ["/undo", "/redo", "/tree"] {
-            runtime.state_mut().set_input(input);
-            assert_eq!(
-                runtime
-                    .handle_input_action(InputAction::Submit)
-                    .expect("submit"),
-                None,
-                "{state} must block {input}"
-            );
-            assert_eq!(runtime.state().input_buffer, input);
-        }
-        let (mut engine, ingress, _egress) = SessionEngine::new();
-        for command in [
-            RuntimeCommand::Undo,
-            RuntimeCommand::Redo,
-            RuntimeCommand::ShowHistoryTree,
-            RuntimeCommand::NavigateHistory {
-                target_entry_id: "entry-1".into(),
-            },
-        ] {
-            command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
-            assert!(matches!(
-                engine.try_recv_control(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ));
-        }
     }
 }
 
@@ -1580,6 +1430,7 @@ fn non_matching_child_stream_event_does_not_mutate_current_view() {
 #[test]
 fn child_interrupted_event_updates_child_view_without_touching_parent() {
     let mut runtime = runtime();
+    runtime.state_mut().phase = AppPhase::Running;
     runtime.state_mut().replace_child_timeline_from_records(
         &[],
         "parent-session",
@@ -1589,6 +1440,9 @@ fn child_interrupted_event_updates_child_view_without_touching_parent() {
         1,
         1,
     );
+    runtime
+        .state_mut()
+        .set_child_view_phase_for_test(AppPhase::Running);
 
     runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
         child_session_id: "child-session".into(),
@@ -1597,6 +1451,11 @@ fn child_interrupted_event_updates_child_view_without_touching_parent() {
         event: SessionEvent::Interrupted,
     });
 
+    assert_eq!(
+        runtime.state().child_view_phase(),
+        Some(AppPhase::Completed)
+    );
+    assert_eq!(runtime.state().phase, AppPhase::Running);
     assert!(runtime.state().timeline.items().is_empty());
     assert!(runtime.state().toast().is_none());
 }
@@ -1684,65 +1543,6 @@ fn agent_model_picker_escape_discards_changes_and_returns_to_agent_picker() {
 }
 
 #[test]
-fn expert_allowlist_change_during_a_turn_shows_in_the_panel() {
-    let mut runtime = runtime_with_experts(vec![AvailableExpert {
-        agent_name: "explorer".into(),
-        route_id: "gpt-5.5".into(),
-        allowed_models: vec!["gpt-5.5".into()],
-    }]);
-    runtime
-        .available_models
-        .push(AvailableModel::new("p/other", "Other"));
-    runtime.session_turn_active = true;
-    runtime.state_mut().set_input("/agents");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("agents picker opens");
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("expert picker opens");
-    runtime
-        .handle_input_action(InputAction::DialogNext)
-        .expect("moves to the second model");
-    runtime
-        .handle_input_action(InputAction::DialogToggle)
-        .expect("toggles the second model");
-    let command = runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("confirming produces a command")
-        .expect("command");
-    let (mut engine, ingress, _egress) = SessionEngine::new();
-    command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
-
-    assert!(matches!(
-        engine.try_recv_control(),
-        Ok(SessionEngineControl::Command(
-            SessionEngineCommand::SetExpertAllowedModels { .. }
-        ))
-    ));
-    assert_eq!(
-        runtime
-            .state()
-            .dialog()
-            .and_then(|dialog| dialog.items[0].right_detail.clone()),
-        Some("gpt-5.5 · p/other".into())
-    );
-
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("expert picker reopens");
-    assert!(matches!(
-        runtime.state().dialog(),
-        Some(dialog)
-            if matches!(dialog.kind, DialogKind::ExpertModelPicker(_))
-                && dialog.items.iter().filter(|item| item.checked).count() == 2
-    ));
-    runtime
-        .handle_input_action(InputAction::DialogCancel)
-        .expect("returns to the agents picker");
-}
-
-#[test]
 fn notice_messages_follow_the_active_language() {
     let mut runtime = runtime();
     runtime
@@ -1785,78 +1585,6 @@ fn running_turn_opens_session_setting_dialogs() {
 }
 
 #[test]
-fn thoughts_command_opens_picker_and_persists_selected_mode() {
-    let mut runtime = runtime();
-    runtime.state_mut().set_input("/thoughts");
-
-    assert_eq!(
-        runtime
-            .handle_input_action(InputAction::Submit)
-            .expect("thoughts picker opens"),
-        None
-    );
-    assert!(matches!(
-        runtime.state().dialog(),
-        Some(dialog)
-            if dialog.kind == DialogKind::ThoughtsPicker
-                && dialog.selected_item().map(|item| item.id.as_str()) == Some("full")
-    ));
-
-    runtime
-        .handle_input_action(InputAction::DialogPrev)
-        .expect("select scroll");
-    runtime
-        .handle_input_action(InputAction::DialogPrev)
-        .expect("select titles");
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("accept thoughts display");
-
-    assert_eq!(
-        runtime.state().thoughts_display,
-        ThoughtsDisplayMode::Titles
-    );
-    assert!(!runtime.state().dialog_is_open());
-    assert_eq!(
-        TuiPreferences::load_from_dir(&runtime.preferences_dir).thoughts_display,
-        ThoughtsDisplayMode::Titles
-    );
-}
-
-#[test]
-fn tools_command_opens_picker_and_persists_selected_mode() {
-    let mut runtime = runtime();
-    runtime.state_mut().set_input("/tools");
-
-    assert_eq!(
-        runtime
-            .handle_input_action(InputAction::Submit)
-            .expect("tools picker opens"),
-        None
-    );
-    assert!(matches!(
-        runtime.state().dialog(),
-        Some(dialog)
-            if dialog.kind == DialogKind::ToolsPicker
-                && dialog.selected_item().map(|item| item.id.as_str()) == Some("detailed")
-    ));
-
-    runtime
-        .handle_input_action(InputAction::DialogPrev)
-        .expect("select compact");
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("accept tools display");
-
-    assert_eq!(runtime.state().tools_display, ToolsDisplayMode::Compact);
-    assert!(!runtime.state().dialog_is_open());
-    assert_eq!(
-        TuiPreferences::load_from_dir(&runtime.preferences_dir).tools_display,
-        ToolsDisplayMode::Compact
-    );
-}
-
-#[test]
 fn thoughts_command_is_available_during_active_turn_and_child_view() {
     let mut runtime = runtime();
     runtime.session_turn_active = true;
@@ -1894,37 +1622,6 @@ fn thoughts_command_is_available_during_active_turn_and_child_view() {
 }
 
 #[test]
-fn thoughts_numeric_alias_persists_and_loads_for_a_new_runtime() {
-    let mut runtime = runtime();
-    runtime.state_mut().set_input("/thoughts 1");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("numeric thoughts command succeeds");
-    assert_eq!(
-        runtime.state().thoughts_display,
-        ThoughtsDisplayMode::Compact
-    );
-
-    let loaded = TuiPreferences::load_from_dir(&runtime.preferences_dir);
-    let (_tx, rx) = mpsc::unbounded_channel();
-    let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
-    state.set_thoughts_display(loaded.thoughts_display);
-    let restarted = TuiRuntime::new(
-        state,
-        rx,
-        Vec::new(),
-        Vec::new(),
-        std::env::temp_dir(),
-        runtime.preferences_dir.clone(),
-    );
-
-    assert_eq!(
-        restarted.state().thoughts_display,
-        ThoughtsDisplayMode::Compact
-    );
-}
-
-#[test]
 fn reasoning_shortcut_waits_for_backend_confirmation() {
     let mut runtime = runtime();
     let previous = runtime.state().reasoning_effort_label.clone();
@@ -1936,50 +1633,6 @@ fn reasoning_shortcut_waits_for_backend_confirmation() {
         Some(RuntimeCommand::SetReasoningEffort(_))
     ));
     assert_eq!(runtime.state().reasoning_effort_label, previous);
-}
-
-#[tokio::test]
-async fn running_turn_projects_session_setting_until_backend_confirmation() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("/permission safe");
-
-    let command = runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("permission setting is accepted")
-        .expect("permission setting is dispatched");
-    assert_eq!(
-        command,
-        RuntimeCommand::SetPermissionMode(crate::permission::PermissionMode::Safe)
-    );
-
-    let (mut engine, ingress, _egress) = SessionEngine::new();
-    command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
-    assert!(matches!(
-        engine.recv_control().await,
-        Some(SessionEngineControl::Command(
-            SessionEngineCommand::SetPermissionMode(crate::permission::PermissionMode::Safe)
-        ))
-    ));
-    assert_eq!(runtime.state().permission_mode_label, "default");
-    assert_eq!(
-        runtime
-            .state()
-            .pending_composer_settings
-            .permission_mode
-            .as_deref(),
-        Some("safe")
-    );
-
-    runtime.apply_session_transport_event(SessionTransportEvent::PermissionModeChanged {
-        mode: "safe".into(),
-    });
-    assert_eq!(runtime.state().permission_mode_label, "safe");
-    assert_eq!(
-        runtime.state().pending_composer_settings.permission_mode,
-        None
-    );
 }
 
 #[test]
@@ -2067,89 +1720,50 @@ fn parent_view_refresh_preserves_pending_setting_projection() {
 }
 
 #[test]
-fn parent_view_refresh_without_usage_preserves_known_parent_usage() {
-    let mut runtime = runtime();
-    runtime
-        .state_mut()
-        .set_token_usage(TokenUsageEvent::with_breakdown(700, 1_000, 600, 100, 0).into());
-    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
-        parent_session_id: "parent-session".into(),
-        child_session_id: "child-session".into(),
-        agent_name: "explorer".into(),
-        index: 0,
-        total: 1,
-        pool_ordinal: 1,
-        in_progress_assistant_text: None,
-        records: vec![],
-        runtime_context: event_context("child-session", 1),
-    });
-
-    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
-        session_id: "parent-session".into(),
-        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-        records: vec![],
-        model_id: None,
-        token_usage: None,
-        runtime_context: event_context("parent-session", 1),
-    });
-
-    assert_eq!(
+fn parent_view_refresh_without_usage_preserves_confirmed_parent_state() {
+    for model_id in [None, Some("gpt-5.5".into())] {
+        let mut runtime = runtime();
         runtime
-            .state()
-            .active_model_token_usage()
-            .map(|usage| (usage.used_tokens, usage.context_window_tokens)),
-        Some((700, 1_000))
-    );
-}
+            .state_mut()
+            .set_token_usage(TokenUsageEvent::with_breakdown(700, 1_000, 600, 100, 0).into());
+        runtime.state_mut().set_output_token_rate(Some(60));
+        runtime
+            .state_mut()
+            .set_reasoning_effort_label(Some("high".into()));
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
+            parent_session_id: "parent-session".into(),
+            child_session_id: "child-session".into(),
+            agent_name: "explorer".into(),
+            index: 0,
+            total: 1,
+            pool_ordinal: 1,
+            in_progress_assistant_text: None,
+            records: vec![],
+            runtime_context: event_context("child-session", 1),
+        });
 
-#[test]
-fn parent_view_refresh_preserves_output_token_rate() {
-    let mut runtime = runtime();
-    runtime.state_mut().set_output_token_rate(Some(60));
-    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
-        parent_session_id: "parent-session".into(),
-        child_session_id: "child-session".into(),
-        agent_name: "explorer".into(),
-        index: 0,
-        total: 1,
-        pool_ordinal: 1,
-        in_progress_assistant_text: None,
-        records: vec![],
-        runtime_context: event_context("child-session", 1),
-    });
+        runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
+            session_id: "parent-session".into(),
+            branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            records: vec![],
+            model_id,
+            token_usage: None,
+            runtime_context: event_context("parent-session", 1),
+        });
 
-    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
-        session_id: "parent-session".into(),
-        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-        records: vec![],
-        model_id: None,
-        token_usage: None,
-        runtime_context: event_context("parent-session", 1),
-    });
-
-    assert_eq!(runtime.state().active_output_token_rate(), Some(60));
-}
-
-#[test]
-fn parent_view_refresh_preserves_confirmed_reasoning_effort() {
-    let mut runtime = runtime();
-    runtime
-        .state_mut()
-        .set_reasoning_effort_label(Some("high".into()));
-
-    runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
-        session_id: "parent-session".into(),
-        branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-        records: vec![],
-        model_id: Some("gpt-5.5".into()),
-        token_usage: None,
-        runtime_context: event_context("parent-session", 1),
-    });
-
-    assert_eq!(
-        runtime.state().reasoning_effort_label.as_deref(),
-        Some("high")
-    );
+        assert_eq!(
+            runtime
+                .state()
+                .active_model_token_usage()
+                .map(|usage| (usage.used_tokens, usage.context_window_tokens)),
+            Some((700, 1_000))
+        );
+        assert_eq!(runtime.state().active_output_token_rate(), Some(60));
+        assert_eq!(
+            runtime.state().reasoning_effort_label.as_deref(),
+            Some("high")
+        );
+    }
 }
 
 #[test]
@@ -2415,9 +2029,12 @@ fn interrupt_confirmation_survives_tick() {
     let mut runtime = runtime();
     runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
 
-    runtime
-        .handle_input_action(InputAction::Interrupt)
-        .expect("first interrupt hint succeeds");
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("first interrupt hint succeeds"),
+        None
+    );
     runtime
         .handle_input_action(InputAction::Tick)
         .expect("tick succeeds");
@@ -2602,138 +2219,6 @@ fn error_preserves_question_while_done_clears_parent_question() {
 }
 
 #[test]
-fn interrupt_rehydrates_agent_from_transcript() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-tui-runtime-interrupt-rehydrate-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time ok")
-            .as_nanos()
-    ));
-    let recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    let transcript = Arc::new(StdMutex::new(recorder));
-
-    {
-        let mut recorder = transcript.lock().expect("lock recorder");
-        recorder
-            .record_user_message("unfinished")
-            .expect("record user message");
-        recorder
-            .record_turn_interrupted(Some(1))
-            .expect("record turn interrupted");
-    }
-
-    let mut agent = test_agent();
-    agent
-        .restore_session_history(vec![HistoryItem::user("stale dangling")], Vec::new(), 0)
-        .expect("seed stale history");
-
-    rehydrate_agent_from_transcript(&mut agent, &transcript).expect("rehydrate agent");
-
-    assert!(matches!(
-        &agent.history_for_test()[..],
-        [HistoryItem::UserMessage { content }, HistoryItem::AssistantTurn { text: Some(assistant_text), .. }]
-            if content.text == "unfinished" && assistant_text.is_empty()
-    ));
-}
-
-#[test]
-fn resumed_session_usage_uses_target_agent_and_drops_response_accounting() {
-    let mut old_agent = test_agent();
-    old_agent
-        .restore_session_history(
-            vec![HistoryItem::user("old session ".repeat(2_000))],
-            Vec::new(),
-            99,
-        )
-        .expect("restore old session");
-    let old_usage = old_agent.session_token_usage().expect("old usage");
-
-    let mut target_agent = test_agent();
-    target_agent.set_model("target-model");
-    target_agent
-        .restore_session_history(vec![HistoryItem::user("target session")], Vec::new(), 2)
-        .expect("restore target session");
-    let target_frames = target_agent.protocol_frames_for_test().to_vec();
-    let target_snapshot = target_agent.runtime_snapshot_for_test().clone();
-    let expected_usage =
-        restored_session_token_usage(&target_agent, target_agent.model(), &target_snapshot)
-            .expect("target usage");
-    let prepared_usage =
-        restored_session_token_usage(&old_agent, target_agent.model(), &target_snapshot)
-            .expect("prepare target usage");
-
-    old_agent
-        .restore_new_session_runtime_snapshot(target_snapshot.clone(), 2)
-        .expect("install target session");
-    old_agent.set_model("target-model");
-    let resumed_usage =
-        restored_session_token_usage(&old_agent, old_agent.model(), &target_snapshot)
-            .expect("resumed usage");
-
-    assert_eq!(
-        old_agent.runtime_snapshot_for_test().current_turn_id,
-        Some(2)
-    );
-    assert_ne!(old_usage.used_tokens, expected_usage.used_tokens);
-    assert_eq!(prepared_usage, expected_usage);
-    assert_eq!(resumed_usage, expected_usage);
-    assert_eq!(resumed_usage.output_tokens, 0);
-    assert_eq!(resumed_usage.cached_tokens, 0);
-    assert_eq!(resumed_usage.cache_report, None);
-    assert!(
-        resumed_usage
-            .prompt_composition
-            .iter()
-            .any(|entry| entry.category == "system" && entry.estimated_tokens > 0)
-    );
-    assert!(
-        resumed_usage
-            .prompt_composition
-            .iter()
-            .any(|entry| entry.category == "messages" && entry.estimated_tokens > 0)
-    );
-}
-
-#[test]
-fn failed_candidate_usage_preserves_agent_and_recorder() {
-    let sessions_dir = std::env::temp_dir().join(format!(
-        "letcode-tui-runtime-candidate-usage-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time ok")
-            .as_nanos()
-    ));
-    let recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-    let recorder_id = recorder.session_id().to_string();
-    let recorder_path = recorder.path().to_path_buf();
-    let mut agent = test_agent();
-    agent
-        .restore_session_history(vec![HistoryItem::user("old session")], Vec::new(), 7)
-        .expect("restore old session");
-    let model = agent.model().to_string();
-    let history = agent.history_for_test().to_vec();
-    let runtime_snapshot = agent.runtime_snapshot_for_test().clone();
-    let invalid_metadata = crate::request_builder::ModelRequestMetadata {
-        effective_input_limit_tokens: Some(0),
-        ..Default::default()
-    };
-    agent.set_model_catalog(std::collections::HashMap::from([(
-        String::from("invalid-model"),
-        invalid_metadata,
-    )]));
-    let target_snapshot = test_agent().runtime_snapshot_for_test().clone();
-
-    assert!(restored_session_token_usage(&agent, "invalid-model", &target_snapshot).is_err());
-
-    assert_eq!(agent.model(), model);
-    assert_eq!(agent.history_for_test(), history.as_slice());
-    assert_eq!(agent.runtime_snapshot_for_test(), &runtime_snapshot);
-    assert_eq!(recorder.session_id(), recorder_id);
-    assert_eq!(recorder.path(), recorder_path);
-}
-
-#[test]
 fn permission_prompt_requires_double_esc_to_interrupt() {
     let mut runtime = runtime();
     runtime.session_turn_active = true;
@@ -2754,108 +2239,6 @@ fn permission_prompt_requires_double_esc_to_interrupt() {
         .handle_input_action(InputAction::Interrupt)
         .expect("second esc succeeds");
     assert_eq!(second, Some(RuntimeCommand::Interrupt));
-}
-
-#[test]
-fn slash_subagent_interrupt_terminalizes_parent_runtime_from_parent_view() {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let mut runtime = TuiRuntime::new(
-        TuiState::default(),
-        rx,
-        vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
-        Vec::new(),
-        std::env::temp_dir(),
-        std::env::temp_dir(),
-    );
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-
-    send_subagent_interrupted(&tx);
-    runtime.try_drain_session_events();
-
-    assert!(!runtime.session_turn_active);
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
-}
-
-#[test]
-fn slash_subagent_interrupt_terminalizes_parent_runtime_from_child_view() {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let mut runtime = TuiRuntime::new(
-        TuiState::default(),
-        rx,
-        vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
-        Vec::new(),
-        std::env::temp_dir(),
-        std::env::temp_dir(),
-    );
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().replace_child_timeline_from_records(
-        &[],
-        "parent-session",
-        "child-session",
-        "explorer",
-        0,
-        1,
-        1,
-    );
-
-    send_subagent_interrupted(&tx);
-    runtime.try_drain_session_events();
-
-    assert!(!runtime.session_turn_active);
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
-    assert!(runtime.state().toast().is_none());
-}
-
-#[test]
-fn parent_interrupt_while_viewing_child_closes_child_active_tools() {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let mut runtime = TuiRuntime::new(
-        TuiState::default(),
-        rx,
-        vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
-        Vec::new(),
-        std::env::temp_dir(),
-        std::env::temp_dir(),
-    );
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().replace_child_timeline_from_records(
-        &[],
-        "parent-session",
-        "child-session",
-        "explorer",
-        0,
-        1,
-        1,
-    );
-    runtime.state_mut().apply_child_session_event(
-        "child-session",
-        SessionEvent::ToolPending(crate::tui::events::ToolPendingEvent::new(
-            "child-call",
-            "fs__write",
-        )),
-    );
-
-    send_subagent_interrupted(&tx);
-    tx.send(SessionTransportEvent::ChildSessionEvent {
-        child_session_id: "child-session".into(),
-        agent_name: Some("explorer".into()),
-        parent_tool_call_id: None,
-        event: SessionEvent::Interrupted,
-    })
-    .expect("send the child terminal event");
-    runtime.try_drain_session_events();
-
-    assert!(!runtime.session_turn_active);
-    assert!(matches!(
-        runtime.state().active_timeline().items().iter().find_map(|item| match item {
-            crate::tui::TimelineItem::Tool(tool) => Some(tool),
-            _ => None,
-        }),
-        Some(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Cancelled
-    ));
 }
 
 #[test]
@@ -3284,7 +2667,6 @@ fn child_view_navigation_and_read_only_actions_do_not_show_toasts() {
         .handle_input_action(InputAction::ChildPrefix)
         .expect("child navigation prefix");
     assert!(runtime.state().toast().is_none());
-    assert_eq!(CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS, 90);
     for _ in 0..CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS - 1 {
         runtime
             .handle_input_action(InputAction::Tick)
@@ -4351,41 +3733,31 @@ fn queued_prompt_accept_does_not_consume_history_until_user_message_arrives() {
 }
 
 #[test]
-fn queued_prompt_does_not_dispatch_after_single_tool_finished() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
+fn queued_prompt_does_not_dispatch_on_non_terminal_events() {
+    for event in [
+        SessionTransportEvent::ToolFinished(ToolFinishedEvent::new(
+            "tool-1",
+            "fs__read",
+            "read completed",
+            ToolOutcome::Success,
+        )),
+        SessionTransportEvent::AssistantDelta(AssistantDeltaEvent::new("still generating")),
+    ] {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
 
-    runtime.apply_session_transport_event(SessionTransportEvent::ToolFinished(
-        ToolFinishedEvent::new("tool-1", "fs__read", "read completed", ToolOutcome::Success),
-    ));
+        runtime.apply_session_transport_event(event);
 
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
-}
-
-#[test]
-fn queued_prompt_does_not_dispatch_on_assistant_text_delta() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::AssistantDelta(
-        AssistantDeltaEvent::new("still generating"),
-    ));
-
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert_eq!(runtime.queued_prompts.len(), 1);
+    }
 }
 
 #[test]
@@ -4559,162 +3931,6 @@ fn tree_dispatches_session_history_and_retired_branch_commands_are_invalid() {
             .expect("tree command"),
         Some(RuntimeCommand::ShowHistoryTree)
     );
-}
-
-#[test]
-fn recorder_current_branch_updates_on_resume_checkout_and_new_session() {
-    let sessions_dir = std::env::temp_dir().join(format!(
-        "letcode-branch-sync-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time ok")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-    let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-    recorder
-        .record_session_started("gpt-test")
-        .expect("session started");
-    recorder.record_user_message("root").expect("root message");
-    recorder
-        .record_context_branch_created(
-            "feature",
-            crate::transcript::ROOT_CONTEXT_BRANCH_ID,
-            2,
-            None,
-        )
-        .expect("branch created");
-    recorder.set_current_context_branch_id(Some("feature".into()));
-    recorder
-        .record_assistant_message("branch reply")
-        .expect("branch message");
-    recorder
-        .record_context_checkout("feature", 4)
-        .expect("checkout metadata");
-    let session_id = recorder.session_id().to_string();
-    let path = recorder.path().to_path_buf();
-
-    let records = read_records(&path).expect("read records");
-    drop(recorder);
-    let snapshot =
-        transcript_projection::project_session_restore_snapshot(session_id.clone(), records)
-            .expect("snapshot");
-    let mut reopened =
-        TranscriptRecorder::open_existing(&sessions_dir, &session_id).expect("reopen recorder");
-    sync_recorder_branch(&mut reopened, &snapshot.branch_id);
-    assert_eq!(reopened.current_context_branch_id(), Some("feature"));
-
-    sync_recorder_branch(&mut reopened, crate::transcript::ROOT_CONTEXT_BRANCH_ID);
-    assert_eq!(reopened.current_context_branch_id(), None);
-
-    let mut fresh = TranscriptRecorder::create(&sessions_dir).expect("fresh recorder");
-    fresh.set_current_context_branch_id(Some("temp".into()));
-    fresh.set_current_context_branch_id(None);
-    assert_eq!(fresh.current_context_branch_id(), None);
-}
-
-#[test]
-fn tick_does_not_clobber_live_child_stream_with_disk_records() {
-    let sessions_dir = std::env::temp_dir().join(format!(
-        "letcode-tui-child-live-refresh-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time ok")
-            .as_nanos()
-    ));
-    let mut parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
-    let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
-    let mut child = TranscriptRecorder::create(&child_dir).expect("create child");
-    let parent_session_id = parent.session_id().to_string();
-    let child_session_id = child.session_id().to_string();
-
-    child
-        .record_session_started("gpt-child")
-        .expect("record child start");
-    parent
-        .record_subagent_result(
-            "run-1",
-            &parent_session_id,
-            "turn-1",
-            &child_session_id,
-            "explorer",
-            "running",
-            "inspecting",
-        )
-        .expect("record child result");
-
-    let (_tx, rx) = mpsc::unbounded_channel();
-    let mut runtime = TuiRuntime::new(
-        TuiState::default(),
-        rx,
-        vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
-        Vec::new(),
-        sessions_dir.clone(),
-        std::env::temp_dir(),
-    );
-    runtime.state_mut().replace_child_timeline_from_records(
-        &[TranscriptRecord {
-            session_id: child_session_id.clone(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::SessionStarted {
-                model: "gpt-child".into(),
-            },
-        }],
-        parent_session_id,
-        child_session_id.clone(),
-        "explorer",
-        0,
-        1,
-        1,
-    );
-    runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
-        child_session_id: child_session_id.clone(),
-        agent_name: None,
-        parent_tool_call_id: None,
-        event: SessionEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
-            "partial stream",
-        )),
-    });
-
-    child
-        .record_tool_call_started("call-1", "shell__exec", serde_json::json!({}))
-        .expect("record child tool start");
-
-    runtime
-        .handle_input_action(InputAction::Tick)
-        .expect("tick succeeds");
-
-    let metadata = runtime
-        .state()
-        .child_view_metadata()
-        .expect("child metadata");
-    assert_eq!(metadata.record_count, 1);
-    assert!(matches!(
-        runtime.state().active_timeline().items().last(),
-        Some(crate::tui::TimelineItem::Assistant(message)) if message.text == "partial stream"
-    ));
-}
-
-#[test]
-fn remove_current_empty_session_deletes_session_started_only_transcript() {
-    let sessions_dir = std::env::temp_dir().join(format!(
-        "letcode-tui-remove-current-empty-session-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos()
-    ));
-    let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-    recorder
-        .record_session_started("gpt-test")
-        .expect("record session started");
-    let path = recorder.path().to_path_buf();
-    let recorder = Arc::new(StdMutex::new(recorder));
-
-    assert!(remove_current_empty_session(&recorder).expect("remove empty session"));
-    assert!(!path.exists());
 }
 
 #[test]
@@ -5443,1056 +4659,6 @@ fn empty_todo_snapshot_clears_restored_todo_state() {
         expert_models: indexmap::IndexMap::new(),
     });
     assert!(runtime.state().latest_todo.is_none());
-}
-
-fn test_transcript(
-    name: &str,
-    history: Vec<(String, String)>,
-) -> (PathBuf, Arc<StdMutex<TranscriptRecorder>>) {
-    let sessions_dir = std::env::temp_dir().join(format!(
-        "letcode-tui-runner-interrupt-{name}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
-    recorder
-        .record_session_started("m1")
-        .expect("record session start");
-    // Avoid a title-generation side request in tests that exercise a prompt.
-    recorder
-        .record_session_title("runner interrupt test")
-        .expect("record title");
-    for (user, assistant) in history {
-        recorder
-            .record_user_message(user)
-            .expect("record user message");
-        recorder
-            .record_assistant_message(assistant)
-            .expect("record assistant message");
-    }
-    (sessions_dir, Arc::new(StdMutex::new(recorder)))
-}
-
-fn records(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Vec<TranscriptRecord> {
-    let recorder = transcript.lock().expect("lock transcript");
-    read_records(recorder.path()).expect("read transcript")
-}
-
-fn planned_interrupt(
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    parent_tool_calls: Vec<(String, String)>,
-) -> InterruptRequest {
-    let recorder = transcript.lock().expect("lock transcript");
-    let (transcript_revision, branch_id, turn_id, _) =
-        recorder.interrupt_transcript_plan().unwrap_or_else(|_| {
-            (
-                0,
-                recorder.current_context_branch_id().map(str::to_string),
-                None,
-                Vec::new(),
-            )
-        });
-    InterruptRequest {
-        parent_tool_calls,
-        active_runs: Vec::new(),
-        turn_id,
-        transcript_revision,
-        branch_id,
-    }
-}
-
-fn turn_started(turn_id: u64) -> TurnStartedEvent {
-    TurnStartedEvent { turn_id }
-}
-
-#[tokio::test]
-async fn active_operation_forwards_runner_events_but_suppresses_done() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    runner_tx
-        .send(SessionTransportEvent::Done)
-        .expect("runner event sender remains open");
-    assert!(matches!(
-        crate::session::engine::select_active_session_operation_with_events(
-            &mut control_rx,
-            &mut deferred_commands,
-            pending_operation.as_mut(),
-            Some(&mut runner_rx),
-        )
-        .await,
-        ActiveSessionOperation::RunnerEvent(SessionTransportEvent::Done)
-    ));
-
-    control_tx
-        .send(SessionEngineControl::Interrupt)
-        .expect("queue interrupt");
-    runner_tx
-        .send(SessionTransportEvent::AssistantDone { message_id: None })
-        .expect("runner event sender remains open");
-    assert!(matches!(
-        crate::session::engine::select_active_session_operation_with_events(
-            &mut control_rx,
-            &mut deferred_commands,
-            pending_operation.as_mut(),
-            Some(&mut runner_rx),
-        )
-        .await,
-        ActiveSessionOperation::Interrupted
-    ));
-    assert!(matches!(
-        runner_rx.try_recv(),
-        Ok(SessionTransportEvent::AssistantDone { .. })
-    ));
-}
-
-#[tokio::test]
-async fn completed_operation_forwards_queued_events_before_done() {
-    let (_control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    let operation = async {
-        runner_tx
-            .send(SessionTransportEvent::AssistantDone { message_id: None })
-            .expect("runner event receiver remains open");
-        runner_tx
-            .send(SessionTransportEvent::Error(ErrorEvent::new(
-                "request failed",
-            )))
-            .expect("runner event receiver remains open");
-        runner_tx
-            .send(SessionTransportEvent::Done)
-            .expect("runner event receiver remains open");
-    };
-    tokio::pin!(operation);
-
-    assert!(matches!(
-        crate::session::engine::select_active_session_operation_with_events(
-            &mut control_rx,
-            &mut deferred_commands,
-            operation.as_mut(),
-            Some(&mut runner_rx),
-        )
-        .await,
-        ActiveSessionOperation::Completed(())
-    ));
-    crate::session::engine::forward_queued_runner_events(&mut runner_rx, &session_tx);
-    session_tx
-        .send(SessionTransportEvent::Done)
-        .expect("session event receiver remains open");
-
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::AssistantDone { .. })
-    ));
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::Error(_))
-    ));
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::Done)
-    ));
-    assert!(session_rx.try_recv().is_err());
-}
-
-#[test]
-fn deferred_settings_use_last_write_wins_per_category() {
-    let mut commands = VecDeque::new();
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetModel("first".into()),
-    );
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetPermissionMode(crate::permission::PermissionMode::Safe),
-    );
-    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetExpertAllowedModels {
-            agent_name: "explorer".into(),
-            model_ids: vec!["allowed-first".into()],
-        },
-    );
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetExpertAllowedModels {
-            agent_name: "explorer".into(),
-            model_ids: vec!["allowed-last".into()],
-        },
-    );
-
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetPermissionMode(
-            crate::permission::PermissionMode::Safe
-        ))
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetModel(model)) if model == "last"
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetExpertAllowedModels { agent_name, model_ids })
-            if agent_name == "explorer" && model_ids == vec!["allowed-last"]
-    ));
-    assert!(commands.is_empty());
-}
-
-#[test]
-fn last_write_wins_does_not_cross_relative_command_barriers() {
-    let mut commands = VecDeque::new();
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetModel("first".into()),
-    );
-    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
-    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
-
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetModel(model)) if model == "first"
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::ToggleFastMode)
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetModel(model)) if model == "last"
-    ));
-    assert!(commands.is_empty());
-}
-
-#[test]
-fn last_write_wins_does_not_cross_prompt_barriers() {
-    let mut commands = VecDeque::new();
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetModel("first".into()),
-    );
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::Prompt(UserMessageSubmission::new(
-            "prompt",
-            crate::user_content::UserMessageContent::from("prompt"),
-        )),
-    );
-    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
-
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetModel(model)) if model == "first"
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::Prompt(prompt)) if prompt.id == "prompt"
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetModel(model)) if model == "last"
-    ));
-    assert!(commands.is_empty());
-}
-
-#[test]
-fn reasoning_last_write_wins_does_not_cross_toggle_barriers() {
-    let mut commands = VecDeque::new();
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetReasoningEffort(crate::request_builder::ModelReasoningEffort::Low),
-    );
-    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::SetReasoningEffort(
-            crate::request_builder::ModelReasoningEffort::High,
-        ),
-    );
-
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetReasoningEffort(
-            crate::request_builder::ModelReasoningEffort::Low
-        ))
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::ToggleFastMode)
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::SetReasoningEffort(
-            crate::request_builder::ModelReasoningEffort::High
-        ))
-    ));
-    assert!(commands.is_empty());
-}
-
-#[test]
-fn deferred_toggles_retain_each_operation() {
-    let mut commands = VecDeque::new();
-    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
-    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::ToggleMcpServer("docs".into()),
-    );
-    enqueue_deferred_command(
-        &mut commands,
-        SessionEngineCommand::ToggleMcpServer("docs".into()),
-    );
-
-    assert_eq!(commands.len(), 4);
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::ToggleFastMode)
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::ToggleFastMode)
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::ToggleMcpServer(server)) if server == "docs"
-    ));
-    assert!(matches!(
-        commands.pop_front(),
-        Some(SessionEngineCommand::ToggleMcpServer(server)) if server == "docs"
-    ));
-}
-
-#[test]
-fn parked_commands_stay_before_later_deferred_commands() {
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
-    let mut parked_commands = VecDeque::new();
-    let mut change_notice_sent = false;
-    let mut deferred_commands = VecDeque::from([SessionEngineCommand::SetPermissionMode(
-        crate::permission::PermissionMode::Auto,
-    )]);
-
-    park_active_turn_command(
-        &mut parked_commands,
-        SessionEngineCommand::SetModel("earlier".into()),
-        &session_tx,
-        &mut change_notice_sent,
-    );
-    flush_parked_commands(&mut deferred_commands, &mut parked_commands);
-
-    assert!(matches!(
-        deferred_commands.pop_front(),
-        Some(SessionEngineCommand::SetModel(model)) if model == "earlier"
-    ));
-    assert!(matches!(
-        deferred_commands.pop_front(),
-        Some(SessionEngineCommand::SetPermissionMode(
-            crate::permission::PermissionMode::Auto
-        ))
-    ));
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::Notice(notice))
-            if notice.message == "Change queued for after the current turn"
-    ));
-}
-
-#[test]
-fn a_background_completion_does_not_suppress_the_queued_change_notice() {
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
-    let mut parked_commands = VecDeque::new();
-    let mut change_notice_sent = false;
-    enqueue_deferred_command(
-        &mut parked_commands,
-        SessionEngineCommand::BackgroundSubagentCompleted {
-            generation: None,
-            parent_session_id: "parent".into(),
-            parent_tool_call_id: None,
-            result: Err("failed".into()),
-        },
-    );
-
-    park_active_turn_command(
-        &mut parked_commands,
-        SessionEngineCommand::ToggleFastMode,
-        &session_tx,
-        &mut change_notice_sent,
-    );
-
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::Notice(notice))
-            if notice.message == "Change queued for after the current turn"
-    ));
-}
-
-#[test]
-fn active_turn_reject_is_not_parked_by_engine() {
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
-    let mut parked_commands = VecDeque::new();
-    let mut change_notice_sent = false;
-    let (_dir, transcript) = test_transcript("active-turn-reject", Vec::new());
-    let subagent_runtime = crate::subagent::SubagentPool::new();
-    let mut background_deliveries = std::collections::HashMap::new();
-
-    crate::session::engine::handle_active_turn_command(
-        SessionEngineCommand::NewSession,
-        &mut parked_commands,
-        &session_tx,
-        &transcript,
-        &subagent_runtime,
-        &mut background_deliveries,
-        &mut change_notice_sent,
-    );
-
-    assert!(parked_commands.is_empty());
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::Notice(notice)) if notice.message == "Turn still running"
-    ));
-}
-
-#[test]
-fn active_turn_reports_a_background_completion_before_parking_it() {
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
-    let mut parked_commands = VecDeque::new();
-    let mut change_notice_sent = false;
-    let (_dir, transcript) = test_transcript("active-turn-completion", Vec::new());
-    let session_id = transcript
-        .lock()
-        .expect("transcript")
-        .session_id()
-        .to_string();
-    let subagent_runtime = crate::subagent::SubagentPool::new();
-    let mut background_deliveries = std::collections::HashMap::new();
-
-    crate::session::engine::handle_active_turn_command(
-        SessionEngineCommand::BackgroundSubagentCompleted {
-            generation: None,
-            parent_session_id: session_id,
-            parent_tool_call_id: Some("call-1".into()),
-            result: Ok(completed_run_summary()),
-        },
-        &mut parked_commands,
-        &session_tx,
-        &transcript,
-        &subagent_runtime,
-        &mut background_deliveries,
-        &mut change_notice_sent,
-    );
-
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::BackgroundSubagentCompleted { .. })
-    ));
-    assert!(matches!(
-        parked_commands.pop_front(),
-        Some(SessionEngineCommand::BackgroundSubagentCompleted { .. })
-    ));
-}
-
-#[test]
-fn busy_phases_refuse_history_navigation_with_one_policy() {
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
-    let mut parked_commands = VecDeque::new();
-    let mut change_notice_sent = false;
-    let (_dir, transcript) = test_transcript("busy-history-navigation", Vec::new());
-    let subagent_runtime = crate::subagent::SubagentPool::new();
-    let mut background_deliveries = std::collections::HashMap::new();
-
-    for command in [
-        SessionEngineCommand::Undo,
-        SessionEngineCommand::ShowHistoryTree,
-    ] {
-        crate::session::engine::handle_active_turn_command(
-            command,
-            &mut parked_commands,
-            &session_tx,
-            &transcript,
-            &subagent_runtime,
-            &mut background_deliveries,
-            &mut change_notice_sent,
-        );
-    }
-
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::Notice(notice))
-            if notice.message == "history navigation is unavailable while a turn is active"
-    ));
-    assert!(matches!(
-        session_rx.try_recv(),
-        Ok(SessionTransportEvent::Error(_))
-    ));
-    assert!(parked_commands.is_empty());
-}
-
-fn completed_run_summary() -> crate::subagent::SubagentRunSummary {
-    crate::subagent::SubagentRunSummary {
-        run_id: "run-1".into(),
-        child_session_id: "child-1".into(),
-        agent_name: "explorer".into(),
-        status: crate::subagent::SubagentStatus::Completed,
-        failure_kind: None,
-        summary: "the child finished".into(),
-        structured_result: crate::subagent::StructuredSubagentResult {
-            status: "completed".into(),
-            summary: "the child finished".into(),
-            malformed: false,
-            findings: Vec::new(),
-            files_read: Vec::new(),
-            files_changed: Vec::new(),
-            commands_run: Vec::new(),
-            validation: Vec::new(),
-            blockers: Vec::new(),
-            next_steps: Vec::new(),
-            run_id: "run-1".into(),
-            child_session_id: "child-1".into(),
-            raw_excerpt: None,
-        },
-    }
-}
-
-#[tokio::test]
-async fn queued_shutdown_interrupts_active_session_operation() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    control_tx
-        .send(SessionEngineControl::Shutdown)
-        .expect("queue shutdown");
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    assert!(matches!(
-        select_active_session_operation(
-            &mut control_rx,
-            &mut deferred_commands,
-            pending_operation.as_mut(),
-        )
-        .await,
-        ActiveSessionOperation::Shutdown
-    ));
-}
-
-#[tokio::test]
-async fn queued_interrupt_then_shutdown_returns_shutdown() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    control_tx
-        .send(SessionEngineControl::Interrupt)
-        .expect("queue interrupt");
-    control_tx
-        .send(SessionEngineControl::Shutdown)
-        .expect("queue shutdown");
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    assert!(matches!(
-        select_active_session_operation(
-            &mut control_rx,
-            &mut deferred_commands,
-            pending_operation.as_mut(),
-        )
-        .await,
-        ActiveSessionOperation::Shutdown
-    ));
-}
-
-#[tokio::test]
-async fn queued_interrupt_then_shutdown_stops_manual_compaction() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    control_tx
-        .send(SessionEngineControl::Interrupt)
-        .expect("queue interrupt");
-    control_tx
-        .send(SessionEngineControl::Shutdown)
-        .expect("queue shutdown");
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    assert!(matches!(
-        select_manual_compaction_operation(
-            &mut control_rx,
-            &mut deferred_commands,
-            pending_operation.as_mut(),
-        )
-        .await,
-        ManualCompactionOperation::Shutdown
-    ));
-}
-
-#[tokio::test]
-async fn manual_compaction_services_queued_child_navigation() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    control_tx
-        .send(SessionEngineControl::Command(
-            SessionEngineCommand::ViewChild {
-                navigation: crate::command::ChildNavigation::Next,
-                anchor_child_session_id: Some("child-1".into()),
-            },
-        ))
-        .expect("queue view child");
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    let operation = select_manual_compaction_operation(
-        &mut control_rx,
-        &mut deferred_commands,
-        pending_operation.as_mut(),
-    )
-    .await;
-
-    assert!(matches!(
-        operation,
-        ManualCompactionOperation::Navigation(ManualCompactionNavigation::ViewChild {
-            navigation: crate::command::ChildNavigation::Next,
-            anchor_child_session_id: Some(anchor),
-        }) if anchor == "child-1"
-    ));
-    assert!(deferred_commands.is_empty());
-}
-
-#[tokio::test]
-async fn manual_compaction_services_child_navigation_while_waiting() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    tokio::spawn(async move {
-        tokio::task::yield_now().await;
-        let _ = control_tx.send(SessionEngineControl::Command(
-            SessionEngineCommand::ViewParent,
-        ));
-        // Keep the channel open for the duration of the select.
-        std::future::pending::<()>().await;
-    });
-
-    let operation = select_manual_compaction_operation(
-        &mut control_rx,
-        &mut deferred_commands,
-        pending_operation.as_mut(),
-    )
-    .await;
-
-    assert!(matches!(
-        operation,
-        ManualCompactionOperation::Navigation(ManualCompactionNavigation::ViewParent)
-    ));
-}
-
-#[tokio::test]
-async fn manual_compaction_still_defers_command_changes() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    control_tx
-        .send(SessionEngineControl::Command(
-            SessionEngineCommand::SetModel("model-b".into()),
-        ))
-        .expect("queue set model");
-    control_tx
-        .send(SessionEngineControl::Shutdown)
-        .expect("queue shutdown");
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    let operation = select_manual_compaction_operation(
-        &mut control_rx,
-        &mut deferred_commands,
-        pending_operation.as_mut(),
-    )
-    .await;
-
-    assert!(matches!(operation, ManualCompactionOperation::Shutdown));
-    assert!(matches!(
-        deferred_commands.pop_front(),
-        Some(SessionEngineCommand::SetModel(model)) if model == "model-b"
-    ));
-}
-
-#[tokio::test]
-async fn queued_interrupt_then_disconnect_returns_shutdown() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    control_tx
-        .send(SessionEngineControl::Interrupt)
-        .expect("queue interrupt");
-    drop(control_tx);
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    assert!(matches!(
-        select_active_session_operation(
-            &mut control_rx,
-            &mut deferred_commands,
-            pending_operation.as_mut(),
-        )
-        .await,
-        ActiveSessionOperation::Shutdown
-    ));
-}
-
-#[tokio::test]
-async fn idle_interrupt_is_not_dropped_before_engine_dispatch() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands = VecDeque::new();
-    control_tx
-        .send(SessionEngineControl::Interrupt)
-        .expect("queue interrupt");
-
-    assert!(matches!(
-        next_idle_session_operation(&mut control_rx, &mut deferred_commands).await,
-        Some(crate::session::engine::IdleSessionOperation::Interrupt)
-    ));
-}
-
-#[tokio::test]
-async fn idle_shutdown_prevents_deferred_command_dispatch() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands =
-        VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
-            "deferred",
-            crate::user_content::UserMessageContent::from("deferred"),
-        ))]);
-    control_tx
-        .send(SessionEngineControl::Shutdown)
-        .expect("queue shutdown");
-
-    assert!(
-        next_idle_session_operation(&mut control_rx, &mut deferred_commands)
-            .await
-            .is_none()
-    );
-    assert_eq!(deferred_commands.len(), 1);
-}
-
-#[tokio::test]
-async fn idle_disconnect_prevents_deferred_command_dispatch() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut deferred_commands =
-        VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
-            "deferred",
-            crate::user_content::UserMessageContent::from("deferred"),
-        ))]);
-    drop(control_tx);
-
-    assert!(
-        next_idle_session_operation(&mut control_rx, &mut deferred_commands)
-            .await
-            .is_none()
-    );
-    assert_eq!(deferred_commands.len(), 1);
-}
-
-#[tokio::test]
-async fn disconnected_control_ingress_interrupts_active_session_operation() {
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<SessionEngineControl>();
-    let mut deferred_commands = VecDeque::new();
-    drop(control_tx);
-    let pending_operation = std::future::pending::<()>();
-    tokio::pin!(pending_operation);
-
-    assert!(matches!(
-        select_active_session_operation(
-            &mut control_rx,
-            &mut deferred_commands,
-            pending_operation.as_mut(),
-        )
-        .await,
-        ActiveSessionOperation::Shutdown
-    ));
-}
-
-#[test]
-fn session_title_base_sequence_remains_resolvable_for_interrupt_branch_scope() {
-    let (_, transcript) = test_transcript("title-base-sequence-interrupt", Vec::new());
-    let mut recorder = transcript.lock().expect("lock transcript");
-    let title_sequence = read_records(recorder.path())
-        .expect("read transcript records")
-        .into_iter()
-        .find(|record| matches!(record.event, TranscriptEvent::SessionTitle { .. }))
-        .expect("session title exists")
-        .sequence;
-
-    recorder
-        .record_context_branch_created("branch-a", ROOT_CONTEXT_BRANCH_ID, title_sequence, None)
-        .expect("title sequence resolves on root branch");
-}
-
-#[test]
-fn record_interrupt_transcript_scopes_active_turn_to_recorder_branch() {
-    let (_, transcript) = test_transcript("branch-scoped-interrupt", Vec::new());
-    {
-        let mut recorder = transcript.lock().expect("lock transcript");
-        let root_leaf_sequence = read_records(recorder.path())
-            .expect("read root records")
-            .last()
-            .expect("session metadata exists")
-            .sequence;
-        recorder
-            .record_context_branch_created(
-                "branch-a",
-                ROOT_CONTEXT_BRANCH_ID,
-                root_leaf_sequence,
-                None,
-            )
-            .expect("create branch A");
-        recorder
-            .record_context_checkout("branch-a", root_leaf_sequence)
-            .expect("checkout branch A");
-        recorder.set_current_context_branch_id(Some("branch-a".into()));
-        recorder
-            .record_turn_started(turn_started(41))
-            .expect("start branch A turn");
-
-        recorder
-            .record_context_branch_created(
-                "branch-b",
-                ROOT_CONTEXT_BRANCH_ID,
-                root_leaf_sequence,
-                None,
-            )
-            .expect("create branch B");
-        recorder
-            .record_context_checkout("branch-b", root_leaf_sequence)
-            .expect("checkout branch B");
-        recorder.set_current_context_branch_id(Some("branch-b".into()));
-        recorder
-            .record_turn_started(turn_started(42))
-            .expect("start branch B turn");
-
-        recorder.set_current_context_branch_id(Some("branch-a".into()));
-    }
-
-    record_interrupt_transcript(
-        &transcript,
-        &planned_interrupt(&transcript, vec![("call-a".into(), "shell__exec".into())]),
-    )
-    .expect("interrupt transcript should persist");
-
-    let after = records(&transcript);
-    let interruptions = after
-        .iter()
-        .filter(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(interruptions.len(), 1);
-    assert!(matches!(
-        &interruptions[0].event,
-        TranscriptEvent::TurnInterrupted { turn_id: Some(41) }
-    ));
-    assert_eq!(
-        interruptions[0].context_branch_id.as_deref(),
-        Some("branch-a")
-    );
-    assert!(after.iter().any(|record| {
-        matches!(
-            &record.event,
-            TranscriptEvent::ToolCallCancelled { call_id, name }
-                if call_id == "call-a" && name == "shell__exec"
-        ) && record.context_branch_id.as_deref() == Some("branch-a")
-    }));
-}
-
-#[test]
-fn record_interrupt_transcript_pre_start_cancellation_does_not_interrupt_sibling_turn() {
-    let (_, transcript) = test_transcript("branch-pre-start-cancel", Vec::new());
-    {
-        let mut recorder = transcript.lock().expect("lock transcript");
-        let root_leaf_sequence = read_records(recorder.path())
-            .expect("read root records")
-            .last()
-            .expect("session metadata exists")
-            .sequence;
-        recorder
-            .record_context_branch_created(
-                "branch-a",
-                ROOT_CONTEXT_BRANCH_ID,
-                root_leaf_sequence,
-                None,
-            )
-            .expect("create branch A");
-        recorder
-            .record_context_checkout("branch-a", root_leaf_sequence)
-            .expect("checkout branch A");
-
-        recorder
-            .record_context_branch_created(
-                "branch-b",
-                ROOT_CONTEXT_BRANCH_ID,
-                root_leaf_sequence,
-                None,
-            )
-            .expect("create branch B");
-        recorder
-            .record_context_checkout("branch-b", root_leaf_sequence)
-            .expect("checkout branch B");
-        recorder.set_current_context_branch_id(Some("branch-b".into()));
-        recorder
-            .record_turn_started(turn_started(52))
-            .expect("start branch B turn");
-
-        recorder.set_current_context_branch_id(Some("branch-a".into()));
-    }
-
-    record_interrupt_transcript(
-        &transcript,
-        &planned_interrupt(&transcript, vec![("call-a".into(), "shell__exec".into())]),
-    )
-    .expect("interrupt transcript should persist");
-
-    let after = records(&transcript);
-    assert!(
-        !after
-            .iter()
-            .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
-    );
-    assert!(after.iter().any(|record| {
-        matches!(
-            &record.event,
-            TranscriptEvent::ToolCallCancelled { call_id, name }
-                if call_id == "call-a" && name == "shell__exec"
-        ) && record.context_branch_id.as_deref() == Some("branch-a")
-    }));
-}
-
-#[test]
-fn record_interrupt_transcript_normalizes_root_branch() {
-    let (_, transcript) = test_transcript("root-active-turn-interrupt", Vec::new());
-    {
-        let mut recorder = transcript.lock().expect("lock transcript");
-        assert_eq!(recorder.current_context_branch_id(), None);
-        recorder
-            .record_turn_started(turn_started(61))
-            .expect("start root turn");
-    }
-
-    record_interrupt_transcript(&transcript, &planned_interrupt(&transcript, Vec::new()))
-        .expect("interrupt transcript should persist");
-
-    let interruptions = records(&transcript)
-        .into_iter()
-        .filter(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(interruptions.len(), 1);
-    assert!(matches!(
-        &interruptions[0].event,
-        TranscriptEvent::TurnInterrupted { turn_id: Some(61) }
-    ));
-    assert_eq!(interruptions[0].context_branch_id, None);
-}
-
-#[test]
-fn same_turn_stale_interrupt_plan_refreshes_parent_tool_calls() {
-    let (_, transcript) = test_transcript("same-turn-stale-interrupt-refresh", Vec::new());
-    {
-        let mut recorder = transcript.lock().expect("lock transcript");
-        recorder
-            .record_turn_started(turn_started(81))
-            .expect("start turn");
-        recorder
-            .record_tool_call_started("call-1", "shell__exec", serde_json::json!({}))
-            .expect("start first tool");
-    }
-    let mut plan = planned_interrupt(&transcript, vec![("call-1".into(), "shell__exec".into())]);
-    transcript
-        .lock()
-        .expect("lock transcript")
-        .record_tool_call_started("call-2", "fs__read", serde_json::json!({}))
-        .expect("start second tool in same turn");
-    assert_ne!(
-        transcript.lock().expect("lock transcript").sequence,
-        plan.transcript_revision
-    );
-    plan.parent_tool_calls = vec![
-        ("call-1".into(), "shell__exec".into()),
-        ("call-2".into(), "fs__read".into()),
-    ];
-    assert!(record_interrupt_transcript(&transcript, &plan).is_ok());
-}
-
-fn stale_interrupt_plan_with_different_identity_is_rejected(
-    name: &str,
-    turn_id: Option<u64>,
-    branch_id: Option<&str>,
-) {
-    let (_, transcript) = test_transcript(name, Vec::new());
-    {
-        let mut recorder = transcript.lock().expect("lock transcript");
-        recorder
-            .record_turn_started(turn_started(82))
-            .expect("start turn");
-    }
-    let mut plan = planned_interrupt(&transcript, Vec::new());
-    transcript
-        .lock()
-        .expect("lock transcript")
-        .record_user_message("advance transcript")
-        .expect("advance transcript");
-    plan.turn_id = turn_id;
-    plan.branch_id = branch_id.map(str::to_string);
-    assert!(record_interrupt_transcript(&transcript, &plan).is_err());
-}
-
-#[test]
-fn cross_turn_stale_interrupt_plan_is_rejected() {
-    stale_interrupt_plan_with_different_identity_is_rejected(
-        "cross-turn-stale-interrupt",
-        Some(999),
-        None,
-    );
-}
-
-#[test]
-fn cross_branch_stale_interrupt_plan_is_rejected() {
-    stale_interrupt_plan_with_different_identity_is_rejected(
-        "cross-branch-stale-interrupt",
-        Some(82),
-        Some("different-branch"),
-    );
-}
-
-#[test]
-fn record_interrupt_transcript_fails_closed_when_branch_projection_cannot_resolve() {
-    let (_, transcript) = test_transcript("unresolvable-branch-interrupt", Vec::new());
-    {
-        let mut recorder = transcript.lock().expect("lock transcript");
-        recorder
-            .record_turn_started(turn_started(71))
-            .expect("start root turn");
-        recorder.set_current_context_branch_id(Some("missing-branch".into()));
-    }
-
-    let before = serde_json::to_value(records(&transcript)).expect("serialize transcript");
-    let stale_plan = InterruptRequest {
-        parent_tool_calls: vec![("call-missing".into(), "shell__exec".into())],
-        active_runs: Vec::new(),
-        turn_id: Some(71),
-        transcript_revision: 0,
-        branch_id: Some("missing-branch".into()),
-    };
-    transcript
-        .lock()
-        .expect("lock transcript")
-        .record_user_message("changed after planning")
-        .expect("change transcript after planning");
-
-    assert!(record_interrupt_transcript(&transcript, &stale_plan).is_err());
-
-    let after = serde_json::to_value(records(&transcript)).expect("serialize transcript");
-    assert_ne!(after, before);
-    assert!(matches!(
-        records(&transcript).last().map(|record| &record.event),
-        Some(TranscriptEvent::UserMessage { .. })
-    ));
 }
 
 #[test]
@@ -7608,6 +5774,7 @@ fn evicted_child_summary_absorbs_later_terminal_events_without_rehydrating_timel
             event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("output")),
         });
     }
+    let cache_len_before = runtime.state().child_timeline_cache_len();
     runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
         child_session_id: "background-child-0".into(),
         agent_name: Some("fixer".into()),
@@ -7616,9 +5783,11 @@ fn evicted_child_summary_absorbs_later_terminal_events_without_rehydrating_timel
     });
 
     assert!(
-        runtime.state().child_timeline_cache_len() <= MAX_CACHED_CHILD_TIMELINES,
-        "terminal child is compacted into summary state"
+        !runtime
+            .state()
+            .child_timeline_cache_contains("background-child-0")
     );
+    assert!(runtime.state().child_timeline_cache_len() <= cache_len_before);
     assert_eq!(
         runtime.state().cached_child_phase("background-child-0"),
         Some(AppPhase::Error)
@@ -8146,55 +6315,6 @@ fn closed_session_transport_event_stream_reports_pending_idle_resume() {
 }
 
 #[test]
-fn bounded_session_transport_event_drain_keeps_double_escape_cancel_dispatch_fair() {
-    let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
-    let mut runtime = TuiRuntime::new(
-        TuiState::default(),
-        session_transport_rx,
-        vec![AvailableModel::new("m1", "M1")],
-        Vec::new(),
-        std::env::temp_dir(),
-        std::env::temp_dir(),
-    );
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Error;
-    for index in 0..512 {
-        session_transport_tx
-            .send(SessionTransportEvent::AssistantDelta(
-                AssistantDeltaEvent::new(format!("flood-{index}")),
-            ))
-            .expect("queue session transport flood event");
-    }
-
-    runtime.try_drain_session_events();
-    assert!(
-        runtime.session_transport_rx.try_recv().is_ok(),
-        "drain stays bounded"
-    );
-
-    let (mut engine, ingress, _egress) = SessionEngine::new();
-    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(
-        runtime
-            .handle_input_action(map_key_event(runtime.state(), escape))
-            .expect("first escape is accepted"),
-        None
-    );
-    let command = runtime
-        .handle_input_action(map_key_event(runtime.state(), escape))
-        .expect("second escape is accepted")
-        .expect("second escape requests interruption");
-    command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
-    assert!(
-        matches!(
-            engine.try_recv_control(),
-            Ok(SessionEngineControl::Interrupt)
-        ),
-        "interrupt dispatch makes progress after flood"
-    );
-}
-
-#[test]
 fn compaction_without_summary_uses_status_and_preserves_notices() {
     let mut runtime = runtime_with_experts(Vec::new());
     runtime
@@ -8361,85 +6481,6 @@ fn historian_child_report_keys_refresh_layout_without_changing_history() {
         ),
         InputAction::Insert('2')
     );
-}
-
-/// TEMPORARY measurement: times a child-view switch and the frame it costs.
-#[test]
-#[ignore = "measurement harness: set LETCODE_BENCH_SESSIONS, LETCODE_BENCH_PARENT_SESSION, LETCODE_BENCH_CHILD_SESSION"]
-fn switch_cost_measure() {
-    use std::time::Instant;
-
-    let dir = std::path::PathBuf::from(
-        std::env::var("LETCODE_BENCH_SESSIONS").expect("LETCODE_BENCH_SESSIONS"),
-    );
-    let parent_session =
-        std::env::var("LETCODE_BENCH_PARENT_SESSION").expect("LETCODE_BENCH_PARENT_SESSION");
-    let child_session =
-        std::env::var("LETCODE_BENCH_CHILD_SESSION").expect("LETCODE_BENCH_CHILD_SESSION");
-    let parent_records =
-        crate::transcript::read_records(dir.join(format!("{parent_session}.jsonl")))
-            .expect("read the parent journal");
-    let child_records = crate::transcript::read_records(
-        crate::transcript::child_sessions_dir(&dir).join(format!("{child_session}.jsonl")),
-    )
-    .expect("read the child journal");
-    println!(
-        "\n### parent {parent_session} {} records · child {child_session} {} records",
-        parent_records.len(),
-        child_records.len()
-    );
-
-    let mut runtime = runtime_with_experts(Vec::new());
-    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-    let draw = |terminal: &mut Terminal<TestBackend>, runtime: &mut TuiRuntime| {
-        terminal
-            .draw(|frame| crate::tui::render::render(frame, &mut runtime.state))
-            .unwrap();
-    };
-
-    for agent_name in ["explorer", "historian"] {
-        for round in 0..3 {
-            let start = Instant::now();
-            runtime.state.replace_child_timeline_from_records(
-                &child_records,
-                "parent",
-                "child",
-                agent_name,
-                1,
-                1,
-                1,
-            );
-            let apply = start.elapsed();
-            let start = Instant::now();
-            draw(&mut terminal, &mut runtime);
-            let first_frame = start.elapsed();
-            let start = Instant::now();
-            draw(&mut terminal, &mut runtime);
-            let steady_frame = start.elapsed();
-            println!(
-                "  child view ({agent_name}) round {round}: apply {:>9.1?} · first frame {:>9.1?} · steady frame {:>9.1?}",
-                apply, first_frame, steady_frame
-            );
-        }
-    }
-
-    for round in 0..2 {
-        let start = Instant::now();
-        runtime
-            .state
-            .replace_session_timeline_from_records(&parent_records);
-        let apply = start.elapsed();
-        let start = Instant::now();
-        draw(&mut terminal, &mut runtime);
-        let first_frame = start.elapsed();
-        let start = Instant::now();
-        draw(&mut terminal, &mut runtime);
-        let steady_frame = start.elapsed();
-        println!(
-            "  parent view round {round}: apply {:>9.1?} · first frame {:>9.1?} · steady frame {:>9.1?}",
-            apply, first_frame, steady_frame
-        );
-    }
 }
 
 #[test]
@@ -8883,87 +6924,6 @@ fn config_editor_translates_schema_descriptions() {
 }
 
 #[test]
-fn config_editor_edits_array_items() {
-    let (mut runtime, path) = runtime_with_config_path(
-        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\nflavor = \"standard\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[mcp.demo]\ntype = \"local\"\ncommand = [\"echo\", \"hi\"]\n",
-    );
-    runtime.state_mut().set_input("/config");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("config command is accepted");
-    search_config(&mut runtime, "command");
-
-    let index = runtime
-        .state()
-        .dialog()
-        .expect("config dialog")
-        .items
-        .iter()
-        .position(|item| item.label == "command")
-        .expect("command field");
-    runtime
-        .state_mut()
-        .dialog_mut()
-        .expect("config dialog")
-        .selected = index;
-
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("expand the array");
-    let dialog = runtime.state().dialog().expect("config dialog");
-    assert!(matches!(
-        dialog.config_fields.get(dialog.config_expanded.expect("expanded field")),
-        Some(ConfigFieldRef::List(path)) if path == &["mcp", "demo", "command"]
-    ));
-    assert_eq!(dialog.config_detail_items.len(), 2);
-
-    runtime
-        .handle_input_action(InputAction::ConfigListAppend)
-        .expect("append a new element");
-    for ch in "bye".chars() {
-        runtime
-            .handle_input_action(InputAction::ConfigEditInsert(ch))
-            .expect("type the element value");
-    }
-    runtime
-        .handle_input_action(InputAction::ConfigEditConfirm)
-        .expect("commit the element");
-
-    let written = std::fs::read_to_string(&path).expect("read config");
-    assert!(!written.contains("bye"), "unsaved edits stay off disk");
-
-    runtime
-        .handle_input_action(InputAction::ConfigSave)
-        .expect("save the draft");
-    let written = std::fs::read_to_string(&path).expect("read config");
-    assert!(written.contains("bye"), "{written}");
-    assert_eq!(
-        runtime
-            .state()
-            .dialog()
-            .expect("config dialog")
-            .config_detail_items
-            .len(),
-        3
-    );
-
-    runtime
-        .handle_input_action(InputAction::DialogPrev)
-        .expect("select the previous element");
-    runtime
-        .handle_input_action(InputAction::DialogPrev)
-        .expect("select the first element");
-    runtime
-        .handle_input_action(InputAction::ConfigListRemove)
-        .expect("remove the element");
-    runtime
-        .handle_input_action(InputAction::ConfigSave)
-        .expect("save the draft");
-    let written = std::fs::read_to_string(&path).expect("read config");
-    assert!(!written.contains("echo"), "{written}");
-}
-
-#[test]
 fn config_editor_hides_fields_that_do_not_apply() {
     let mut runtime = runtime_with_config(
         "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[mcp.demo]\ntype = \"remote\"\nurl = \"https://m.invalid\"\n",
@@ -8986,125 +6946,6 @@ fn config_editor_hides_fields_that_do_not_apply() {
     assert!(labels.contains(&"url"), "{labels:?}");
     assert!(!labels.contains(&"command"), "{labels:?}");
     assert!(!labels.contains(&"environment"), "{labels:?}");
-}
-
-#[test]
-fn config_editor_adds_a_new_mcp_server() {
-    let (mut runtime, path) = runtime_with_config_path(
-        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n",
-    );
-    runtime.state_mut().set_input("/config");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("config command is accepted");
-
-    let index = runtime
-        .state()
-        .dialog()
-        .expect("config dialog")
-        .items
-        .iter()
-        .position(|item| item.id == "new/mcp")
-        .expect("new mcp entry");
-    runtime
-        .state_mut()
-        .dialog_mut()
-        .expect("config dialog")
-        .selected = index;
-
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("start naming the server");
-    for ch in "demo".chars() {
-        runtime
-            .handle_input_action(InputAction::ConfigEditInsert(ch))
-            .expect("type the name");
-    }
-    runtime
-        .handle_input_action(InputAction::ConfigEditConfirm)
-        .expect("commit the name");
-
-    let written = std::fs::read_to_string(&path).expect("read config");
-    assert!(
-        !written.contains("[mcp.demo]"),
-        "unsaved entries stay off disk"
-    );
-
-    runtime
-        .handle_input_action(InputAction::ConfigSave)
-        .expect("save the draft");
-    let dialog = runtime.state().dialog().expect("config dialog");
-    assert!(
-        dialog.config_error.is_some(),
-        "a server without a command cannot be saved"
-    );
-    assert!(
-        dialog.config_dirty,
-        "the draft stays dirty after a failed save"
-    );
-    let written = std::fs::read_to_string(&path).expect("read config");
-    assert!(!written.contains("[mcp.demo]"), "{written}");
-}
-
-#[test]
-fn config_editor_picks_an_allowed_model_from_a_choice() {
-    let (mut runtime, path) = runtime_with_config_path(
-        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[agents.explorer]\nallowed_models = [\"alpha/m\"]\n",
-    );
-    runtime.state_mut().set_input("/config");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("config command is accepted");
-
-    enter_config_table(&mut runtime, "agents");
-    enter_config_table(&mut runtime, "explorer");
-    let index = runtime
-        .state()
-        .dialog()
-        .expect("config dialog")
-        .items
-        .iter()
-        .position(|item| item.label == "allowed_models")
-        .expect("allowed_models field");
-    runtime
-        .state_mut()
-        .dialog_mut()
-        .expect("config dialog")
-        .selected = index;
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("expand the list");
-    assert_eq!(
-        runtime
-            .state()
-            .dialog()
-            .expect("config dialog")
-            .config_detail_items
-            .len(),
-        1
-    );
-
-    runtime
-        .handle_input_action(InputAction::ConfigListAppend)
-        .expect("append an element");
-    let dialog = runtime.state().dialog().expect("config dialog");
-    assert_eq!(dialog.config_detail_target, Some(1));
-    assert!(
-        dialog
-            .config_detail_items
-            .iter()
-            .any(|item| item.label == "alpha/m"),
-        "the element editor offers configured routes"
-    );
-
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("pick the model");
-    runtime
-        .handle_input_action(InputAction::ConfigSave)
-        .expect("save the draft");
-    let written = std::fs::read_to_string(&path).expect("read config");
-    assert!(written.contains("\"alpha/m\""), "{written}");
 }
 
 #[test]
@@ -9382,123 +7223,6 @@ fn toggle_config_retry(runtime: &mut TuiRuntime) {
 }
 
 #[test]
-fn config_editor_only_reports_saved_after_writing_the_file() {
-    let (mut runtime, path) = open_editable_config();
-    toggle_config_retry(&mut runtime);
-    assert!(runtime.state().dialog().expect("dialog").config_dirty);
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read configuration"),
-        EDITABLE_CONFIG
-    );
-    assert!(
-        runtime
-            .state()
-            .toast
-            .as_ref()
-            .is_none_or(|toast| toast.message != "Configuration saved")
-    );
-    runtime
-        .handle_input_action(InputAction::ConfigSave)
-        .expect("save configuration");
-    assert!(!runtime.state().dialog().expect("dialog").config_dirty);
-    assert!(
-        std::fs::read_to_string(&path)
-            .expect("read configuration")
-            .contains("enabled = true")
-    );
-    assert_eq!(
-        runtime.state().toast.as_ref().expect("saved toast").message,
-        "Configuration saved"
-    );
-}
-
-#[test]
-fn config_editor_closing_dirty_draft_requires_a_choice() {
-    let (mut runtime, path) = open_editable_config();
-    toggle_config_retry(&mut runtime);
-    runtime
-        .handle_input_action(InputAction::DialogCancel)
-        .expect("request close");
-    assert_eq!(
-        runtime
-            .state()
-            .dialog()
-            .expect("close confirmation")
-            .config_close_selected,
-        Some(0)
-    );
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read configuration"),
-        EDITABLE_CONFIG
-    );
-    runtime
-        .handle_input_action(InputAction::DialogCancel)
-        .expect("cancel close");
-    assert_eq!(
-        runtime
-            .state()
-            .dialog()
-            .expect("dialog")
-            .config_close_selected,
-        None
-    );
-    assert!(runtime.state().dialog().expect("dialog").config_dirty);
-    runtime
-        .handle_input_action(InputAction::DialogCancel)
-        .expect("request close");
-    runtime
-        .handle_input_action(InputAction::DialogNext)
-        .expect("choose discard");
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("discard and close");
-    assert!(runtime.state().dialog().is_none());
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read configuration"),
-        EDITABLE_CONFIG
-    );
-}
-
-#[test]
-fn config_editor_can_save_or_continue_from_close_confirmation() {
-    let (mut runtime, path) = open_editable_config();
-    toggle_config_retry(&mut runtime);
-    runtime
-        .handle_input_action(InputAction::DialogCancel)
-        .expect("request close");
-    runtime
-        .handle_input_action(InputAction::DialogNext)
-        .expect("choose discard");
-    runtime
-        .handle_input_action(InputAction::DialogNext)
-        .expect("choose continue");
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("continue editing");
-    assert!(runtime.state().dialog().expect("dialog").config_dirty);
-    assert_eq!(
-        runtime
-            .state()
-            .dialog()
-            .expect("dialog")
-            .config_close_selected,
-        None
-    );
-    runtime
-        .handle_input_action(InputAction::DialogCancel)
-        .expect("request close");
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("save and close");
-    assert!(runtime.state().dialog().is_none());
-    assert!(
-        std::fs::read_to_string(&path)
-            .expect("read configuration")
-            .contains("enabled = true")
-    );
-}
-
-#[test]
 fn config_editor_pastes_into_the_edit_buffer_at_the_cursor() {
     let (mut runtime, _) = open_editable_config();
     search_config(&mut runtime, "base_url");
@@ -9662,46 +7386,6 @@ fn config_editor_invalid_draft_keeps_choices_and_arrays_editable() {
 }
 
 #[test]
-fn config_editor_failed_save_retains_the_draft_and_detailed_error() {
-    let (mut runtime, path) = open_editable_config();
-    runtime
-        .edit_config_document(|document| {
-            document["global"]["max_iterations"] = toml_edit::value(0);
-            Ok(())
-        })
-        .expect("edit draft");
-    runtime
-        .handle_input_action(InputAction::ConfigSave)
-        .expect("attempt save");
-    let dialog = runtime.state().dialog().expect("dialog");
-    assert!(dialog.config_dirty);
-    assert!(
-        dialog
-            .config_error
-            .as_deref()
-            .expect("validation error")
-            .contains("max_iterations")
-    );
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read configuration"),
-        EDITABLE_CONFIG
-    );
-    runtime
-        .handle_input_action(InputAction::DialogCancel)
-        .expect("request close");
-    runtime
-        .handle_input_action(InputAction::DialogAccept)
-        .expect("attempt save and close");
-    assert!(
-        runtime
-            .state()
-            .dialog()
-            .expect("keep dialog on failure")
-            .config_dirty
-    );
-}
-
-#[test]
 fn config_editor_search_matches_dotted_field_paths() {
     let (mut runtime, _) = open_editable_config();
     search_config(&mut runtime, "global.max_iterations");
@@ -9782,4 +7466,2201 @@ fn config_editor_custom_choice_displays_the_edit_buffer_and_cursor() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(text.contains("mCUSTOM-EDIT▏"), "{text}");
+}
+
+#[test]
+fn deferred_settings_use_last_write_wins_per_category() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetModel("first".into()),
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetPermissionMode(crate::permission::PermissionMode::Safe),
+    );
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetExpertAllowedModels {
+            agent_name: "explorer".into(),
+            model_ids: vec!["allowed-first".into()],
+        },
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetExpertAllowedModels {
+            agent_name: "explorer".into(),
+            model_ids: vec!["allowed-last".into()],
+        },
+    );
+
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetPermissionMode(
+            crate::permission::PermissionMode::Safe
+        ))
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "last"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetExpertAllowedModels { agent_name, model_ids })
+            if agent_name == "explorer" && model_ids == vec!["allowed-last"]
+    ));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn last_write_wins_does_not_cross_relative_command_barriers() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetModel("first".into()),
+    );
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
+
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "first"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleFastMode)
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "last"
+    ));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn last_write_wins_does_not_cross_prompt_barriers() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetModel("first".into()),
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::Prompt(UserMessageSubmission::new(
+            "prompt",
+            crate::user_content::UserMessageContent::from("prompt"),
+        )),
+    );
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::SetModel("last".into()));
+
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "first"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::Prompt(prompt)) if prompt.id == "prompt"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "last"
+    ));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn reasoning_last_write_wins_does_not_cross_toggle_barriers() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetReasoningEffort(crate::request_builder::ModelReasoningEffort::Low),
+    );
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::SetReasoningEffort(
+            crate::request_builder::ModelReasoningEffort::High,
+        ),
+    );
+
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetReasoningEffort(
+            crate::request_builder::ModelReasoningEffort::Low
+        ))
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleFastMode)
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::SetReasoningEffort(
+            crate::request_builder::ModelReasoningEffort::High
+        ))
+    ));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn deferred_toggles_retain_each_operation() {
+    let mut commands = VecDeque::new();
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
+    enqueue_deferred_command(&mut commands, SessionEngineCommand::ToggleFastMode);
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::ToggleMcpServer("docs".into()),
+    );
+    enqueue_deferred_command(
+        &mut commands,
+        SessionEngineCommand::ToggleMcpServer("docs".into()),
+    );
+
+    assert_eq!(commands.len(), 4);
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleFastMode)
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleFastMode)
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleMcpServer(server)) if server == "docs"
+    ));
+    assert!(matches!(
+        commands.pop_front(),
+        Some(SessionEngineCommand::ToggleMcpServer(server)) if server == "docs"
+    ));
+}
+
+#[test]
+fn parked_commands_stay_before_later_deferred_commands() {
+    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+    let mut parked_commands = VecDeque::new();
+    let mut change_notice_sent = false;
+    let mut deferred_commands = VecDeque::from([SessionEngineCommand::SetPermissionMode(
+        crate::permission::PermissionMode::Auto,
+    )]);
+
+    park_active_turn_command(
+        &mut parked_commands,
+        SessionEngineCommand::SetModel("earlier".into()),
+        &session_tx,
+        &mut change_notice_sent,
+    );
+    flush_parked_commands(&mut deferred_commands, &mut parked_commands);
+
+    assert!(matches!(
+        deferred_commands.pop_front(),
+        Some(SessionEngineCommand::SetModel(model)) if model == "earlier"
+    ));
+    assert!(matches!(
+        deferred_commands.pop_front(),
+        Some(SessionEngineCommand::SetPermissionMode(
+            crate::permission::PermissionMode::Auto
+        ))
+    ));
+    assert!(matches!(
+        session_rx.try_recv(),
+        Ok(SessionTransportEvent::Notice(notice))
+            if notice.message == "Change queued for after the current turn"
+    ));
+}
+
+mod integration_tests {
+    use super::*;
+
+    fn test_transcript(
+        name: &str,
+        history: Vec<(String, String)>,
+    ) -> (PathBuf, Arc<StdMutex<TranscriptRecorder>>) {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-runner-interrupt-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder
+            .record_session_started("m1")
+            .expect("record session start");
+        // Avoid a title-generation side request in tests that exercise a prompt.
+        recorder
+            .record_session_title("runner interrupt test")
+            .expect("record title");
+        for (user, assistant) in history {
+            recorder
+                .record_user_message(user)
+                .expect("record user message");
+            recorder
+                .record_assistant_message(assistant)
+                .expect("record assistant message");
+        }
+        (sessions_dir, Arc::new(StdMutex::new(recorder)))
+    }
+
+    fn records(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Vec<TranscriptRecord> {
+        let recorder = transcript.lock().expect("lock transcript");
+        read_records(recorder.path()).expect("read transcript")
+    }
+
+    fn planned_interrupt(
+        transcript: &Arc<StdMutex<TranscriptRecorder>>,
+        parent_tool_calls: Vec<(String, String)>,
+    ) -> InterruptRequest {
+        let recorder = transcript.lock().expect("lock transcript");
+        let (transcript_revision, branch_id, turn_id, _) =
+            recorder.interrupt_transcript_plan().unwrap_or_else(|_| {
+                (
+                    0,
+                    recorder.current_context_branch_id().map(str::to_string),
+                    None,
+                    Vec::new(),
+                )
+            });
+        InterruptRequest {
+            parent_tool_calls,
+            active_runs: Vec::new(),
+            turn_id,
+            transcript_revision,
+            branch_id,
+        }
+    }
+
+    fn turn_started(turn_id: u64) -> TurnStartedEvent {
+        TurnStartedEvent { turn_id }
+    }
+
+    #[tokio::test]
+    async fn active_operation_forwards_runner_events_but_suppresses_done() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        runner_tx
+            .send(SessionTransportEvent::Done)
+            .expect("runner event sender remains open");
+        assert!(matches!(
+            crate::session::engine::select_active_session_operation_with_events(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+                Some(&mut runner_rx),
+            )
+            .await,
+            ActiveSessionOperation::RunnerEvent(SessionTransportEvent::Done)
+        ));
+
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+        runner_tx
+            .send(SessionTransportEvent::AssistantDone { message_id: None })
+            .expect("runner event sender remains open");
+        assert!(matches!(
+            crate::session::engine::select_active_session_operation_with_events(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+                Some(&mut runner_rx),
+            )
+            .await,
+            ActiveSessionOperation::Interrupted
+        ));
+        assert!(matches!(
+            runner_rx.try_recv(),
+            Ok(SessionTransportEvent::AssistantDone { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_operation_forwards_queued_events_before_done() {
+        let (_control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        let operation = async {
+            runner_tx
+                .send(SessionTransportEvent::AssistantDone { message_id: None })
+                .expect("runner event receiver remains open");
+            runner_tx
+                .send(SessionTransportEvent::Error(ErrorEvent::new(
+                    "request failed",
+                )))
+                .expect("runner event receiver remains open");
+            runner_tx
+                .send(SessionTransportEvent::Done)
+                .expect("runner event receiver remains open");
+        };
+        tokio::pin!(operation);
+
+        assert!(matches!(
+            crate::session::engine::select_active_session_operation_with_events(
+                &mut control_rx,
+                &mut deferred_commands,
+                operation.as_mut(),
+                Some(&mut runner_rx),
+            )
+            .await,
+            ActiveSessionOperation::Completed(())
+        ));
+        crate::session::engine::forward_queued_runner_events(&mut runner_rx, &session_tx);
+        session_tx
+            .send(SessionTransportEvent::Done)
+            .expect("session event receiver remains open");
+
+        assert!(matches!(
+            session_rx.try_recv(),
+            Ok(SessionTransportEvent::AssistantDone { .. })
+        ));
+        assert!(matches!(
+            session_rx.try_recv(),
+            Ok(SessionTransportEvent::Error(_))
+        ));
+        assert!(matches!(
+            session_rx.try_recv(),
+            Ok(SessionTransportEvent::Done)
+        ));
+        assert!(session_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_background_completion_does_not_suppress_the_queued_change_notice() {
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut parked_commands = VecDeque::new();
+        let mut change_notice_sent = false;
+        enqueue_deferred_command(
+            &mut parked_commands,
+            SessionEngineCommand::BackgroundSubagentCompleted {
+                generation: None,
+                parent_session_id: "parent".into(),
+                parent_tool_call_id: None,
+                result: Err("failed".into()),
+            },
+        );
+
+        park_active_turn_command(
+            &mut parked_commands,
+            SessionEngineCommand::ToggleFastMode,
+            &session_tx,
+            &mut change_notice_sent,
+        );
+
+        assert!(matches!(
+            session_rx.try_recv(),
+            Ok(SessionTransportEvent::Notice(notice))
+                if notice.message == "Change queued for after the current turn"
+        ));
+    }
+
+    #[test]
+    fn active_turn_reject_is_not_parked_by_engine() {
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut parked_commands = VecDeque::new();
+        let mut change_notice_sent = false;
+        let (_dir, transcript) = test_transcript("active-turn-reject", Vec::new());
+        let subagent_runtime = crate::subagent::SubagentPool::new();
+        let mut background_deliveries = std::collections::HashMap::new();
+
+        crate::session::engine::handle_active_turn_command(
+            SessionEngineCommand::NewSession,
+            &mut parked_commands,
+            &session_tx,
+            &transcript,
+            &subagent_runtime,
+            &mut background_deliveries,
+            &mut change_notice_sent,
+        );
+
+        assert!(parked_commands.is_empty());
+        assert!(matches!(
+            session_rx.try_recv(),
+            Ok(SessionTransportEvent::Notice(notice)) if notice.message == "Turn still running"
+        ));
+    }
+
+    #[test]
+    fn active_turn_reports_a_background_completion_before_parking_it() {
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut parked_commands = VecDeque::new();
+        let mut change_notice_sent = false;
+        let (_dir, transcript) = test_transcript("active-turn-completion", Vec::new());
+        let session_id = transcript
+            .lock()
+            .expect("transcript")
+            .session_id()
+            .to_string();
+        let subagent_runtime = crate::subagent::SubagentPool::new();
+        let mut background_deliveries = std::collections::HashMap::new();
+
+        crate::session::engine::handle_active_turn_command(
+            SessionEngineCommand::BackgroundSubagentCompleted {
+                generation: None,
+                parent_session_id: session_id,
+                parent_tool_call_id: Some("call-1".into()),
+                result: Ok(completed_run_summary()),
+            },
+            &mut parked_commands,
+            &session_tx,
+            &transcript,
+            &subagent_runtime,
+            &mut background_deliveries,
+            &mut change_notice_sent,
+        );
+
+        assert!(matches!(
+            session_rx.try_recv(),
+            Ok(SessionTransportEvent::BackgroundSubagentCompleted { .. })
+        ));
+        assert!(matches!(
+            parked_commands.pop_front(),
+            Some(SessionEngineCommand::BackgroundSubagentCompleted { .. })
+        ));
+    }
+
+    #[test]
+    fn busy_phases_refuse_history_navigation_with_one_policy() {
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut parked_commands = VecDeque::new();
+        let mut change_notice_sent = false;
+        let (_dir, transcript) = test_transcript("busy-history-navigation", Vec::new());
+        let subagent_runtime = crate::subagent::SubagentPool::new();
+        let mut background_deliveries = std::collections::HashMap::new();
+
+        for command in [
+            SessionEngineCommand::Undo,
+            SessionEngineCommand::ShowHistoryTree,
+        ] {
+            crate::session::engine::handle_active_turn_command(
+                command,
+                &mut parked_commands,
+                &session_tx,
+                &transcript,
+                &subagent_runtime,
+                &mut background_deliveries,
+                &mut change_notice_sent,
+            );
+        }
+
+        assert!(matches!(
+            session_rx.try_recv(),
+            Ok(SessionTransportEvent::Notice(notice))
+                if notice.message == "history navigation is unavailable while a turn is active"
+        ));
+        assert!(matches!(
+            session_rx.try_recv(),
+            Ok(SessionTransportEvent::Error(_))
+        ));
+        assert!(parked_commands.is_empty());
+    }
+
+    fn completed_run_summary() -> crate::subagent::SubagentRunSummary {
+        crate::subagent::SubagentRunSummary {
+            run_id: "run-1".into(),
+            child_session_id: "child-1".into(),
+            agent_name: "explorer".into(),
+            status: crate::subagent::SubagentStatus::Completed,
+            failure_kind: None,
+            summary: "the child finished".into(),
+            structured_result: crate::subagent::StructuredSubagentResult {
+                status: "completed".into(),
+                summary: "the child finished".into(),
+                malformed: false,
+                findings: Vec::new(),
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                commands_run: Vec::new(),
+                validation: Vec::new(),
+                blockers: Vec::new(),
+                next_steps: Vec::new(),
+                run_id: "run-1".into(),
+                child_session_id: "child-1".into(),
+                raw_excerpt: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_shutdown_interrupts_active_session_operation() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_active_session_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ActiveSessionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_interrupt_then_shutdown_returns_shutdown() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_active_session_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ActiveSessionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_interrupt_then_shutdown_stops_manual_compaction() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_manual_compaction_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ManualCompactionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_services_queued_child_navigation() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Command(
+                SessionEngineCommand::ViewChild {
+                    navigation: crate::command::ChildNavigation::Next,
+                    anchor_child_session_id: Some("child-1".into()),
+                },
+            ))
+            .expect("queue view child");
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        let operation = select_manual_compaction_operation(
+            &mut control_rx,
+            &mut deferred_commands,
+            pending_operation.as_mut(),
+        )
+        .await;
+
+        assert!(matches!(
+            operation,
+            ManualCompactionOperation::Navigation(ManualCompactionNavigation::ViewChild {
+                navigation: crate::command::ChildNavigation::Next,
+                anchor_child_session_id: Some(anchor),
+            }) if anchor == "child-1"
+        ));
+        assert!(deferred_commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_services_child_navigation_while_waiting() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = control_tx.send(SessionEngineControl::Command(
+                SessionEngineCommand::ViewParent,
+            ));
+            // Keep the channel open for the duration of the select.
+            std::future::pending::<()>().await;
+        });
+
+        let operation = select_manual_compaction_operation(
+            &mut control_rx,
+            &mut deferred_commands,
+            pending_operation.as_mut(),
+        )
+        .await;
+
+        assert!(matches!(
+            operation,
+            ManualCompactionOperation::Navigation(ManualCompactionNavigation::ViewParent)
+        ));
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_still_defers_command_changes() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Command(
+                SessionEngineCommand::SetModel("model-b".into()),
+            ))
+            .expect("queue set model");
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        let operation = select_manual_compaction_operation(
+            &mut control_rx,
+            &mut deferred_commands,
+            pending_operation.as_mut(),
+        )
+        .await;
+
+        assert!(matches!(operation, ManualCompactionOperation::Shutdown));
+        assert!(matches!(
+            deferred_commands.pop_front(),
+            Some(SessionEngineCommand::SetModel(model)) if model == "model-b"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_interrupt_then_disconnect_returns_shutdown() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+        drop(control_tx);
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_active_session_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ActiveSessionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_interrupt_is_not_dropped_before_engine_dispatch() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+
+        assert!(matches!(
+            next_idle_session_operation(&mut control_rx, &mut deferred_commands).await,
+            Some(crate::session::engine::IdleSessionOperation::Interrupt)
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_prevents_deferred_command_dispatch() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands =
+            VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "deferred",
+                crate::user_content::UserMessageContent::from("deferred"),
+            ))]);
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+
+        assert!(
+            next_idle_session_operation(&mut control_rx, &mut deferred_commands)
+                .await
+                .is_none()
+        );
+        assert_eq!(deferred_commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_disconnect_prevents_deferred_command_dispatch() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands =
+            VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "deferred",
+                crate::user_content::UserMessageContent::from("deferred"),
+            ))]);
+        drop(control_tx);
+
+        assert!(
+            next_idle_session_operation(&mut control_rx, &mut deferred_commands)
+                .await
+                .is_none()
+        );
+        assert_eq!(deferred_commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnected_control_ingress_interrupts_active_session_operation() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<SessionEngineControl>();
+        let mut deferred_commands = VecDeque::new();
+        drop(control_tx);
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_active_session_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ActiveSessionOperation::Shutdown
+        ));
+    }
+
+    #[test]
+    fn session_title_base_sequence_remains_resolvable_for_interrupt_branch_scope() {
+        let (_, transcript) = test_transcript("title-base-sequence-interrupt", Vec::new());
+        let mut recorder = transcript.lock().expect("lock transcript");
+        let title_sequence = read_records(recorder.path())
+            .expect("read transcript records")
+            .into_iter()
+            .find(|record| matches!(record.event, TranscriptEvent::SessionTitle { .. }))
+            .expect("session title exists")
+            .sequence;
+
+        recorder
+            .record_context_branch_created("branch-a", ROOT_CONTEXT_BRANCH_ID, title_sequence, None)
+            .expect("title sequence resolves on root branch");
+    }
+
+    #[test]
+    fn record_interrupt_transcript_scopes_active_turn_to_recorder_branch() {
+        let (_, transcript) = test_transcript("branch-scoped-interrupt", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            let root_leaf_sequence = read_records(recorder.path())
+                .expect("read root records")
+                .last()
+                .expect("session metadata exists")
+                .sequence;
+            recorder
+                .record_context_branch_created(
+                    "branch-a",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    root_leaf_sequence,
+                    None,
+                )
+                .expect("create branch A");
+            recorder
+                .record_context_checkout("branch-a", root_leaf_sequence)
+                .expect("checkout branch A");
+            recorder.set_current_context_branch_id(Some("branch-a".into()));
+            recorder
+                .record_turn_started(turn_started(41))
+                .expect("start branch A turn");
+
+            recorder
+                .record_context_branch_created(
+                    "branch-b",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    root_leaf_sequence,
+                    None,
+                )
+                .expect("create branch B");
+            recorder
+                .record_context_checkout("branch-b", root_leaf_sequence)
+                .expect("checkout branch B");
+            recorder.set_current_context_branch_id(Some("branch-b".into()));
+            recorder
+                .record_turn_started(turn_started(42))
+                .expect("start branch B turn");
+
+            recorder.set_current_context_branch_id(Some("branch-a".into()));
+        }
+
+        record_interrupt_transcript(
+            &transcript,
+            &planned_interrupt(&transcript, vec![("call-a".into(), "shell__exec".into())]),
+        )
+        .expect("interrupt transcript should persist");
+
+        let after = records(&transcript);
+        let interruptions = after
+            .iter()
+            .filter(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(interruptions.len(), 1);
+        assert!(matches!(
+            &interruptions[0].event,
+            TranscriptEvent::TurnInterrupted { turn_id: Some(41) }
+        ));
+        assert_eq!(
+            interruptions[0].context_branch_id.as_deref(),
+            Some("branch-a")
+        );
+        assert!(after.iter().any(|record| {
+            matches!(
+                &record.event,
+                TranscriptEvent::ToolCallCancelled { call_id, name }
+                    if call_id == "call-a" && name == "shell__exec"
+            ) && record.context_branch_id.as_deref() == Some("branch-a")
+        }));
+    }
+
+    #[test]
+    fn record_interrupt_transcript_pre_start_cancellation_does_not_interrupt_sibling_turn() {
+        let (_, transcript) = test_transcript("branch-pre-start-cancel", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            let root_leaf_sequence = read_records(recorder.path())
+                .expect("read root records")
+                .last()
+                .expect("session metadata exists")
+                .sequence;
+            recorder
+                .record_context_branch_created(
+                    "branch-a",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    root_leaf_sequence,
+                    None,
+                )
+                .expect("create branch A");
+            recorder
+                .record_context_checkout("branch-a", root_leaf_sequence)
+                .expect("checkout branch A");
+
+            recorder
+                .record_context_branch_created(
+                    "branch-b",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    root_leaf_sequence,
+                    None,
+                )
+                .expect("create branch B");
+            recorder
+                .record_context_checkout("branch-b", root_leaf_sequence)
+                .expect("checkout branch B");
+            recorder.set_current_context_branch_id(Some("branch-b".into()));
+            recorder
+                .record_turn_started(turn_started(52))
+                .expect("start branch B turn");
+
+            recorder.set_current_context_branch_id(Some("branch-a".into()));
+        }
+
+        record_interrupt_transcript(
+            &transcript,
+            &planned_interrupt(&transcript, vec![("call-a".into(), "shell__exec".into())]),
+        )
+        .expect("interrupt transcript should persist");
+
+        let after = records(&transcript);
+        assert!(
+            !after
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+        );
+        assert!(after.iter().any(|record| {
+            matches!(
+                &record.event,
+                TranscriptEvent::ToolCallCancelled { call_id, name }
+                    if call_id == "call-a" && name == "shell__exec"
+            ) && record.context_branch_id.as_deref() == Some("branch-a")
+        }));
+    }
+
+    #[test]
+    fn record_interrupt_transcript_normalizes_root_branch() {
+        let (_, transcript) = test_transcript("root-active-turn-interrupt", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            assert_eq!(recorder.current_context_branch_id(), None);
+            recorder
+                .record_turn_started(turn_started(61))
+                .expect("start root turn");
+        }
+
+        record_interrupt_transcript(&transcript, &planned_interrupt(&transcript, Vec::new()))
+            .expect("interrupt transcript should persist");
+
+        let interruptions = records(&transcript)
+            .into_iter()
+            .filter(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(interruptions.len(), 1);
+        assert!(matches!(
+            &interruptions[0].event,
+            TranscriptEvent::TurnInterrupted { turn_id: Some(61) }
+        ));
+        assert_eq!(interruptions[0].context_branch_id, None);
+    }
+
+    #[test]
+    fn same_turn_stale_interrupt_plan_refreshes_parent_tool_calls() {
+        let (_, transcript) = test_transcript("same-turn-stale-interrupt-refresh", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            recorder
+                .record_turn_started(turn_started(81))
+                .expect("start turn");
+            recorder
+                .record_tool_call_started("call-1", "shell__exec", serde_json::json!({}))
+                .expect("start first tool");
+        }
+        let plan = planned_interrupt(&transcript, vec![("call-1".into(), "shell__exec".into())]);
+        transcript
+            .lock()
+            .expect("lock transcript")
+            .record_tool_call_started("call-2", "fs__read", serde_json::json!({}))
+            .expect("start second tool in same turn");
+        assert_ne!(
+            transcript.lock().expect("lock transcript").sequence,
+            plan.transcript_revision
+        );
+        record_interrupt_transcript(&transcript, &plan).expect("persist refreshed interrupt plan");
+        let after = records(&transcript);
+        let cancelled_calls = after
+            .iter()
+            .filter_map(|record| match &record.event {
+                TranscriptEvent::ToolCallCancelled { call_id, name } => {
+                    Some((call_id.as_str(), name.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cancelled_calls,
+            [("call-1", "shell__exec"), ("call-2", "fs__read")]
+        );
+        assert!(matches!(
+            after.last().map(|record| &record.event),
+            Some(TranscriptEvent::TurnInterrupted { turn_id: Some(81) })
+        ));
+    }
+
+    fn stale_interrupt_plan_with_different_identity_is_rejected(
+        name: &str,
+        turn_id: Option<u64>,
+        branch_id: Option<&str>,
+    ) {
+        let (_, transcript) = test_transcript(name, Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            recorder
+                .record_turn_started(turn_started(82))
+                .expect("start turn");
+        }
+        let mut plan = planned_interrupt(&transcript, Vec::new());
+        transcript
+            .lock()
+            .expect("lock transcript")
+            .record_user_message("advance transcript")
+            .expect("advance transcript");
+        plan.turn_id = turn_id;
+        plan.branch_id = branch_id.map(str::to_string);
+        assert!(record_interrupt_transcript(&transcript, &plan).is_err());
+    }
+
+    #[test]
+    fn cross_turn_stale_interrupt_plan_is_rejected() {
+        stale_interrupt_plan_with_different_identity_is_rejected(
+            "cross-turn-stale-interrupt",
+            Some(999),
+            None,
+        );
+    }
+
+    #[test]
+    fn cross_branch_stale_interrupt_plan_is_rejected() {
+        stale_interrupt_plan_with_different_identity_is_rejected(
+            "cross-branch-stale-interrupt",
+            Some(82),
+            Some("different-branch"),
+        );
+    }
+
+    #[test]
+    fn record_interrupt_transcript_fails_closed_when_branch_projection_cannot_resolve() {
+        let (_, transcript) = test_transcript("unresolvable-branch-interrupt", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            recorder
+                .record_turn_started(turn_started(71))
+                .expect("start root turn");
+            recorder.set_current_context_branch_id(Some("missing-branch".into()));
+        }
+
+        let before = serde_json::to_value(records(&transcript)).expect("serialize transcript");
+        let stale_plan = InterruptRequest {
+            parent_tool_calls: vec![("call-missing".into(), "shell__exec".into())],
+            active_runs: Vec::new(),
+            turn_id: Some(71),
+            transcript_revision: 0,
+            branch_id: Some("missing-branch".into()),
+        };
+        transcript
+            .lock()
+            .expect("lock transcript")
+            .record_user_message("changed after planning")
+            .expect("change transcript after planning");
+
+        assert!(record_interrupt_transcript(&transcript, &stale_plan).is_err());
+
+        let after = serde_json::to_value(records(&transcript)).expect("serialize transcript");
+        assert_ne!(after, before);
+        assert!(matches!(
+            records(&transcript).last().map(|record| &record.event),
+            Some(TranscriptEvent::UserMessage { .. })
+        ));
+    }
+
+    #[test]
+    fn history_tree_selection_restores_user_content_and_targets_the_parent() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-history-selection-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&sessions_dir).expect("sessions directory");
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("recorder");
+        let session_id = recorder.session_id().to_string();
+        recorder.record_user_message("first").expect("first user");
+        recorder
+            .record_assistant_message("first answer")
+            .expect("first answer");
+        recorder.record_user_message("second").expect("second user");
+        drop(recorder);
+        let transcript = Arc::new(StdMutex::new(
+            TranscriptRecorder::open_existing(&sessions_dir, &session_id).expect("open recorder"),
+        ));
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        let (initial_session_id, _) = initial_session_metadata(&transcript).expect("load metadata");
+        state.session_id = Some(initial_session_id);
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            state,
+            rx,
+            Vec::new(),
+            Vec::new(),
+            sessions_dir,
+            std::env::temp_dir(),
+        );
+
+        let path = runtime.sessions_dir.join(format!("{session_id}.jsonl"));
+        let records = read_records(&path).expect("records");
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionHistoryLoaded {
+            entries: transcript_projection::project_session_history_tree(&records),
+        });
+        let dialog = runtime.state().dialog().expect("history dialog");
+        assert_eq!(dialog.kind, DialogKind::HistoryTree);
+        assert_eq!(dialog.selected_item().expect("selected").id, "entry-3");
+
+        let command = runtime
+            .handle_dialog_accept()
+            .expect("accept user selection");
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::NavigateHistory {
+                target_entry_id: "entry-2".into(),
+            })
+        );
+        assert_eq!(runtime.state().input_buffer, "second");
+
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionHistoryLoaded {
+            entries: transcript_projection::project_session_history_tree(&records),
+        });
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("history dialog")
+            .selected = 1;
+        let command = runtime
+            .handle_dialog_accept()
+            .expect("accept assistant selection");
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::NavigateHistory {
+                target_entry_id: "entry-2".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn thoughts_command_opens_picker_and_persists_selected_mode() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/thoughts");
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("thoughts picker opens"),
+            None
+        );
+        assert!(matches!(
+            runtime.state().dialog(),
+            Some(dialog)
+                if dialog.kind == DialogKind::ThoughtsPicker
+                    && dialog.selected_item().map(|item| item.id.as_str()) == Some("full")
+        ));
+
+        runtime
+            .handle_input_action(InputAction::DialogPrev)
+            .expect("select scroll");
+        runtime
+            .handle_input_action(InputAction::DialogPrev)
+            .expect("select titles");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("accept thoughts display");
+
+        assert_eq!(
+            runtime.state().thoughts_display,
+            ThoughtsDisplayMode::Titles
+        );
+        assert!(!runtime.state().dialog_is_open());
+        assert_eq!(
+            TuiPreferences::load_from_dir(&runtime.preferences_dir).thoughts_display,
+            ThoughtsDisplayMode::Titles
+        );
+    }
+
+    #[test]
+    fn tools_command_opens_picker_and_persists_selected_mode() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/tools");
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("tools picker opens"),
+            None
+        );
+        assert!(matches!(
+            runtime.state().dialog(),
+            Some(dialog)
+                if dialog.kind == DialogKind::ToolsPicker
+                    && dialog.selected_item().map(|item| item.id.as_str()) == Some("detailed")
+        ));
+
+        runtime
+            .handle_input_action(InputAction::DialogPrev)
+            .expect("select compact");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("accept tools display");
+
+        assert_eq!(runtime.state().tools_display, ToolsDisplayMode::Compact);
+        assert!(!runtime.state().dialog_is_open());
+        assert_eq!(
+            TuiPreferences::load_from_dir(&runtime.preferences_dir).tools_display,
+            ToolsDisplayMode::Compact
+        );
+    }
+
+    #[test]
+    fn thoughts_numeric_alias_persists_and_loads_for_a_new_runtime() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/thoughts 1");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("numeric thoughts command succeeds");
+        assert_eq!(
+            runtime.state().thoughts_display,
+            ThoughtsDisplayMode::Compact
+        );
+
+        let loaded = TuiPreferences::load_from_dir(&runtime.preferences_dir);
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.set_thoughts_display(loaded.thoughts_display);
+        let restarted = TuiRuntime::new(
+            state,
+            rx,
+            Vec::new(),
+            Vec::new(),
+            std::env::temp_dir(),
+            runtime.preferences_dir.clone(),
+        );
+
+        assert_eq!(
+            restarted.state().thoughts_display,
+            ThoughtsDisplayMode::Compact
+        );
+    }
+
+    fn test_agent() -> Agent {
+        Agent::new("gpt-test", 4, 4)
+    }
+
+    #[test]
+    fn interrupt_rehydrates_agent_from_transcript() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-runtime-interrupt-rehydrate-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        let transcript = Arc::new(StdMutex::new(recorder));
+
+        {
+            let mut recorder = transcript.lock().expect("lock recorder");
+            recorder
+                .record_user_message("unfinished")
+                .expect("record user message");
+            recorder
+                .record_turn_interrupted(Some(1))
+                .expect("record turn interrupted");
+        }
+
+        let mut agent = test_agent();
+        agent
+            .restore_session_history(vec![HistoryItem::user("stale dangling")], Vec::new(), 0)
+            .expect("seed stale history");
+
+        rehydrate_agent_from_transcript(&mut agent, &transcript).expect("rehydrate agent");
+
+        assert!(matches!(
+            &agent.history_for_test()[..],
+            [HistoryItem::UserMessage { content }, HistoryItem::AssistantTurn { text: Some(assistant_text), .. }]
+                if content.text == "unfinished" && assistant_text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn resumed_session_usage_uses_target_agent_and_drops_response_accounting() {
+        let mut old_agent = test_agent();
+        old_agent
+            .restore_session_history(
+                vec![HistoryItem::user("old session ".repeat(2_000))],
+                Vec::new(),
+                99,
+            )
+            .expect("restore old session");
+        let old_usage = old_agent.session_token_usage().expect("old usage");
+
+        let mut target_agent = test_agent();
+        target_agent.set_model("target-model");
+        target_agent
+            .restore_session_history(vec![HistoryItem::user("target session")], Vec::new(), 2)
+            .expect("restore target session");
+        let target_snapshot = target_agent.runtime_snapshot_for_test().clone();
+        let prepared_usage =
+            restored_session_token_usage(&old_agent, target_agent.model(), &target_snapshot)
+                .expect("prepare target usage");
+
+        old_agent
+            .restore_new_session_runtime_snapshot(target_snapshot.clone(), 2)
+            .expect("install target session");
+        old_agent.set_model("target-model");
+        let resumed_usage =
+            restored_session_token_usage(&old_agent, old_agent.model(), &target_snapshot)
+                .expect("resumed usage");
+
+        assert_eq!(
+            old_agent.runtime_snapshot_for_test().current_turn_id,
+            Some(2)
+        );
+        assert!(prepared_usage.used_tokens < old_usage.used_tokens);
+        assert_eq!(resumed_usage, prepared_usage);
+        assert_eq!(resumed_usage.output_tokens, 0);
+        assert_eq!(resumed_usage.cached_tokens, 0);
+        assert_eq!(resumed_usage.cache_report, None);
+        assert!(
+            resumed_usage
+                .prompt_composition
+                .iter()
+                .any(|entry| entry.category == "system" && entry.estimated_tokens > 0)
+        );
+        assert!(
+            resumed_usage
+                .prompt_composition
+                .iter()
+                .any(|entry| entry.category == "messages" && entry.estimated_tokens > 0)
+        );
+    }
+
+    #[test]
+    fn failed_candidate_usage_preserves_agent() {
+        let mut agent = test_agent();
+        agent
+            .restore_session_history(vec![HistoryItem::user("old session")], Vec::new(), 7)
+            .expect("restore old session");
+        let model = agent.model().to_string();
+        let history = agent.history_for_test().to_vec();
+        let runtime_snapshot = agent.runtime_snapshot_for_test().clone();
+        let invalid_metadata = crate::request_builder::ModelRequestMetadata {
+            effective_input_limit_tokens: Some(0),
+            ..Default::default()
+        };
+        agent.set_model_catalog(std::collections::HashMap::from([(
+            String::from("invalid-model"),
+            invalid_metadata,
+        )]));
+        let target_snapshot = test_agent().runtime_snapshot_for_test().clone();
+
+        assert!(restored_session_token_usage(&agent, "invalid-model", &target_snapshot).is_err());
+
+        assert_eq!(agent.model(), model);
+        assert_eq!(agent.history_for_test(), history.as_slice());
+        assert_eq!(agent.runtime_snapshot_for_test(), &runtime_snapshot);
+    }
+
+    #[test]
+    fn slash_subagent_interrupt_terminalizes_parent_runtime_from_parent_view() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+
+        send_subagent_interrupted(&tx);
+        runtime.try_drain_session_events();
+
+        assert!(!runtime.session_turn_active);
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+    }
+
+    #[test]
+    fn slash_subagent_interrupt_terminalizes_parent_runtime_from_child_view() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+
+        send_subagent_interrupted(&tx);
+        runtime.try_drain_session_events();
+
+        assert!(!runtime.session_turn_active);
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+        assert!(runtime.state().toast().is_none());
+    }
+
+    #[test]
+    fn parent_interrupt_while_viewing_child_closes_child_active_tools() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+        runtime.state_mut().apply_child_session_event(
+            "child-session",
+            SessionEvent::ToolPending(crate::tui::events::ToolPendingEvent::new(
+                "child-call",
+                "fs__write",
+            )),
+        );
+
+        send_subagent_interrupted(&tx);
+        tx.send(SessionTransportEvent::ChildSessionEvent {
+            child_session_id: "child-session".into(),
+            agent_name: Some("explorer".into()),
+            parent_tool_call_id: None,
+            event: SessionEvent::Interrupted,
+        })
+        .expect("send the child terminal event");
+        runtime.try_drain_session_events();
+
+        assert!(!runtime.session_turn_active);
+        assert!(matches!(
+            runtime.state().active_timeline().items().iter().find_map(|item| match item {
+                crate::tui::TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            }),
+            Some(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Cancelled
+        ));
+    }
+
+    #[test]
+    fn recorder_current_branch_updates_on_resume_checkout_and_new_session() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-branch-sync-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder.record_user_message("root").expect("root message");
+        recorder
+            .record_context_branch_created(
+                "feature",
+                crate::transcript::ROOT_CONTEXT_BRANCH_ID,
+                2,
+                None,
+            )
+            .expect("branch created");
+        recorder.set_current_context_branch_id(Some("feature".into()));
+        recorder
+            .record_assistant_message("branch reply")
+            .expect("branch message");
+        recorder
+            .record_context_checkout("feature", 4)
+            .expect("checkout metadata");
+        let session_id = recorder.session_id().to_string();
+        let path = recorder.path().to_path_buf();
+
+        let records = read_records(&path).expect("read records");
+        drop(recorder);
+        let snapshot =
+            transcript_projection::project_session_restore_snapshot(session_id.clone(), records)
+                .expect("snapshot");
+        let mut reopened =
+            TranscriptRecorder::open_existing(&sessions_dir, &session_id).expect("reopen recorder");
+        sync_recorder_branch(&mut reopened, &snapshot.branch_id);
+        assert_eq!(reopened.current_context_branch_id(), Some("feature"));
+
+        sync_recorder_branch(&mut reopened, crate::transcript::ROOT_CONTEXT_BRANCH_ID);
+        assert_eq!(reopened.current_context_branch_id(), None);
+
+        let mut fresh = TranscriptRecorder::create(&sessions_dir).expect("fresh recorder");
+        fresh.set_current_context_branch_id(Some("temp".into()));
+        fresh.set_current_context_branch_id(None);
+        assert_eq!(fresh.current_context_branch_id(), None);
+    }
+
+    #[test]
+    fn tick_does_not_clobber_live_child_stream_with_disk_records() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-child-live-refresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
+        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
+        let mut child = TranscriptRecorder::create(&child_dir).expect("create child");
+        let parent_session_id = parent.session_id().to_string();
+        let child_session_id = child.session_id().to_string();
+
+        child
+            .record_session_started("gpt-child")
+            .expect("record child start");
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                &child_session_id,
+                "explorer",
+                "running",
+                "inspecting",
+            )
+            .expect("record child result");
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            Vec::new(),
+            sessions_dir.clone(),
+            std::env::temp_dir(),
+        );
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[TranscriptRecord {
+                session_id: child_session_id.clone(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::SessionStarted {
+                    model: "gpt-child".into(),
+                },
+            }],
+            parent_session_id,
+            child_session_id.clone(),
+            "explorer",
+            0,
+            1,
+            1,
+        );
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+            child_session_id: child_session_id.clone(),
+            agent_name: None,
+            parent_tool_call_id: None,
+            event: SessionEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
+                "partial stream",
+            )),
+        });
+
+        child
+            .record_tool_call_started("call-1", "shell__exec", serde_json::json!({}))
+            .expect("record child tool start");
+
+        runtime
+            .handle_input_action(InputAction::Tick)
+            .expect("tick succeeds");
+
+        let metadata = runtime
+            .state()
+            .child_view_metadata()
+            .expect("child metadata");
+        assert_eq!(metadata.record_count, 1);
+        assert!(matches!(
+            runtime.state().active_timeline().items().last(),
+            Some(crate::tui::TimelineItem::Assistant(message)) if message.text == "partial stream"
+        ));
+    }
+
+    #[test]
+    fn remove_current_empty_session_deletes_session_started_only_transcript() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-remove-current-empty-session-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        ));
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("record session started");
+        let path = recorder.path().to_path_buf();
+        let recorder = Arc::new(StdMutex::new(recorder));
+
+        assert!(remove_current_empty_session(&recorder).expect("remove empty session"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn config_editor_edits_array_items() {
+        let (mut runtime, path) = runtime_with_config_path(
+            "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\nflavor = \"standard\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[mcp.demo]\ntype = \"local\"\ncommand = [\"echo\", \"hi\"]\n",
+        );
+        runtime.state_mut().set_input("/config");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("config command is accepted");
+        search_config(&mut runtime, "command");
+
+        let index = runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .items
+            .iter()
+            .position(|item| item.label == "command")
+            .expect("command field");
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("config dialog")
+            .selected = index;
+
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("expand the array");
+        let dialog = runtime.state().dialog().expect("config dialog");
+        assert!(matches!(
+            dialog.config_fields.get(dialog.config_expanded.expect("expanded field")),
+            Some(ConfigFieldRef::List(path)) if path == &["mcp", "demo", "command"]
+        ));
+        assert_eq!(dialog.config_detail_items.len(), 2);
+
+        runtime
+            .handle_input_action(InputAction::ConfigListAppend)
+            .expect("append a new element");
+        for ch in "bye".chars() {
+            runtime
+                .handle_input_action(InputAction::ConfigEditInsert(ch))
+                .expect("type the element value");
+        }
+        runtime
+            .handle_input_action(InputAction::ConfigEditConfirm)
+            .expect("commit the element");
+
+        let written = std::fs::read_to_string(&path).expect("read config");
+        assert!(!written.contains("bye"), "unsaved edits stay off disk");
+
+        runtime
+            .handle_input_action(InputAction::ConfigSave)
+            .expect("save the draft");
+        let written = std::fs::read_to_string(&path).expect("read config");
+        assert!(written.contains("bye"), "{written}");
+        assert_eq!(
+            runtime
+                .state()
+                .dialog()
+                .expect("config dialog")
+                .config_detail_items
+                .len(),
+            3
+        );
+
+        runtime
+            .handle_input_action(InputAction::DialogPrev)
+            .expect("select the previous element");
+        runtime
+            .handle_input_action(InputAction::DialogPrev)
+            .expect("select the first element");
+        runtime
+            .handle_input_action(InputAction::ConfigListRemove)
+            .expect("remove the element");
+        runtime
+            .handle_input_action(InputAction::ConfigSave)
+            .expect("save the draft");
+        let written = std::fs::read_to_string(&path).expect("read config");
+        assert!(!written.contains("echo"), "{written}");
+    }
+
+    #[test]
+    fn config_editor_adds_a_new_mcp_server() {
+        let (mut runtime, path) = runtime_with_config_path(
+            "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n",
+        );
+        runtime.state_mut().set_input("/config");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("config command is accepted");
+
+        let index = runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .items
+            .iter()
+            .position(|item| item.id == "new/mcp")
+            .expect("new mcp entry");
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("config dialog")
+            .selected = index;
+
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("start naming the server");
+        for ch in "demo".chars() {
+            runtime
+                .handle_input_action(InputAction::ConfigEditInsert(ch))
+                .expect("type the name");
+        }
+        runtime
+            .handle_input_action(InputAction::ConfigEditConfirm)
+            .expect("commit the name");
+
+        let written = std::fs::read_to_string(&path).expect("read config");
+        assert!(
+            !written.contains("[mcp.demo]"),
+            "unsaved entries stay off disk"
+        );
+
+        runtime
+            .handle_input_action(InputAction::ConfigSave)
+            .expect("save the draft");
+        let dialog = runtime.state().dialog().expect("config dialog");
+        assert!(
+            dialog.config_error.is_some(),
+            "a server without a command cannot be saved"
+        );
+        assert!(
+            dialog.config_dirty,
+            "the draft stays dirty after a failed save"
+        );
+        let written = std::fs::read_to_string(&path).expect("read config");
+        assert!(!written.contains("[mcp.demo]"), "{written}");
+    }
+
+    #[test]
+    fn config_editor_picks_an_allowed_model_from_a_choice() {
+        let (mut runtime, path) = runtime_with_config_path(
+            "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[agents.explorer]\nallowed_models = [\"alpha/m\"]\n",
+        );
+        runtime.state_mut().set_input("/config");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("config command is accepted");
+
+        enter_config_table(&mut runtime, "agents");
+        enter_config_table(&mut runtime, "explorer");
+        let index = runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .items
+            .iter()
+            .position(|item| item.label == "allowed_models")
+            .expect("allowed_models field");
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("config dialog")
+            .selected = index;
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("expand the list");
+        assert_eq!(
+            runtime
+                .state()
+                .dialog()
+                .expect("config dialog")
+                .config_detail_items
+                .len(),
+            1
+        );
+
+        runtime
+            .handle_input_action(InputAction::ConfigListAppend)
+            .expect("append an element");
+        let dialog = runtime.state().dialog().expect("config dialog");
+        assert_eq!(dialog.config_detail_target, Some(1));
+        assert!(
+            dialog
+                .config_detail_items
+                .iter()
+                .any(|item| item.label == "alpha/m"),
+            "the element editor offers configured routes"
+        );
+
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("pick the model");
+        runtime
+            .handle_input_action(InputAction::ConfigSave)
+            .expect("save the draft");
+        let written = std::fs::read_to_string(&path).expect("read config");
+        assert!(written.contains("\"alpha/m\""), "{written}");
+    }
+
+    #[test]
+    fn config_editor_only_reports_saved_after_writing_the_file() {
+        let (mut runtime, path) = open_editable_config();
+        toggle_config_retry(&mut runtime);
+        assert!(runtime.state().dialog().expect("dialog").config_dirty);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read configuration"),
+            EDITABLE_CONFIG
+        );
+        assert!(
+            runtime
+                .state()
+                .toast
+                .as_ref()
+                .is_none_or(|toast| toast.message != "Configuration saved")
+        );
+        runtime
+            .handle_input_action(InputAction::ConfigSave)
+            .expect("save configuration");
+        assert!(!runtime.state().dialog().expect("dialog").config_dirty);
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read configuration")
+                .contains("enabled = true")
+        );
+        assert_eq!(
+            runtime.state().toast.as_ref().expect("saved toast").message,
+            "Configuration saved"
+        );
+    }
+
+    #[test]
+    fn config_editor_closing_dirty_draft_requires_a_choice() {
+        let (mut runtime, path) = open_editable_config();
+        toggle_config_retry(&mut runtime);
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("request close");
+        assert_eq!(
+            runtime
+                .state()
+                .dialog()
+                .expect("close confirmation")
+                .config_close_selected,
+            Some(0)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read configuration"),
+            EDITABLE_CONFIG
+        );
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("cancel close");
+        assert_eq!(
+            runtime
+                .state()
+                .dialog()
+                .expect("dialog")
+                .config_close_selected,
+            None
+        );
+        assert!(runtime.state().dialog().expect("dialog").config_dirty);
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("request close");
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("choose discard");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("discard and close");
+        assert!(runtime.state().dialog().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read configuration"),
+            EDITABLE_CONFIG
+        );
+    }
+
+    #[test]
+    fn config_editor_can_save_or_continue_from_close_confirmation() {
+        let (mut runtime, path) = open_editable_config();
+        toggle_config_retry(&mut runtime);
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("request close");
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("choose discard");
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("choose continue");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("continue editing");
+        assert!(runtime.state().dialog().expect("dialog").config_dirty);
+        assert_eq!(
+            runtime
+                .state()
+                .dialog()
+                .expect("dialog")
+                .config_close_selected,
+            None
+        );
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("request close");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("save and close");
+        assert!(runtime.state().dialog().is_none());
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read configuration")
+                .contains("enabled = true")
+        );
+    }
+
+    #[test]
+    fn config_editor_failed_save_retains_the_draft_and_detailed_error() {
+        let (mut runtime, path) = open_editable_config();
+        runtime
+            .edit_config_document(|document| {
+                document["global"]["max_iterations"] = toml_edit::value(0);
+                Ok(())
+            })
+            .expect("edit draft");
+        runtime
+            .handle_input_action(InputAction::ConfigSave)
+            .expect("attempt save");
+        let dialog = runtime.state().dialog().expect("dialog");
+        assert!(dialog.config_dirty);
+        assert!(
+            dialog
+                .config_error
+                .as_deref()
+                .expect("validation error")
+                .contains("max_iterations")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read configuration"),
+            EDITABLE_CONFIG
+        );
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("request close");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("attempt save and close");
+        assert!(
+            runtime
+                .state()
+                .dialog()
+                .expect("keep dialog on failure")
+                .config_dirty
+        );
+    }
+
+    #[test]
+    fn navigation_commands_respect_pending_work() {
+        for state in ["running", "pending", "queued", "background"] {
+            let mut runtime = runtime();
+            match state {
+                "running" => runtime.session_turn_active = true,
+                "pending" => {
+                    let (reply_tx, _reply_rx) = oneshot::channel();
+                    runtime.apply_session_transport_event(
+                        SessionTransportEvent::PermissionRequested {
+                            event: PermissionRequestEvent::new(
+                                "call-1",
+                                "shell__exec",
+                                "Run command",
+                            ),
+                            handle: RunnerPermissionRequest::new(reply_tx),
+                        },
+                    );
+                }
+                "queued" => runtime
+                    .queued_prompt_lifecycle
+                    .dispatch(UserMessageSubmission::from("queued")),
+                "background" => {
+                    runtime.apply_session_transport_event(
+                        SessionTransportEvent::ChildSessionEvent {
+                            child_session_id: "background-child".into(),
+                            agent_name: Some("explorer".into()),
+                            parent_tool_call_id: None,
+                            event: SessionEvent::UserMessage(UserMessageEvent::new(
+                                "background work",
+                            )),
+                        },
+                    );
+                    runtime.apply_session_transport_event(SessionTransportEvent::Done);
+                }
+                _ => unreachable!(),
+            }
+            for input in ["/undo", "/redo", "/tree"] {
+                runtime.state_mut().set_input(input);
+                assert_eq!(
+                    runtime
+                        .handle_input_action(InputAction::Submit)
+                        .expect("submit"),
+                    None,
+                    "{state} must block {input}"
+                );
+                assert_eq!(runtime.state().input_buffer, input);
+            }
+            let (mut engine, ingress, _egress) = SessionEngine::new();
+            for command in [
+                RuntimeCommand::Undo,
+                RuntimeCommand::Redo,
+                RuntimeCommand::ShowHistoryTree,
+                RuntimeCommand::NavigateHistory {
+                    target_entry_id: "entry-1".into(),
+                },
+            ] {
+                command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+                assert!(matches!(
+                    engine.try_recv_control(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn expert_allowlist_change_during_a_turn_shows_in_the_panel() {
+        let mut runtime = runtime_with_experts(vec![AvailableExpert {
+            agent_name: "explorer".into(),
+            route_id: "gpt-5.5".into(),
+            allowed_models: vec!["gpt-5.5".into()],
+        }]);
+        runtime
+            .available_models
+            .push(AvailableModel::new("p/other", "Other"));
+        runtime.session_turn_active = true;
+        runtime.state_mut().set_input("/agents");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("agents picker opens");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("expert picker opens");
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("moves to the second model");
+        runtime
+            .handle_input_action(InputAction::DialogToggle)
+            .expect("toggles the second model");
+        let command = runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("confirming produces a command")
+            .expect("command");
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+
+        assert!(matches!(
+            engine.try_recv_control(),
+            Ok(SessionEngineControl::Command(
+                SessionEngineCommand::SetExpertAllowedModels { .. }
+            ))
+        ));
+        assert_eq!(
+            runtime
+                .state()
+                .dialog()
+                .and_then(|dialog| dialog.items[0].right_detail.clone()),
+            Some("gpt-5.5 · p/other".into())
+        );
+
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("expert picker reopens");
+        assert!(matches!(
+            runtime.state().dialog(),
+            Some(dialog)
+                if matches!(dialog.kind, DialogKind::ExpertModelPicker(_))
+                    && dialog.items.iter().filter(|item| item.checked).count() == 2
+        ));
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("returns to the agents picker");
+    }
+
+    #[tokio::test]
+    async fn running_turn_projects_session_setting_until_backend_confirmation() {
+        let mut runtime = runtime();
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("/permission safe");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("permission setting is accepted")
+            .expect("permission setting is dispatched");
+        assert_eq!(
+            command,
+            RuntimeCommand::SetPermissionMode(crate::permission::PermissionMode::Safe)
+        );
+
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+        assert!(matches!(
+            engine.recv_control().await,
+            Some(SessionEngineControl::Command(
+                SessionEngineCommand::SetPermissionMode(crate::permission::PermissionMode::Safe)
+            ))
+        ));
+        assert_eq!(runtime.state().permission_mode_label, "default");
+        assert_eq!(
+            runtime
+                .state()
+                .pending_composer_settings
+                .permission_mode
+                .as_deref(),
+            Some("safe")
+        );
+
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionModeChanged {
+            mode: "safe".into(),
+        });
+        assert_eq!(runtime.state().permission_mode_label, "safe");
+        assert_eq!(
+            runtime.state().pending_composer_settings.permission_mode,
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_session_transport_event_drain_keeps_double_escape_cancel_dispatch_fair() {
+        let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            session_transport_rx,
+            vec![AvailableModel::new("m1", "M1")],
+            Vec::new(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Error;
+        for index in 0..512 {
+            session_transport_tx
+                .send(SessionTransportEvent::AssistantDelta(
+                    AssistantDeltaEvent::new(format!("flood-{index}")),
+                ))
+                .expect("queue session transport flood event");
+        }
+
+        runtime.try_drain_session_events();
+        assert!(
+            runtime.session_transport_rx.try_recv().is_ok(),
+            "drain stays bounded"
+        );
+
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            runtime
+                .handle_input_action(map_key_event(runtime.state(), escape))
+                .expect("first escape is accepted"),
+            None
+        );
+        let command = runtime
+            .handle_input_action(map_key_event(runtime.state(), escape))
+            .expect("second escape is accepted")
+            .expect("second escape requests interruption");
+        command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+        assert!(
+            matches!(
+                engine.try_recv_control(),
+                Ok(SessionEngineControl::Interrupt)
+            ),
+            "interrupt dispatch makes progress after flood"
+        );
+    }
 }

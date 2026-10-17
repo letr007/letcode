@@ -202,7 +202,7 @@ fn render_question_answers(request: &QuestionRequest, response: &QuestionRespons
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::super::{QuestionRequest, QuestionResponse, ToolExecutionContext, ToolRegistry};
     use crate::tool_names;
     use serde_json::json;

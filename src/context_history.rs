@@ -661,7 +661,7 @@ pub fn source_entries(
 }
 
 #[cfg(test)]
-mod history_integration_tests {
+mod integration_tests {
     use super::*;
     use crate::request_builder::HistoryItem;
     use crate::transcript::{TranscriptEvent as E, TranscriptRecord, restore_session_history};

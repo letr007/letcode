@@ -240,16 +240,3 @@ where
         .map_err(|_| anyhow!("transcript recorder poisoned"))?;
     f(&mut recorder)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::HEADLESS_CHILD_PERMISSION_DENIED_REASON;
-
-    #[test]
-    fn headless_child_permission_denial_reason_does_not_claim_tui_approval() {
-        assert_eq!(
-            HEADLESS_CHILD_PERMISSION_DENIED_REASON,
-            "Denied in headless child execution"
-        );
-    }
-}

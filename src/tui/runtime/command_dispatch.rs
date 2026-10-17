@@ -25,7 +25,7 @@ fn handle_session_engine_unavailable(runtime: &mut TuiRuntime) {
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
     use crate::session::{SessionEngine, engine::SessionEngineControl};
     use crate::tui::{AppPhase, TuiState, map_key_event};

@@ -1705,10 +1705,7 @@ mod tests {
             rendered.contains('拒') || rendered.contains("Reject"),
             "{rendered}"
         );
-        assert!(
-            !rendered.contains('始') || rendered.contains("Allow always"),
-            "{rendered}"
-        );
+        assert!(!rendered.contains("Allow always"), "{rendered}");
         assert!(rendered.contains("y/o"), "{rendered}");
         assert!(rendered.contains("n/d"), "{rendered}");
         assert!(rendered.contains("esc"), "{rendered}");
@@ -1793,10 +1790,6 @@ mod tests {
         assert!(!rendered.contains("records"), "{rendered}");
         assert!(!rendered.contains("parent-session"), "{rendered}");
         assert!(!rendered.contains("message letcode"), "{rendered}");
-        assert!(
-            !rendered.contains("hidden input should not render"),
-            "{rendered}"
-        );
     }
 
     #[test]

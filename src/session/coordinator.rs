@@ -818,7 +818,7 @@ pub enum CommandOwnership {
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
     use crate::permission::PermissionMode;
     use crate::request_builder::ModelReasoningEffort;

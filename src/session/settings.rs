@@ -186,7 +186,7 @@ pub fn apply_reasoning_effort(
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};

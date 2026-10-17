@@ -590,7 +590,7 @@ pub fn restored_session_token_usage(
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

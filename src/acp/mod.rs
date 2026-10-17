@@ -254,7 +254,7 @@ fn forward(requests_tx: &mpsc::UnboundedSender<DriverRequest>, request: DriverRe
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
