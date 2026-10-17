@@ -681,9 +681,9 @@ pub(crate) fn sanitize_compaction_summary_body(summary: &str) -> anyhow::Result<
 }
 
 #[cfg(test)]
-#[path = "transcript_projection/tests.rs"]
+#[path = "../../tests/internal/transcript/transcript_projection/tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "transcript_projection/history_validation_tests.rs"]
+#[path = "../../tests/internal/transcript/transcript_projection/history_validation_tests.rs"]
 mod history_validation_tests;

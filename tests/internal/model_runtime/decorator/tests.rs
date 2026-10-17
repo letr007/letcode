@@ -1,0 +1,246 @@
+use super::*;
+use crate::fake::{FakeIdentity, FakeRequestContext};
+use crate::model_runtime::HttpMethod;
+use std::collections::BTreeMap;
+
+fn request(protocol: &str, body: Value) -> PreparedHttpRequest {
+    let mut protocol_headers = BTreeMap::new();
+    protocol_headers.insert("accept".into(), "text/event-stream".into());
+    protocol_headers.insert("content-type".into(), "application/json".into());
+    if protocol == "anthropic" {
+        protocol_headers.insert("anthropic-version".into(), "2023-06-01".into());
+    }
+    PreparedHttpRequest {
+        method: HttpMethod::Post,
+        url: format!("https://example.invalid/{protocol}"),
+        protocol_headers,
+        body: serde_json::to_vec(&body).unwrap(),
+        prompt_unit_origins: Vec::new(),
+    }
+}
+
+fn codex_context() -> FakeRequestContext {
+    FakeRequestContext::Codex(
+        FakeIdentity::new("fake-installation")
+            .turn_context(&crate::config::FakeConfig::default(), None),
+    )
+}
+
+fn claude_context() -> FakeRequestContext {
+    FakeRequestContext::Claude(FakeIdentity::new("fake-installation").claude_turn_context(
+        &crate::config::FakeConfig::default(),
+        crate::permission::PermissionMode::Auto,
+    ))
+}
+
+#[test]
+fn codex_decorator_carries_declared_metadata_without_credentials() {
+    let protocol = ProtocolId::new("responses").unwrap();
+    let decorator =
+        FakeRequestDecorator::new(FakeProfile::Codex, &protocol, codex_context(), false).unwrap();
+    let decorated = decorator
+        .decorate(
+            &protocol,
+            request(
+                "responses",
+                serde_json::json!({
+                    "model": "gpt",
+                    "instructions": "system",
+                    "input": [{"type":"message"}],
+                    "tools": [],
+                    "temperature": 0.2
+                }),
+            ),
+        )
+        .unwrap();
+    let body: Value = serde_json::from_slice(&decorated.body).unwrap();
+    assert_eq!(body["model"], "gpt");
+    assert_eq!(body["instructions"], "system");
+    assert!(body.get("temperature").is_none());
+    assert_eq!(body["stream"], true);
+    assert_eq!(
+        decorated.protocol_headers.get("accept").map(String::as_str),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        decorated
+            .protocol_headers
+            .keys()
+            .filter(|name| name.as_str() == "accept")
+            .count(),
+        1
+    );
+    let wire = format!(
+        "{}{}",
+        String::from_utf8(decorated.body).unwrap(),
+        decorated
+            .protocol_headers
+            .values()
+            .cloned()
+            .collect::<String>()
+    );
+    assert!(!wire.contains("authorization"));
+    assert!(!wire.contains("api-key"));
+    // The turn metadata is a compatibility projection of the declared
+    // identity, not a second source of truth.
+    assert!(
+        decorated
+            .protocol_headers
+            .values()
+            .any(|value| value.contains("fake-installation"))
+    );
+}
+
+#[test]
+fn anthropic_decorator_carries_the_claude_code_profile() {
+    let protocol = ProtocolId::new("anthropic").unwrap();
+    let decorator =
+        FakeRequestDecorator::new(FakeProfile::Anthropic, &protocol, claude_context(), false)
+            .unwrap();
+    let original = serde_json::json!({
+        "model":"claude",
+        "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
+        "stream":true
+    });
+    let decorated = decorator
+        .decorate(&protocol, request("anthropic", original.clone()))
+        .unwrap();
+    let body: Value = serde_json::from_slice(&decorated.body).unwrap();
+    assert_eq!(body["model"], original["model"]);
+    assert_eq!(body["messages"], original["messages"]);
+    assert_eq!(body["stream"], original["stream"]);
+    assert_eq!(decorated.url, "https://example.invalid/anthropic?beta=true");
+    let user_id = body["metadata"]["user_id"].as_str().expect("user id");
+    let user_id: Value = serde_json::from_str(user_id).expect("user id blob");
+    assert_eq!(user_id["device_id"].as_str().expect("device id").len(), 64);
+    assert!(user_id["session_id"].is_string());
+    assert_eq!(user_id["account_uuid"], "");
+
+    assert_eq!(
+        decorated.protocol_headers["anthropic-version"],
+        "2023-06-01"
+    );
+    assert_eq!(decorated.protocol_headers["accept"], "application/json");
+    assert_eq!(decorated.protocol_headers["x-app"], "cli");
+    let user_agent = &decorated.protocol_headers["user-agent"];
+    assert!(user_agent.starts_with("claude-cli/"), "{user_agent}");
+    assert!(user_agent.ends_with("(external, cli)"), "{user_agent}");
+    assert!(decorated.protocol_headers.contains_key("anthropic-beta"));
+    assert!(
+        decorated
+            .protocol_headers
+            .contains_key("x-claude-code-session-id")
+    );
+    // Codex-only transport identity must not leak into this profile.
+    assert!(!decorated.protocol_headers.contains_key("originator"));
+    assert!(
+        !decorated
+            .protocol_headers
+            .contains_key("x-codex-turn-metadata")
+    );
+}
+
+#[test]
+fn claude_requests_share_the_session_without_a_request_id() {
+    let protocol = ProtocolId::new("anthropic").unwrap();
+    let decorator =
+        FakeRequestDecorator::new(FakeProfile::Anthropic, &protocol, claude_context(), false)
+            .unwrap();
+    let body = serde_json::json!({
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true
+    });
+    let first = decorator
+        .decorate(&protocol, request("anthropic", body.clone()))
+        .unwrap();
+    let second = decorator
+        .decorate(&protocol, request("anthropic", body))
+        .unwrap();
+
+    assert_eq!(
+        first.protocol_headers["x-claude-code-session-id"],
+        second.protocol_headers["x-claude-code-session-id"]
+    );
+    assert!(!first.protocol_headers.contains_key("x-client-request-id"));
+    let mut already_suffixed = request("anthropic", serde_json::json!({"model": "claude"}));
+    already_suffixed.url = "https://example.invalid/anthropic?beta=true".into();
+    assert_eq!(
+        decorator.decorate(&protocol, already_suffixed).unwrap().url,
+        "https://example.invalid/anthropic?beta=true"
+    );
+    let session = |decorated: &PreparedHttpRequest| {
+        let body: Value = serde_json::from_slice(&decorated.body).unwrap();
+        body["metadata"]["user_id"]
+            .as_str()
+            .expect("user id")
+            .to_string()
+    };
+    assert_eq!(session(&first), session(&second));
+    assert!(session(&first).contains(&first.protocol_headers["x-claude-code-session-id"]));
+}
+
+#[test]
+fn claude_profile_replaces_the_adapter_transport_values() {
+    let protocol = ProtocolId::new("anthropic").unwrap();
+    let decorator =
+        FakeRequestDecorator::new(FakeProfile::Anthropic, &protocol, claude_context(), false)
+            .unwrap();
+    let mut prepared = request("anthropic", serde_json::json!({"model": "claude"}));
+    prepared
+        .protocol_headers
+        .insert("anthropic-beta".into(), "provider-beta".into());
+    prepared
+        .protocol_headers
+        .insert("accept".into(), "text/event-stream".into());
+
+    let decorated = decorator.decorate(&protocol, prepared).unwrap();
+    let beta = &decorated.protocol_headers["anthropic-beta"];
+    assert!(!beta.contains("provider-beta"), "{beta}");
+    assert!(beta.starts_with("claude-code-"), "{beta}");
+    assert_eq!(decorated.protocol_headers["accept"], "application/json");
+}
+
+#[test]
+fn decorator_rejects_incompatible_protocols() {
+    let completions = ProtocolId::new("completions").unwrap();
+    assert!(
+        FakeRequestDecorator::new(FakeProfile::Codex, &completions, codex_context(), false)
+            .is_err()
+    );
+    let responses = ProtocolId::new("responses").unwrap();
+    assert!(
+        FakeRequestDecorator::new(FakeProfile::Codex, &responses, claude_context(), false).is_err()
+    );
+    let anthropic = ProtocolId::new("anthropic").unwrap();
+    assert!(
+        FakeRequestDecorator::new(FakeProfile::Anthropic, &anthropic, codex_context(), false)
+            .is_err()
+    );
+}
+
+#[test]
+fn only_websocket_responses_requests_carry_the_beta_header() {
+    let protocol = ProtocolId::new("responses").unwrap();
+    let body = serde_json::json!({
+        "model": "gpt",
+        "instructions": "system",
+        "input": [{"type":"message"}],
+        "tools": []
+    });
+
+    let http = FakeRequestDecorator::new(FakeProfile::Codex, &protocol, codex_context(), false)
+        .unwrap()
+        .decorate(&protocol, request("responses", body.clone()))
+        .unwrap();
+    assert!(!http.protocol_headers.contains_key("openai-beta"));
+
+    let websocket = FakeRequestDecorator::new(FakeProfile::Codex, &protocol, codex_context(), true)
+        .unwrap()
+        .decorate(&protocol, request("responses", body))
+        .unwrap();
+    assert_eq!(
+        websocket.protocol_headers["openai-beta"],
+        crate::fake::CODEX_RESPONSES_WEBSOCKET_BETA
+    );
+}

@@ -82,70 +82,8 @@ pub fn is_trusted_artifact_path(path: &std::path::Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn preview_keeps_only_leading_chars() {
-        let content = "abcdefghij";
-        assert_eq!(fold_preview(content, 4), "abcd");
-        assert_eq!(fold_preview(content, 100), content);
-        assert_eq!(fold_preview("中文内容", 2), "中文");
-    }
-
-    #[test]
-    fn artifact_names_are_content_addressed() {
-        let name = artifact_file_name(b"hello", "txt");
-        assert_eq!(name, artifact_file_name(b"hello", "txt"));
-        assert_ne!(name, artifact_file_name(b"hello!", "txt"));
-        assert!(name.ends_with(".txt"));
-        assert_ne!(
-            artifact_file_name(b"x", "out"),
-            artifact_file_name(b"x", "err")
-        );
-    }
-
-    #[test]
-    fn trusted_artifact_path_covers_only_our_temp_subdirs() {
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
-        let command = root.join(COMMAND_ARTIFACT_DIR).join("stream-1-2.out");
-        let fetch = root.join(FETCH_ARTIFACT_DIR).join("a.txt");
-        let search = root.join(SEARCH_ARTIFACT_DIR).join("deadbeef.txt");
-        assert!(is_trusted_artifact_path(Path::new(&command)));
-        assert!(is_trusted_artifact_path(Path::new(&fetch)));
-        assert!(is_trusted_artifact_path(Path::new(&search)));
-        // Sibling / unrelated paths and the temp root itself are not trusted.
-        assert!(!is_trusted_artifact_path(Path::new(&root)));
-        assert!(!is_trusted_artifact_path(Path::new(
-            &root.join("letcode-outside-tool-read-123.txt")
-        )));
-        assert!(!is_trusted_artifact_path(Path::new(
-            &root.join("letcode-command-other")
-        )));
-        assert!(!is_trusted_artifact_path(Path::new(
-            "/nope/letcode-command/x"
-        )));
-    }
-
-    #[tokio::test]
-    async fn write_artifact_is_idempotent_and_round_trips() {
-        let body = b"payload content";
-        let first = write_artifact("letcode-test-fold", body, "txt")
-            .await
-            .unwrap();
-        let second = write_artifact("letcode-test-fold", body, "txt")
-            .await
-            .unwrap();
-        assert_eq!(first, second);
-        let written = tokio::fs::read(&first).await.unwrap();
-        assert_eq!(written, body);
-        let _ = tokio::fs::remove_file(&first).await;
-        let _ = tokio::fs::remove_dir(std::env::temp_dir().join("letcode-test-fold")).await;
-    }
-}
+#[path = "../../tests/internal/tool/fold_artifact/tests.rs"]
+mod tests;
 
 /// Promote built-in folded outputs before their tool result enters the journal.
 /// The content-addressed file is durable before its reference is returned.
@@ -252,22 +190,8 @@ fn persist_artifact(source: &std::path::Path, directory: &std::path::Path) -> Re
 }
 
 #[cfg(test)]
-mod retained_tests {
-    use super::*;
-    #[test]
-    fn retained_body_survives_removal_of_temporary_original() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("temporary.txt");
-        std::fs::write(&source, "complete output").unwrap();
-        let path = persist_artifact(&source, &root.path().join("session")).unwrap();
-        assert_eq!(
-            path,
-            persist_artifact(&source, &root.path().join("session")).unwrap()
-        );
-        std::fs::remove_file(source).unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "complete output");
-    }
-}
+#[path = "../../tests/internal/tool/fold_artifact/retained_tests.rs"]
+mod retained_tests;
 
 pub(crate) fn is_retained_artifact_path(path: &std::path::Path) -> bool {
     let Ok(root) = crate::memory::configured_memory_sessions_dir()

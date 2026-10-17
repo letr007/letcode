@@ -36,9 +36,14 @@ cargo test --locked
 
 ## 代码组织
 
-进程内测试位于 `src/`，可直接访问私有实现。测试代码部分在源码文件内使用 `#[cfg(test)]`，部分拆分为同级 `tests.rs`。进程内集成测试完整名称包含 `integration_tests::` 子串。
+所有测试代码集中存放在根目录 `tests/` 下。
 
-进程端到端测试位于 `tests/cli.rs`。
+- `tests/internal/` 存放进程内测试源码，镜像 `src/` 模块层级。
+- `tests/cli.rs` 存放进程端到端（E2E）测试。
+
+进程内测试源码位于 `tests/internal/`，按 `src/` 的功能模块路径存放为 `tests.rs` 或专用测试文件。`src/` 内的模块通过 `#[cfg(test)] #[path = "..."]` 挂载对应测试。测试代码仍编译进 `--bin letcode`，不被 Cargo 自动识别为单独 target，不增加库目标，也不暴露额外公开接口，直接访问私有实现。单元测试和进程内集成测试未按目录物理拆开，统一通过测试名称是否包含 `integration_tests::` 区分。
+
+进程端到端测试位于 `tests/cli.rs`，由 Cargo 编译为独立二进制 target（`--test cli`）。
 
 ## 定向运行
 
@@ -60,7 +65,7 @@ cargo test --locked --test cli '<完整测试名中的连续片段>'
 
 ## 新增测试
 
-- 局部组件与私有逻辑补充在对应模块的源文件 `#[cfg(test)]` 或 `tests.rs`。
-- 文件持久化、跨模块协作流程补充在 `src/` 中，测试名称路径包含 `integration_tests::`。
-- 只有真实二进制进程契约（如 CLI 参数、退出码、真实子进程拉起与重启恢复）补充在 `tests/cli.rs`。
+- 单组件本地逻辑（含单组件本地文件操作）与私有逻辑的单元测试，补充在 `tests/internal/<模块>/` 下，由对应源码模块挂载。
+- 跨模块协作与多组件持久化等进程内集成测试，同样补充在 `tests/internal/<模块>/` 下，测试名称需包含 `integration_tests::`。
+- 真实二进制进程契约（如 CLI 参数、退出码、真实子进程拉起与重启恢复），补充在 `tests/cli.rs`。
 - 基于现有可见性编写测试，不为测试暴露新的公开接口，不引入额外测试框架。

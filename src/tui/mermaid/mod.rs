@@ -223,4 +223,5 @@ fn render_cache() -> &'static Mutex<MermaidRenderCache> {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/internal/tui/mermaid/tests.rs"]
 mod tests;

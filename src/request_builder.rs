@@ -996,5 +996,5 @@ fn estimate_tools_tokens(tools: &[ToolSpec]) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "request_builder/tests.rs"]
+#[path = "../tests/internal/request_builder/tests.rs"]
 mod tests;
