@@ -119,12 +119,12 @@ letcode
 `/child list` 打开成员列表，swarm 模式包含全部深度成员。
 `/child <session_id>` 查看指定成员。
 查看子会话不会接管任务执行，也不改变当前主会话。
-继续已结束的子会话，需要主代理显式接管。
+继续已结束的子会话可以显式接管；在 swarm 模式下，也可发送 `agent__send` 消息唤醒续跑。
 
-主代理可用 `agent__jobs`、`agent__status`、`agent__wait`
-和 `agent__cancel` 列出、查看、等待或取消任务。
+可用 `agent__jobs`、`agent__status`、`agent__wait`
+和 `agent__cancel` 列出、查看、等待或取消任务；swarm 模式还提供 `agent__send` 向同树会话发送消息。
 只读任务可并发运行。读写范围重叠时会冲突。
-冲突任务直接拒绝，不排队。子代理不能继续委派。
+冲突任务直接拒绝，不排队。expert 模式下子代理不能继续委派；swarm 模式允许成员继续委派。
 
 ## 权限与设置
 

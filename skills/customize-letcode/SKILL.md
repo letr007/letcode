@@ -24,6 +24,8 @@ provider/model 时会拒绝启动。下面这些是合法配置面。
 覆盖）。MCP、权限模式、Fast Mode，以及 `max_iterations` / `max_tool_calls`
 仍需重启。
 
+`[subagents]` 配置在创建新根会话时记录快照。热重载只影响后续新根会话；恢复会话沿用原快照。
+
 坏配置不会弄崩正在跑的会话（重载会保留内存里的旧配置），但磁盘上的坏文件会挡住下一次冷启动。
 
 每次改完 `letcode.toml` 后，调用 `config__validate`（`path` 为 `null` = 默认
@@ -82,6 +84,14 @@ log_file = "logs/combined.log"
 
 [permissions]
 mode = "default" # safe | default | auto | yolo（solo 是 yolo 的别名）
+
+[subagents]
+mode = "expert"                  # expert | swarm，默认 expert
+max_depth = 3                    # swarm 最大深度，根为 0，包含上限
+max_concurrent = 16              # 整树并发子代理上限（兼容别名 max_descendants）
+max_pending_messages = 16        # 每会话待处理消息队列容量
+max_message_bytes = 16384        # 单条消息 UTF-8 字节数上限
+run_timeout_secs = 600           # swarm run 默认超时秒数
 
 # 可选 expert 路由。省略 provider 则跟随 active_provider。
 # [agents.explorer]
@@ -243,6 +253,10 @@ namespace = "my-cache"
 形状说明：
 
 - 相对路径的 `sessions_dir` / `log_file` 相对**配置文件所在目录**解析。
+- `subagents.mode` 支持 `expert`（默认）与 `swarm`。`expert` 仅由父代理委派；`swarm` 允许成员继续委派，并支持同树会话消息。数值限制字段必须为正整数，且不改变 `expert` 模式的运行行为。
+- `max_concurrent` 为整树共享的并发子代理上限，包含启动预约与消息恢复预约；主脑不占名额，run 结束后释放。`max_descendants` 是其兼容别名，两者不可同时填写。
+- `max_pending_messages` 限制每个会话（含根会话与成员）的待处理消息队列容量。单条消息正文字节数由 `max_message_bytes` 约束。
+- `run_timeout_secs` 是 swarm run 在请求与模板均未指定超时时的默认秒数，取值须在运行时截止期限范围内。
 - Provider 认证配置在 `[providers.<name>.auth]`。`credential_env` 可显式指定环境变量；未指定时默认读取按 provider 名生成的 `<PROVIDER>_API_KEY`，再回退到 `credential`。endpoint 不再通过 `<PROVIDER>_BASE_URL` 覆盖，必须配置在 `[providers.<name>.endpoints]`。
 - `type = "bearer"` 使用 `Authorization: Bearer ...`；`header` / `query` 必须配置合法的 `name`；`none` 不能携带 credential。
 - Provider 和 model 都可配置 `protocol` / `flavor`。`protocol` 支持 `responses`、`completions`、`anthropic`；`flavor = "deepseek"` 是显式 DeepSeek profile，不根据 provider/model 名猜测。

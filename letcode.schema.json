@@ -234,7 +234,7 @@
     },
     "subagents": {
       "type": "object",
-      "description": "Subagent mode and limits for a swarm run.",
+      "description": "Subagent execution mode and limits for the session tree.",
       "additionalProperties": false,
       "properties": {
         "mode": {
@@ -253,19 +253,19 @@
           "type": "integer",
           "minimum": 1,
           "default": 16,
-          "description": "Maximum concurrent descendants per root, including starting runs and message wakeups."
+          "description": "Maximum concurrent subagents in the session tree, including starting and message wakeup reservations. Mutually exclusive with max_descendants."
         },
         "max_descendants": {
           "type": "integer",
           "minimum": 1,
           "deprecated": true,
-          "description": "Compatibility alias for max_concurrent."
+          "description": "Deprecated alias for max_concurrent. Mutually exclusive with max_concurrent."
         },
         "max_pending_messages": {
           "type": "integer",
           "minimum": 1,
           "default": 16,
-          "description": "Pending message queue capacity per member."
+          "description": "Pending message queue capacity per session."
         },
         "max_message_bytes": {
           "type": "integer",
@@ -277,9 +277,10 @@
           "type": "integer",
           "minimum": 1,
           "default": 600,
-          "description": "Timeout for one swarm run in seconds. Must fit the platform deadline range."
+          "description": "Default timeout for a swarm run in seconds when not specified by the request or template. Must fit the platform deadline range."
         }
-      }
+      },
+      "not": { "required": ["max_concurrent", "max_descendants"] }
     },
     "agents": {
       "type": "object",

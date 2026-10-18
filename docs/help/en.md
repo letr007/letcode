@@ -119,12 +119,12 @@ Specify the task, expected result and target paths to the main agent.
 `/child list` opens the member list, including all depths in swarm mode.
 `/child <session_id>` opens a specific member.
 Viewing a child session does not take over execution or change the active parent session.
-Continuing an ended child session requires explicit takeover by the main agent.
+Continuing an ended child session requires explicit takeover; in swarm mode, members can also be resumed by sending messages with `agent__send`.
 
-The main agent can list, inspect, wait for or cancel tasks with
-`agent__jobs`, `agent__status`, `agent__wait` and `agent__cancel`.
+Tasks can be listed, inspected, waited for or cancelled with
+`agent__jobs`, `agent__status`, `agent__wait` and `agent__cancel`; swarm mode also provides `agent__send` to message same-tree sessions.
 Read-only tasks can run concurrently. Overlapping read/write scopes conflict;
-conflicting tasks are rejected rather than queued. Children cannot delegate again.
+conflicting tasks are rejected rather than queued. In expert mode, children cannot delegate again; swarm mode allows members to continue delegating.
 
 ## Permissions and settings
 

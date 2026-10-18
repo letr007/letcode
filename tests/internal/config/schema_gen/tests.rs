@@ -27,6 +27,10 @@ fn subagents_editor_schema_exposes_modes_and_defaults() {
         schema["definitions"]["subagents"]["additionalProperties"],
         false
     );
+    assert_eq!(
+        schema["definitions"]["subagents"]["not"],
+        json!({ "required": ["max_concurrent", "max_descendants"] })
+    );
     for (field, expected) in [
         ("max_depth", 3),
         ("max_concurrent", 16),
