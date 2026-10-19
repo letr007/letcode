@@ -451,7 +451,11 @@ impl MemoryStore {
                         })
                     }))
         });
-        let grams = query_grams(query.query.as_deref().unwrap_or_default());
+        let text = query.query.as_deref().unwrap_or_default();
+        let grams = query_grams(text);
+        if grams.is_empty() && !text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let candidates = candidates
             .into_iter()
             .map(|memory| {
@@ -643,8 +647,6 @@ fn status_name(status: crate::memory::MemoryStatus) -> &'static str {
 
 const MAX_QUERY_TERMS: usize = 24;
 
-/// 连续汉字按二字组展开（`记忆系统` → `记忆`/`忆系`/`系统`），其余词保持原样。
-/// 中文没有词边界，整句当成一个词时只剩逐字子串命中，长句必然查不到任何记忆。
 fn query_grams(text: &str) -> Vec<String> {
     let mut grams = Vec::new();
     for term in text
@@ -656,6 +658,13 @@ fn query_grams(text: &str) -> Vec<String> {
         let mut run = String::new();
         let mut run_is_han = None;
         for character in term.chars() {
+            if ",;\"'`()[]{}，。；：！？、（）【】〔〕「」『』“”‘’《》〈〉…—–".contains(character)
+            {
+                push_grams(&mut grams, &run, run_is_han == Some(true));
+                run.clear();
+                run_is_han = None;
+                continue;
+            }
             let is_han = is_han(character);
             if run_is_han != Some(is_han) {
                 push_grams(&mut grams, &run, run_is_han == Some(true));
@@ -727,16 +736,23 @@ fn gram_weights(candidates: &[(MemoryRecord, SearchFields)], grams: &[String]) -
 }
 
 fn memory_score(fields: &SearchFields, grams: &[String], weights: &[f64]) -> f64 {
-    grams
-        .iter()
-        .zip(weights)
-        .map(|(gram, weight)| {
-            let hits = u64::from(fields.title.contains(gram)) * 6
-                + u64::from(fields.summary.contains(gram)) * 2
-                + u64::from(fields.paths.contains(gram)) * 8;
-            weight * hits as f64
-        })
-        .sum()
+    let mut score = 0.0;
+    let mut matched_weight = 0.0;
+    let mut total_weight = 0.0;
+    for (gram, weight) in grams.iter().zip(weights) {
+        let hits = u64::from(fields.title.contains(gram)) * 6
+            + u64::from(fields.summary.contains(gram)) * 2
+            + u64::from(fields.paths.contains(gram)) * 8;
+        score += weight * hits as f64;
+        total_weight += weight;
+        if hits > 0 {
+            matched_weight += weight;
+        }
+    }
+    if total_weight == 0.0 {
+        return 0.0;
+    }
+    score * matched_weight / total_weight
 }
 
 #[cfg(test)]

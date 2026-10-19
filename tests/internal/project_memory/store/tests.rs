@@ -218,6 +218,7 @@ fn project_scope_restart_and_text_search_do_not_need_the_source_journal() {
         assert_eq!(store.query(&query(text)).unwrap().len(), 1, "{text}");
     }
     assert!(store.query(&query("%' OR 1=1 --")).unwrap().is_empty());
+    assert!(store.query(&query("，。！？")).unwrap().is_empty());
     let other = MemoryStore::open(root.path(), project_b.path()).unwrap();
     assert!(other.known_memories(20).unwrap().is_empty());
     assert_eq!(other.status().unwrap().state, "missing");
@@ -231,6 +232,19 @@ fn query_grams_expand_han_runs_and_keep_other_tokens() {
     );
     assert_eq!(query_grams("cache other"), ["cache", "other"]);
     assert_eq!(query_grams("记忆 记忆"), ["记忆"]);
+    assert_eq!(
+        query_grams("，stdio模式 spawn，"),
+        ["stdio", "模式", "spawn"]
+    );
+    assert_eq!(
+        query_grams("`src/a_b.rs` (foo::bar) /tmp/a.txt v1.2.3"),
+        ["src/a_b.rs", "foo::bar", "/tmp/a.txt", "v1.2.3"]
+    );
+    assert_eq!(
+        query_grams("!= foo! ? => foo::<T> @"),
+        ["!=", "foo!", "?", "=>", "foo::<t>", "@"]
+    );
+    assert!(query_grams("，。！？").is_empty());
     assert!(query_grams(" \t\n").is_empty());
 }
 
@@ -308,6 +322,23 @@ fn rare_grams_outrank_common_ones() {
     let hits = store.query(&query("检索打分")).unwrap();
     assert_eq!(hits.len(), 5);
     assert_eq!(hits[0].title, "打分标准");
+}
+
+#[test]
+fn query_scores_reward_coverage() {
+    let focused = SearchFields {
+        title: String::new(),
+        summary: "alpha beta gamma".into(),
+        paths: String::new(),
+    };
+    let repeated = SearchFields {
+        title: "alpha".into(),
+        summary: String::new(),
+        paths: "alpha".into(),
+    };
+    let grams = query_grams("alpha beta gamma");
+    let weights = [1.0; 3];
+    assert!(memory_score(&focused, &grams, &weights) > memory_score(&repeated, &grams, &weights));
 }
 
 #[test]
