@@ -30,7 +30,7 @@ mode = "default" # safe | default | auto | yolo
 | `Command`（命令执行） | `shell__exec` | 审批 |
 | `Unknown`（未知分类） | 未声明安全属性的 MCP 工具与扩展 | 审批 |
 
-系统内部工具（`question`、`workflow__todos` 和 `skill`）属于元操作，直接放行执行。
+系统内部工具（`question`、`workflow__todos`、`skill`、`peer__discover` 和 `peer__send`）直接放行执行。
 
 ## 会话级授权
 

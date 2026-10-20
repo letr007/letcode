@@ -123,6 +123,7 @@ Continuing an ended child session requires explicit takeover; in swarm mode, mem
 
 Tasks can be listed, inspected, waited for or cancelled with
 `agent__jobs`, `agent__status`, `agent__wait` and `agent__cancel`; swarm mode also provides `agent__send` to message same-tree sessions.
+Other letcode main sessions running on this machine are listed with `peer__discover` and messaged with `peer__send`; a reply arrives as a separate message.
 Read-only tasks can run concurrently. Overlapping read/write scopes conflict;
 conflicting tasks are rejected rather than queued. In expert mode, children cannot delegate again; swarm mode allows members to continue delegating.
 

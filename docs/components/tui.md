@@ -32,6 +32,7 @@ letcode
 - Mermaid 渲染解析图表代码块，在终端网格中绘制节点、连线和标签。
 - 工具调用卡片展示执行参数与结果摘要。`/tools` 可切换紧凑（`compact`）或详细（`detailed`）视图。
 - `fs__write`、`fs__append` 和 `edit__apply_patch` 卡片默认截断较长差异。点击卡片可展开完整 diff。宽屏并排显示，窄屏单列显示。
+- `agent__send` 和 `peer__send` 显示为消息卡片，收起时显示目标与正文摘要，展开后显示完整正文。
 
 ## 帮助阅读器
 

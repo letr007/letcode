@@ -123,6 +123,7 @@ letcode
 
 可用 `agent__jobs`、`agent__status`、`agent__wait`
 和 `agent__cancel` 列出、查看、等待或取消任务；swarm 模式还提供 `agent__send` 向同树会话发送消息。
+用 `peer__discover` 列出本机其他正在运行的 letcode 主会话，用 `peer__send` 发送文本消息。回复由对方另发一条消息。
 只读任务可并发运行。读写范围重叠时会冲突。
 冲突任务直接拒绝，不排队。expert 模式下子代理不能继续委派；swarm 模式允许成员继续委派。
 
