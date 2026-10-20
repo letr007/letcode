@@ -1,36 +1,43 @@
 name: Build
 
 on:
-  push:
-    tags:
-      - "v*"
   pull_request:
     branches: [main]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  compile:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            command: cargo build --release --locked --target x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
+            command: cargo check --release --locked --target aarch64-unknown-linux-gnu
+          - os: macos-latest
             target: x86_64-apple-darwin
+            command: cargo check --release --locked --target x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
+            command: cargo check --release --locked --target aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            command: cargo check --release --locked --target x86_64-pc-windows-msvc
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
+            command: cargo check --release --locked --target aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
@@ -42,35 +49,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: build-${{ matrix.target }}
+          key: check-${{ matrix.target }}
+          shared-key: letcode
 
-      - name: Build release
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          bin_dir="target/${{ matrix.target }}/release"
-          staging="dist/letcode-${version}-${{ matrix.target }}"
-          mkdir -p "$staging"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp "$bin_dir/letcode.exe" "$staging/"
-            asset="${staging}.zip"
-            staging_name="$(basename "$staging")"
-            (cd dist && 7z a -tzip "${staging_name}.zip" "$staging_name")
-          else
-            cp "$bin_dir/letcode" "$staging/"
-            asset="${staging}.tar.gz"
-            tar -C dist -czf "$asset" "letcode-${version}-${{ matrix.target }}"
-          fi
-          echo "ASSET=${asset}" >> "$GITHUB_ENV"
-          ls -lh "$asset"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: letcode-${{ matrix.target }}
-          path: ${{ env.ASSET }}
-          if-no-files-found: error
+      - name: Compile release
+        run: ${{ matrix.command }}

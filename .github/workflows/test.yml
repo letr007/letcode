@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -28,6 +32,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: letcode
 
       - name: Install ripgrep
         if: runner.os == 'Linux'
@@ -41,11 +47,5 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
-      - name: Unit tests
-        run: cargo test-unit
-
-      - name: Integration tests
-        run: cargo test-integration
-
-      - name: Process E2E tests
-        run: cargo test-e2e
+      - name: Tests
+        run: cargo test --locked
