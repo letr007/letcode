@@ -82,7 +82,7 @@ mod session_command_adapter;
 mod session_dialog;
 use history_tree_dialog::history_tree_dialog_items;
 use permission_lifecycle::PermissionLifecycleController;
-use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
+use queued_prompt::QueuedPromptLifecycle;
 use session_dialog::session_dialog_items;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
@@ -1329,7 +1329,6 @@ impl TuiRuntime {
             SessionTransportEvent::TurnStarted => {
                 self.session_turn_active = true;
                 self.current_turn_output_tokens = 0;
-                self.queued_prompt_lifecycle.clear_dispatch_ready();
             }
             SessionTransportEvent::QuestionRequested { request, handle }
                 if self
@@ -1431,25 +1430,11 @@ impl TuiRuntime {
                 self.permission_lifecycle.clear_if_parent();
                 self.cancel_pending_question_if_parent("question cancelled because the turn ended");
                 self.interrupt_confirmation_pending = false;
-                match self.queued_prompt_lifecycle.done_disposition() {
-                    QueuedPromptDoneDisposition::ReadyForNextDispatch => {
-                        self.queued_prompt_lifecycle.mark_dispatch_ready();
-                    }
-                    QueuedPromptDoneDisposition::PreserveInFlight => {}
-                    QueuedPromptDoneDisposition::ConsumeFailedAcceptedPrompt(prompt) => {
-                        if self
-                            .queued_prompts
-                            .front()
-                            .is_some_and(|queued| queued.id == prompt.id)
-                        {
-                            self.queued_prompts.pop_front();
-                            self.state
-                                .timeline
-                                .remove_first_queued_user_message_preview(&prompt.id);
-                        }
-                        self.queued_prompt_lifecycle =
-                            QueuedPromptLifecycle::idle(!self.queued_prompts.is_empty());
-                    }
+                if let Some(prompt) = self.queued_prompt_lifecycle.take() {
+                    self.queued_prompts.retain(|queued| queued.id != prompt.id);
+                    self.state
+                        .timeline
+                        .remove_first_queued_user_message_preview(&prompt.id);
                 }
                 self.session_turn_active = false;
             }
@@ -1458,7 +1443,6 @@ impl TuiRuntime {
                     .retain(|sample| sample.child_session_id.is_some());
                 self.interrupt_confirmation_pending = false;
                 self.session_resume_pending = false;
-                self.queued_prompt_lifecycle.record_error();
             }
             SessionTransportEvent::FastModeChanged { enabled } => {
                 self.state.set_fast_mode_enabled(*enabled);
@@ -1513,8 +1497,13 @@ impl TuiRuntime {
                 self.apply_model_catalog_update(catalog);
                 suppress_session_event = true;
             }
-            SessionTransportEvent::QueuedPromptAccepted { prompt } => {
-                self.queued_prompt_lifecycle.accept(&prompt.id);
+            SessionTransportEvent::QueuedPromptAccepted { prompt }
+                if self
+                    .queued_prompts
+                    .iter()
+                    .any(|queued| queued.id == prompt.id) =>
+            {
+                self.queued_prompt_lifecycle.accept(prompt.clone());
             }
             SessionTransportEvent::SessionTitleUpdated { session_id, title }
                 if self.state.session_id.as_deref() == Some(session_id) =>
@@ -1536,28 +1525,27 @@ impl TuiRuntime {
                 let _ = self
                     .cancel_pending_question("question cancelled because the turn was interrupted");
                 self.interrupt_confirmation_pending = false;
-                self.queued_prompts.clear();
-                self.queued_prompt_lifecycle.reset();
+                if let Some(prompt) = self.queued_prompt_lifecycle.take() {
+                    self.queued_prompts.retain(|queued| queued.id != prompt.id);
+                    self.state
+                        .timeline
+                        .remove_first_queued_user_message_preview(&prompt.id);
+                }
                 self.session_turn_active = false;
-                self.state.activate_all_queued_user_message_previews();
             }
             SessionTransportEvent::UserMessage(user_message) => {
-                self.queued_prompt_lifecycle.clear_dispatch_ready();
                 self.session_turn_active = true;
                 self.current_turn_output_tokens = 0;
 
                 if self
-                    .queued_prompt_lifecycle
-                    .dispatched_submission_id()
-                    .is_some_and(|dispatched| dispatched == user_message.submission_id)
-                    && self
-                        .queued_prompts
-                        .front()
-                        .is_some_and(|queued| queued.id == user_message.submission_id)
+                    .queued_prompts
+                    .iter()
+                    .any(|queued| queued.id == user_message.submission_id)
                 {
                     self.queued_prompt_lifecycle
                         .resolve_user_message(&user_message.submission_id);
-                    self.queued_prompts.pop_front();
+                    self.queued_prompts
+                        .retain(|queued| queued.id != user_message.submission_id);
                     suppress_session_event = self
                         .state
                         .activate_queued_user_message(&user_message.submission_id);
@@ -1572,14 +1560,6 @@ impl TuiRuntime {
                 }) {
                     suppress_session_event = true;
                 }
-            }
-            SessionTransportEvent::AssistantDelta(_)
-            | SessionTransportEvent::ReasoningDelta(_)
-            | SessionTransportEvent::ToolPending(_)
-            | SessionTransportEvent::ToolCancelled(_)
-            | SessionTransportEvent::ToolStarted(_)
-            | SessionTransportEvent::ToolOutputDelta(_) => {
-                self.queued_prompt_lifecycle.clear_dispatch_ready();
             }
             SessionTransportEvent::TokenUsage(token_usage) => {
                 let mut token_usage = token_usage.clone();
@@ -1633,12 +1613,6 @@ impl TuiRuntime {
                     .apply_event(SessionEvent::TokenUsage(token_usage.clone()));
                 self.state.commit_sidebar_token_usage();
                 suppress_session_event = true;
-            }
-            SessionTransportEvent::ToolBatchFinished
-                if !self.queued_prompts.is_empty()
-                    && !self.queued_prompt_lifecycle.has_inflight_handoff() =>
-            {
-                self.queued_prompt_lifecycle.mark_dispatch_ready();
             }
             SessionTransportEvent::SessionResumed {
                 session_id,
@@ -2576,10 +2550,7 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::Submit => self.handle_submit(),
-            InputAction::RemoveLastQueuedPrompt => {
-                self.remove_last_queued_prompt();
-                Ok(None)
-            }
+            InputAction::RemoveLastQueuedPrompt => Ok(self.remove_last_queued_prompt()),
             InputAction::HistoryPrev => {
                 self.navigate_history_previous();
                 Ok(None)
@@ -2754,6 +2725,7 @@ impl TuiRuntime {
             | crate::session::SessionCommand::ViewParent
             | crate::session::SessionCommand::ResumeSession(_)
             | crate::session::SessionCommand::NewSession
+            | crate::session::SessionCommand::CancelQueuedPrompt(_)
             | crate::session::SessionCommand::Interrupt => {}
         }
     }
@@ -2799,16 +2771,27 @@ impl TuiRuntime {
             | crate::session::SessionCommand::ViewParent
             | crate::session::SessionCommand::ResumeSession(_)
             | crate::session::SessionCommand::NewSession
+            | crate::session::SessionCommand::CancelQueuedPrompt(_)
             | crate::session::SessionCommand::Interrupt => {}
         }
     }
 
     pub(super) fn clear_unaccepted_queued_prompt(&mut self) {
-        self.queued_prompt_lifecycle.clear_unaccepted();
+        self.queued_prompt_lifecycle.reset();
+        for prompt in self.queued_prompts.drain(..) {
+            self.state
+                .timeline
+                .remove_first_queued_user_message_preview(&prompt.id);
+        }
     }
 
     fn engine_turn_is_active(&self) -> bool {
-        self.session_turn_active || self.queued_prompt_lifecycle.has_inflight_handoff()
+        self.session_turn_active
+            || !self.queued_prompts.is_empty()
+            || self
+                .queued_prompt_lifecycle
+                .accepted_submission_id()
+                .is_some()
     }
 
     fn has_cancellable_work(&self) -> bool {
@@ -2861,7 +2844,6 @@ impl TuiRuntime {
             return Ok(None);
         }
 
-        let prompt = content.text.clone();
         let command_input = self
             .state
             .input_buffer
@@ -2920,8 +2902,9 @@ impl TuiRuntime {
                 Some(crate::session::ActiveTurnCommandDisposition::QueuePrompt)
                     if !self.state.is_read_only_child_view() =>
                 {
-                    self.queue_prompt(UserMessageSubmission::new(next_submission_id(), content));
-                    return Ok(None);
+                    let submission = UserMessageSubmission::new(next_submission_id(), content);
+                    self.queue_prompt(submission.clone());
+                    return Ok(Some(RuntimeCommand::SubmitPrompt(submission)));
                 }
                 Some(crate::session::ActiveTurnCommandDisposition::Reject)
                 | Some(crate::session::ActiveTurnCommandDisposition::Interrupt)
@@ -2953,20 +2936,12 @@ impl TuiRuntime {
             });
         }
 
-        let submitted_draft = composer_draft_for_submission(&self.state);
-        self.state.clear_input();
-        self.state.clear_composer_tokens();
-        self.state.mark_session_active();
+        let submission = UserMessageSubmission::new(next_submission_id(), content);
+        self.queue_prompt(submission.clone());
         self.state.phase = super::state::AppPhase::Running;
-        self.queued_prompt_lifecycle.clear_dispatch_ready();
         self.session_turn_active = true;
-        self.state.toast = None;
-        self.submitted_prompts.push(prompt.clone());
-        self.submitted_prompt_drafts.push(submitted_draft);
 
-        Ok(Some(RuntimeCommand::SubmitPrompt(
-            UserMessageSubmission::new(next_submission_id(), content),
-        )))
+        Ok(Some(RuntimeCommand::SubmitPrompt(submission)))
     }
 
     fn navigate_history_previous(&mut self) {
@@ -3047,43 +3022,20 @@ impl TuiRuntime {
         self.state.toast = None;
     }
 
-    fn remove_last_queued_prompt(&mut self) {
+    fn remove_last_queued_prompt(&mut self) -> Option<RuntimeCommand> {
         if self.state.is_read_only_child_view() {
-            return;
+            return None;
         }
-        let Some(prompt) = self.queued_prompts.back() else {
-            return;
-        };
-        if self.queued_prompt_lifecycle.dispatched_submission_id() == Some(prompt.id.as_str()) {
-            return;
-        }
-
-        let submission_id = prompt.id.clone();
-        self.queued_prompts.pop_back();
-        self.state
-            .timeline
-            .remove_first_queued_user_message_preview(&submission_id);
-    }
-
-    fn take_next_queued_prompt_command(&mut self) -> Option<RuntimeCommand> {
-        if !self.queued_prompt_lifecycle.is_dispatch_ready()
-            || self.queued_prompt_lifecycle.has_inflight_handoff()
-            || self.permission_lifecycle.is_pending()
-            || self.state.pending_permission.is_some()
-            || matches!(
-                self.state.phase,
-                super::state::AppPhase::WaitingForPermission | super::state::AppPhase::Quitting
-            )
-        {
+        let prompt = self.queued_prompts.back()?;
+        if self.queued_prompt_lifecycle.accepted_submission_id() == Some(prompt.id.as_str()) {
             return None;
         }
 
-        let prompt = self.queued_prompts.front()?.clone();
-        self.queued_prompt_lifecycle.dispatch(prompt.clone());
-        self.session_turn_active = true;
-        self.state.mark_session_active();
-        self.state.phase = super::state::AppPhase::Running;
-        Some(RuntimeCommand::SubmitPrompt(prompt))
+        let submission_id = self.queued_prompts.pop_back()?.id;
+        self.state
+            .timeline
+            .remove_first_queued_user_message_preview(&submission_id);
+        Some(RuntimeCommand::CancelQueuedPrompt(submission_id))
     }
 
     fn handle_interrupt(&mut self) -> Result<Option<RuntimeCommand>> {
@@ -3271,6 +3223,9 @@ impl TuiRuntime {
             SessionCommand::ToggleMcpServer(server_name) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ToggleMcpServer(server_name),
             ))),
+            SessionCommand::CancelQueuedPrompt(submission_id) => Ok(Some(
+                SubmittedCommand::Runtime(RuntimeCommand::CancelQueuedPrompt(submission_id)),
+            )),
             SessionCommand::Interrupt => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Interrupt)))
             }
@@ -6537,9 +6492,6 @@ pub async fn run_tui(
                 process_terminal_event(&mut runtime, event, &ingress)?;
             }
             runtime.try_drain_session_events();
-            if let Some(command) = runtime.take_next_queued_prompt_command() {
-                command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
-            }
             drawer.set_title(&runtime.terminal_title())?;
             runtime.draw(&mut drawer)?;
 

@@ -88,6 +88,15 @@ impl SessionEngineIngress {
         ))
     }
 
+    pub fn cancel_prompt(
+        &self,
+        submission_id: impl Into<String>,
+    ) -> Result<(), SessionEngineIngressError> {
+        self.send_control(SessionEngineControl::Command(
+            SessionEngineCommand::CancelPrompt(submission_id.into()),
+        ))
+    }
+
     /// Request cancellation without frontend-specific execution metadata.
     pub fn request_interrupt(&self) -> Result<(), SessionEngineIngressError> {
         self.send_control(SessionEngineControl::Interrupt)
@@ -1270,6 +1279,19 @@ async fn replace_mcp_session(
     }
 }
 
+fn refresh_peer_session(
+    runtime: &crate::peer::PeerRuntime,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    resumed: bool,
+) -> Result<()> {
+    let (session_id, title) = initial_session_metadata(transcript)?;
+    if resumed {
+        runtime.resume_session(session_id, title)
+    } else {
+        runtime.update_session(session_id, title)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_engine_loop(
     agent: Agent,
@@ -1288,6 +1310,40 @@ async fn run_engine_loop(
 ) {
     let transcript = transcript;
     let mut agent = agent;
+    let peer_control_tx = control_tx.clone();
+    let peer_runtime = match async {
+        let (session_id, title) = initial_session_metadata(&transcript)?;
+        let config_dir = config
+            .mcp_config_path
+            .parent()
+            .ok_or_else(|| anyhow!("configuration path has no parent directory"))?;
+        let runtime = crate::peer::PeerRuntime::start(
+            config_dir,
+            config.workspace_dir.clone(),
+            session_id,
+            title,
+            move |message| {
+                let _ = peer_control_tx.send(SessionEngineControl::Command(
+                    SessionEngineCommand::PeerMessage(message),
+                ));
+            },
+        )
+        .await?;
+        crate::tool::peer::register(&mut agent, runtime.client())?;
+        Ok::<_, anyhow::Error>(runtime)
+    }
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                format!("failed to start peer messaging: {error}"),
+            )));
+            return;
+        }
+    };
+    let peer_client = peer_runtime.client();
+    let (peer_title_tx, mut peer_title_rx) = mpsc::unbounded_channel();
     let mut mcp_tools_rx = Some(mcp_tools_rx);
     // The auto-review service reads both maps from outside the engine loop, so
     // they become shared handles here and leave the configuration value empty.
@@ -1343,6 +1399,18 @@ async fn run_engine_loop(
     loop {
         tokio::select! {
             biased;
+            Some(event) = peer_title_rx.recv() => {
+                if let SessionTransportEvent::SessionTitleUpdated { session_id, title } = &event
+                    && peer_client.info().address.session_id == *session_id
+                    && let Err(error) = peer_runtime.update_session(session_id.clone(), Some(title.clone()))
+                {
+                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                        format!("failed to update peer session title: {error}"),
+                    )));
+                    break;
+                }
+                let _ = title_event_tx.send(event);
+            }
             reload = reload_rx.recv() => {
                 if reload.is_none() {
                     break;
@@ -1820,6 +1888,43 @@ async fn run_engine_loop(
                         crate::user_content::UserMessageSubmission::new(crate::subagent::generate_message_id(), crate::user_content::UserMessageContent::from(message))
                     }
                     SessionEngineCommand::Prompt(prompt) => prompt,
+                    SessionEngineCommand::PeerMessage(message) => {
+                        if message.to != peer_client.info().address {
+                            continue;
+                        }
+                        let current_session_id = match transcript.lock() {
+                            Ok(recorder) => recorder.session_id().to_string(),
+                            Err(_) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                    ErrorEvent::new("transcript recorder poisoned"),
+                                ));
+                                break;
+                            }
+                        };
+                        if message.to.session_id != current_session_id {
+                            continue;
+                        }
+                        crate::user_content::UserMessageSubmission::new(
+                            crate::subagent::generate_message_id(),
+                            crate::user_content::UserMessageContent::from(format!(
+                                "[Peer message from {}. The source is routing metadata.]\n{}",
+                                serde_json::to_string(&message.from).expect("peer address serializes"),
+                                message.message,
+                            )),
+                        )
+                    }
+                    SessionEngineCommand::CancelQueuedPrompt(id) => {
+                        cancel_queued_prompt(&mut deferred_commands, &id);
+                        continue;
+                    }
+                    SessionEngineCommand::CancelPrompt(id) => {
+                        if cancel_queued_prompt(&mut deferred_commands, &id) {
+                            let _ = session_transport_tx.send(SessionTransportEvent::PromptCancelled {
+                                submission_id: id,
+                            });
+                        }
+                        continue;
+                    }
                     SessionEngineCommand::ContinueSession => {
                         crate::user_content::UserMessageSubmission::new(
                             "internal-continuation",
@@ -1845,6 +1950,7 @@ async fn run_engine_loop(
                         continue;
                     }
                     SessionEngineCommand::Compact => {
+                        let _ = session_transport_tx.send(SessionTransportEvent::ManualCompactionStarted);
                         let active_route_has_credentials = {
                             let route_api_keys = route_api_key_configured
                                 .lock()
@@ -1936,7 +2042,7 @@ async fn run_engine_loop(
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new("failed to settle swarm before reloading the current session")));
                                 continue;
                             }
-                            let restored = (|| -> Result<()> {
+                            let restored = (|| -> Result<SessionTransportEvent> {
                                 rehydrate_agent_from_transcript(&mut agent, &transcript)?;
                                 let recorder = transcript.lock().map_err(|_| anyhow!("transcript recorder poisoned"))?;
                                 let records = read_records(recorder.path())?;
@@ -1954,18 +2060,26 @@ async fn run_engine_loop(
                                         config.api_key_hint.clone(), Some(control_tx.clone()), Some(session_transport_tx.clone()));
                                 runner.prepare_subagent_runtime(&mut agent)?;
                                 auto_review_service.clear_sticky();
-                                let _ = session_transport_tx.send(SessionTransportEvent::SessionResumed {
+                                Ok(SessionTransportEvent::SessionResumed {
                                     session_id: session_id.clone(), branch_id: snapshot.branch_id,
                                     messages: crate::session::restore::restored_messages_from_protocol_frames(&snapshot.snapshot.active_protocol_frames()),
                                     records, evidence_count: snapshot.snapshot.evidence.len(), model_id: Some(agent.route_display_name()), token_usage: None,
                                     runtime_context,
                                     expert_models: config.expert_default_routes.iter().map(|(name, route)| (name.clone(), route.display_name())).collect(),
-                                });
-                                Ok(())
+                                })
                             })();
-                            if let Err(error) = restored {
-                                subagent_runtime.close_swarm_sessions();
-                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("failed to reload current swarm session: {error}"))));
+                            match restored {
+                                Ok(event) => {
+                                    if let Err(error) = refresh_peer_session(&peer_runtime, &transcript, true) {
+                                        let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(error.to_string())));
+                                        break;
+                                    }
+                                    let _ = session_transport_tx.send(event);
+                                }
+                                Err(error) => {
+                                    subagent_runtime.close_swarm_sessions();
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("failed to reload current swarm session: {error}"))));
+                                }
                             }
                             continue;
                         }
@@ -2080,6 +2194,10 @@ async fn run_engine_loop(
                                     mode: agent.permission_mode().to_string(),
                                 },
                             );
+                        }
+                        if let Err(error) = refresh_peer_session(&peer_runtime, &transcript, true) {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(error.to_string())));
+                            break;
                         }
                         let _ = session_transport_tx.send(SessionTransportEvent::SessionResumed {
                             session_id: resumed_event_session_id,
@@ -2211,6 +2329,10 @@ async fn run_engine_loop(
                         let new_session_model_id = agent.route_display_name();
                         if let Some(historian) = &agent.historian_runtime { historian.cancel(); }
                         auto_review_service.clear_sticky();
+                        if let Err(error) = refresh_peer_session(&peer_runtime, &transcript, false) {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(error.to_string())));
+                            break;
+                        }
                         let _ = session_transport_tx.send(started_event);
                         let _ = session_transport_tx.send(SessionTransportEvent::ModelChanged {
                             model_id: new_session_model_id,
@@ -2264,7 +2386,7 @@ async fn run_engine_loop(
                     runner_event_tx,
                     transcript.clone(),
                 )
-                    .with_session_title_event_sender(title_event_tx.clone())
+                    .with_session_title_event_sender(peer_title_tx.clone())
                     .with_child_live_text(child_live_text.clone())
                     .with_subagent_runtime(
                         subagent_runtime.clone(),
@@ -2282,6 +2404,7 @@ async fn run_engine_loop(
                         Some(session_transport_tx.clone()),
                     );
                 let historian_control = agent.historian_runtime.clone();
+                let active_submission_id = prompt.id.clone();
                 let (interrupted, shutdown, interrupt_failure, turn_failure) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
@@ -2305,14 +2428,46 @@ async fn run_engine_loop(
                     let mut turn_failure = None;
 
                     loop {
-                        match select_active_session_operation_with_events(
-                            &mut control_rx,
-                            &mut deferred_commands,
-                            run.as_mut(),
-                            Some(&mut runner_event_rx),
-                        )
-                        .await
-                        {
+                        let operation = tokio::select! {
+                            Some(event) = peer_title_rx.recv() => {
+                                if let SessionTransportEvent::SessionTitleUpdated { session_id, title } = &event
+                                    && peer_client.info().address.session_id == *session_id
+                                    && let Err(error) = peer_runtime.update_session(session_id.clone(), Some(title.clone()))
+                                {
+                                    interrupt_failure = Some(format!("failed to update peer session title: {error}"));
+                                    break;
+                                }
+                                let _ = title_event_tx.send(event);
+                                continue;
+                            }
+                            operation = select_active_session_operation_with_events(
+                                &mut control_rx,
+                                &mut deferred_commands,
+                                run.as_mut(),
+                                Some(&mut runner_event_rx),
+                            ) => operation,
+                        };
+                        let targeted_cancel = matches!(&operation,
+                            ActiveSessionOperation::Command(Some(SessionEngineCommand::CancelPrompt(id)))
+                                if *id == active_submission_id);
+                        let operation = match operation {
+                            ActiveSessionOperation::Command(Some(SessionEngineCommand::CancelPrompt(id))) => {
+                                if targeted_cancel {
+                                    ActiveSessionOperation::Interrupted
+                                } else {
+                                    let parked = cancel_queued_prompt(&mut parked_commands, &id);
+                                    let deferred = cancel_queued_prompt(&mut deferred_commands, &id);
+                                    if parked || deferred {
+                                        let _ = session_transport_tx.send(SessionTransportEvent::PromptCancelled {
+                                            submission_id: id,
+                                        });
+                                    }
+                                    continue;
+                                }
+                            }
+                            operation => operation,
+                        };
+                        match operation {
                             outcome @ (ActiveSessionOperation::Interrupted
                             | ActiveSessionOperation::Shutdown) => {
                                 let is_shutdown =
@@ -2336,6 +2491,9 @@ async fn run_engine_loop(
                                         break;
                                     }
                                 };
+                                if !targeted_cancel {
+                                    discard_queued_peer_messages(&mut parked_commands);
+                                }
                                 interrupted = Some(interrupt);
                                 if is_shutdown { subagent_runtime.cancel_active(); }
                                 if is_shutdown && subagent_runtime.is_running() {
@@ -2378,15 +2536,13 @@ async fn run_engine_loop(
                                 Some(command @ SessionEngineCommand::SwarmMessageReady { .. }) => {
                                     parked_commands.push_back(command);
                                 }
-                                Some(SessionEngineCommand::Prompt(prompt)) => {
-                                    if let Ok(mut queue) = turn_continuation_queue.lock() {
-                                        queue.mark_user_prompt_queued();
-                                    }
-                                    deferred_commands.push_front(SessionEngineCommand::Prompt(prompt));
-                                    let _ = session_transport_tx.send(SessionTransportEvent::AssistantDone {
-                                        message_id: None,
-                                    });
-                                    break;
+                                Some(command @ (SessionEngineCommand::Prompt(_)
+                                    | SessionEngineCommand::PeerMessage(_))) => {
+                                    parked_commands.push_back(command);
+                                }
+                                Some(SessionEngineCommand::CancelQueuedPrompt(id)) => {
+                                    cancel_queued_prompt(&mut parked_commands, &id);
+                                    cancel_queued_prompt(&mut deferred_commands, &id);
                                 }
                                 Some(SessionEngineCommand::ViewChild {
                                     navigation,
@@ -2508,34 +2664,6 @@ async fn run_engine_loop(
                     deferred_commands.clear();
                     parked_commands.clear();
                     break;
-                }
-                if turn_continuation_queue
-                    .lock()
-                    .map(|queue| queue.preempted_by_user_prompt())
-                    .unwrap_or(false)
-                {
-                    if let Err(error) = derive_interrupt_request(&transcript, &subagent_runtime)
-                        .and_then(|interrupt| record_interrupt_transcript(&transcript, &interrupt))
-                    {
-                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                            ErrorEvent::new(format!(
-                                "failed to close the preempted turn before queued prompt: {error}"
-                            )),
-                        ));
-                        deferred_commands.clear();
-                        parked_commands.clear();
-                        break;
-                    }
-                    if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
-                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                            ErrorEvent::new(format!(
-                                "failed to restore background completion before queued prompt: {error}"
-                            )),
-                        ));
-                        deferred_commands.clear();
-                        parked_commands.clear();
-                        break;
-                    }
                 }
                 if let Some(interrupt) = interrupted {
                     let persisted_interrupt = match record_interrupt_transcript(&transcript, &interrupt) {

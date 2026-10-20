@@ -165,6 +165,10 @@ pub(crate) enum SessionTransportEvent {
     QueuedPromptAccepted {
         prompt: UserMessageSubmission,
     },
+    PromptCancelled {
+        submission_id: String,
+    },
+    ManualCompactionStarted,
     TodoSnapshot(TodoSnapshotEvent),
     AutoContinueChanged(AutoContinueChangedEvent),
     FastModeChanged {
@@ -355,7 +359,9 @@ impl SessionTransportEvent {
             | Self::BackgroundSubagentCompleted { .. }
             | Self::ModelCatalogUpdated(_)
             | Self::SettingChangeFailed { .. }
-            | Self::QueuedPromptAccepted { .. } => None,
+            | Self::QueuedPromptAccepted { .. }
+            | Self::PromptCancelled { .. }
+            | Self::ManualCompactionStarted => None,
             Self::TodoSnapshot(event) => Some(SessionEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => {
                 Some(SessionEvent::AutoContinueChanged(event.clone()))

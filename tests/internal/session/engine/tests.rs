@@ -2888,8 +2888,22 @@ max_output_tokens = 4096
     }
 
     #[tokio::test]
-    async fn a_prompt_queued_behind_a_preempted_turn_keeps_the_session_usable() {
+    async fn local_and_peer_inputs_wait_for_the_active_turn_and_keep_fifo_order() {
+        for peer_first in [false, true] {
+            check_queued_inputs(peer_first, None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_cancellation_targets_queued_and_active_submissions() {
+        for active in [false, true] {
+            check_queued_inputs(false, Some(active)).await;
+        }
+    }
+
+    async fn check_queued_inputs(peer_first: bool, cancel_active: Option<bool>) {
         tokio::time::timeout(Duration::from_secs(30), async {
+            let release = Arc::new(tokio::sync::Notify::new());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
@@ -2951,7 +2965,7 @@ max_output_tokens = 4096
             agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
             agent.set_primary_route_factory(primary_factory);
             agent
-                .try_register_tool(HoldingTool { release: None })
+                .try_register_tool(HoldingTool { release: Some(release.clone()) })
                 .expect("register the holding tool");
             crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
 
@@ -2962,8 +2976,83 @@ max_output_tokens = 4096
             let ingress = engine.take_ingress();
             let mut events = engine.take_event_egress().into_receiver();
 
+            let peers = crate::peer::PeerRuntime::start(
+                directory.path(), None, "sender".into(), None, |_| {},
+            ).await.unwrap();
+            let peer_address = loop {
+                let discovered = peers.client().discover().unwrap();
+                if let Some(peer) = discovered.into_iter().find(|peer| peer.address.session_id != "sender") {
+                    break peer.address;
+                }
+                tokio::task::yield_now().await;
+            };
+            if let Some(cancel_active) = cancel_active {
+                let prompt = |id: &str| SessionEngineCommand::Prompt(
+                    crate::user_content::UserMessageSubmission::new(id, id.into()),
+                );
+                let peer = || SessionEngineCommand::PeerMessage(crate::peer::PeerMessage {
+                    from: peer_address.clone(),
+                    to: peer_address.clone(),
+                    message: "peer input".into(),
+                });
+                ingress.submit_transitional(if cancel_active { prompt("target") } else { peer() }).unwrap();
+                loop {
+                    if open_tool_call_batch_recorded(&transcript).unwrap_or(false) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                if cancel_active {
+                    ingress.submit_transitional(peer()).unwrap();
+                } else {
+                    ingress.submit_transitional(prompt("target")).unwrap();
+                }
+                ingress.cancel_prompt("target").unwrap();
+                let mut accepted = Vec::new();
+                loop {
+                    match events.recv().await.unwrap() {
+                        SessionTransportEvent::QueuedPromptAccepted { prompt } => accepted.push(prompt.id),
+                        SessionTransportEvent::Interrupted => {
+                            assert!(cancel_active);
+                            break;
+                        }
+                        SessionTransportEvent::PromptCancelled { submission_id } => {
+                            assert!(!cancel_active);
+                            assert_eq!(submission_id, "target");
+                            break;
+                        }
+                        SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                        _ => {}
+                    }
+                }
+                assert_eq!(accepted.len(), 1);
+                assert_eq!(accepted[0] == "target", cancel_active);
+                if !cancel_active {
+                    assert!(open_tool_call_batch_recorded(&transcript).unwrap());
+                    release.notify_one();
+                }
+                ingress.cancel_prompt("target").unwrap();
+                loop {
+                    match events.recv().await.unwrap() {
+                        SessionTransportEvent::Done => break,
+                        SessionTransportEvent::QueuedPromptAccepted { prompt } => {
+                            assert!(cancel_active);
+                            assert!(prompt.text().contains("peer input"));
+                        }
+                        SessionTransportEvent::Interrupted | SessionTransportEvent::PromptCancelled { .. } => {
+                            panic!("completed or unrelated submissions stay unchanged");
+                        }
+                        SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                        _ => {}
+                    }
+                }
+                ingress.shutdown().unwrap();
+                engine.join().await.unwrap();
+                stub.abort();
+                return;
+            }
             let mut errors = Vec::new();
-            let mut answers = Vec::new();
+            let mut accepted = Vec::new();
             ingress
                 .submit(SessionCommand::SubmitPrompt(
                     crate::user_content::UserMessageSubmission::new(
@@ -2987,8 +3076,10 @@ max_output_tokens = 4096
                     );
                 }
                 while let Ok(event) = events.try_recv() {
-                    if let SessionTransportEvent::Error(error) = event {
-                        errors.push(observed_error(&error));
+                    match event {
+                        SessionTransportEvent::Error(error) => errors.push(observed_error(&error)),
+                        SessionTransportEvent::QueuedPromptAccepted { prompt } => accepted.push(prompt.content.text),
+                        _ => {}
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -3003,51 +3094,71 @@ max_output_tokens = 4096
                 ))
                 .unwrap();
 
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let Ok(Some(event)) = tokio::time::timeout(remaining, events.recv()).await else {
-                    break;
-                };
-                match event {
-                    SessionTransportEvent::Error(error) => {
-                        let locked = error
-                            .message
-                            .contains("assistant tool call group is incomplete");
-                        errors.push(observed_error(&error));
-                        if locked {
-                            break;
-                        }
-                    }
-                    SessionTransportEvent::AssistantDelta(delta) => {
-                        let answered = delta.delta.contains(STUB_ANSWER);
-                        answers.push(delta.delta);
-                        if answered {
-                            break;
-                        }
-                    }
+            let peer_input = SessionEngineCommand::PeerMessage(crate::peer::PeerMessage {
+                from: crate::peer::PeerAddress {
+                    instance_id: "source".into(), session_id: "sender".into(), generation: 0,
+                },
+                to: peer_address.clone(),
+                message: "peer input".into(),
+            });
+            ingress.submit(SessionCommand::CancelQueuedPrompt("prompt-2".into())).unwrap();
+            let queued = |id: &str| SessionEngineCommand::Prompt(
+                crate::user_content::UserMessageSubmission::new(id, crate::user_content::UserMessageContent::from(id)),
+            );
+            let commands = if peer_first {
+                [peer_input, queued("local input")]
+            } else {
+                [queued("local input"), peer_input]
+            };
+            for command in commands {
+                ingress.submit_transitional(command).unwrap();
+            }
+            let (reply, mut barrier) = tokio::sync::oneshot::channel();
+            ingress.submit_transitional(SessionEngineCommand::InspectHistory(reply)).unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(30), &mut barrier).await.is_err());
+            assert!(open_tool_call_batch_recorded(&transcript).unwrap());
+            release.notify_one();
+            barrier.await.unwrap();
+            let mut done = 0;
+            while done != 3 {
+                match events.recv().await.unwrap() {
+                    SessionTransportEvent::QueuedPromptAccepted { prompt } => accepted.push(prompt.content.text),
+                    SessionTransportEvent::Done => done += 1,
+                    SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
                     _ => {}
                 }
             }
-
-            assert!(
-                !errors.iter().any(|message| message
-                    .contains("assistant tool call group is incomplete")),
-                "preempting a running turn must not leave the session locked; observed errors: {errors:?}"
-            );
-            assert!(
-                answers.iter().any(|answer| answer.contains(STUB_ANSWER)),
-                "the prompt queued behind the preempted turn must open its own turn; observed errors: {errors:?}"
-            );
-
+            assert_eq!(accepted.len(), 3);
+            assert_eq!(accepted[0], "first prompt");
+            assert!(accepted[if peer_first { 1 } else { 2 }].contains("peer input"));
+            assert_eq!(accepted[if peer_first { 2 } else { 1 }], "local input");
+            assert!(errors.is_empty());
+            ingress.submit(SessionCommand::NewSession).unwrap();
+            loop {
+                match events.recv().await.unwrap() {
+                    SessionTransportEvent::SessionStarted { .. } => break,
+                    SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                    _ => {}
+                }
+            }
+            ingress.submit_transitional(SessionEngineCommand::PeerMessage(crate::peer::PeerMessage {
+                from: peer_address.clone(), to: peer_address, message: "old target".into(),
+            })).unwrap();
+            let (reply, barrier) = tokio::sync::oneshot::channel();
+            ingress.submit_transitional(SessionEngineCommand::InspectHistory(reply)).unwrap();
+            barrier.await.unwrap();
+            while let Ok(event) = events.try_recv() {
+                assert!(!matches!(event, SessionTransportEvent::QueuedPromptAccepted { .. }));
+                if let SessionTransportEvent::Error(error) = event {
+                    panic!("{}", observed_error(&error));
+                }
+            }
             ingress.shutdown().unwrap();
             engine.join().await.unwrap();
+            assert_eq!(peers.client().discover().unwrap().len(), 1);
             stub.abort();
         })
         .await
-        .expect("preemption of a running turn timed out");
+        .expect("queued inputs timed out");
     }
 }

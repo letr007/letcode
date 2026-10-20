@@ -684,7 +684,6 @@ pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot
 #[derive(Debug, Default)]
 pub(crate) struct TurnContinuationQueue {
     pending: VecDeque<PendingTurnContinuation>,
-    preempted_by_user_prompt: bool,
 }
 
 impl TurnContinuationQueue {
@@ -692,18 +691,7 @@ impl TurnContinuationQueue {
         self.pending.push_back(continuation);
     }
 
-    pub(crate) fn mark_user_prompt_queued(&mut self) {
-        self.preempted_by_user_prompt = true;
-    }
-
-    pub(crate) fn preempted_by_user_prompt(&self) -> bool {
-        self.preempted_by_user_prompt
-    }
-
     pub(crate) fn drain_ready(&mut self) -> Vec<PendingTurnContinuation> {
-        if self.preempted_by_user_prompt {
-            return Vec::new();
-        }
         self.pending.drain(..).collect()
     }
 }
@@ -1020,10 +1008,11 @@ impl AgentFactory {
             prelude,
             runtime_snapshot: Agent::fresh_runtime_snapshot(&model),
             protocol_append_state: crate::protocol_frames::ProtocolAppendState::empty(),
-            tools: parent
-                .tools
-                .scoped(template.tool_scope)
-                .without_tools(&[tool_names::TOOL_MEMORY_RECALL]),
+            tools: parent.tools.scoped(template.tool_scope).without_tools(&[
+                tool_names::TOOL_MEMORY_RECALL,
+                tool_names::TOOL_PEER_DISCOVER,
+                tool_names::TOOL_PEER_SEND,
+            ]),
             skill_registry: parent.skill_registry.clone(),
             skill_cards: parent.skill_cards.clone(),
             subagent_delegate: None,

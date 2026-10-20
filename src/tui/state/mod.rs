@@ -2127,15 +2127,6 @@ impl TuiState {
         true
     }
 
-    pub fn activate_all_queued_user_message_previews(&mut self) -> usize {
-        let activated = self.timeline.activate_queued_user_message_previews();
-        if activated > 0 {
-            self.active_session = true;
-            self.begin_user_turn_state();
-        }
-        activated
-    }
-
     fn begin_user_turn_state(&mut self) {
         self.latest_auto_continue = AutoContinueState::default();
         if let Some(todo) = self.latest_todo.as_mut() {

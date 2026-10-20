@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
@@ -21,6 +22,15 @@ const ANSWER: &str = "The file was read successfully.";
 const RESUMED_ANSWER: &str = "The saved file discussion was resumed.";
 const CALL_ID: &str = "read-fixture-call";
 const MODEL_ERROR: &str = "scripted_invalid_request";
+const PEER_PROMPT: &str = "Send the peer a greeting and finish this turn.";
+const PEER_GREETING: &str = "peer-greeting-evidence-5821";
+const PEER_REPLY: &str = "peer-reply-evidence-9043";
+const PEER_SENT: &str = "The greeting was written; this turn is complete.";
+const PEER_REPLIED: &str = "The reply was written.";
+const PEER_ANSWER: &str = "The peer reply was received.";
+const DISCOVER_CALL: &str = "peer-discover-call";
+const SEND_CALL: &str = "peer-greeting-call";
+const REPLY_CALL: &str = "peer-reply-call";
 
 type Requests = Arc<Mutex<Vec<Value>>>;
 
@@ -100,7 +110,7 @@ tools = true
         std::fs::write(&self.config, config).unwrap();
     }
 
-    async fn run(&self, args: &[&str], input: &str, requests: Option<&Requests>) -> Output {
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_letcode"));
         command.env_clear();
         for key in [
@@ -135,7 +145,11 @@ tools = true
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().unwrap();
+        command
+    }
+
+    async fn run(&self, args: &[&str], input: &str, requests: Option<&Requests>) -> Output {
+        let mut child = self.command(args).spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap().take(MAX_BYTES as u64);
         let mut stderr = child.stderr.take().unwrap().take(MAX_BYTES as u64);
@@ -188,6 +202,33 @@ tools = true
         }
     }
 
+    async fn peers(&self, expected: usize) -> Vec<Value> {
+        let directory = self.home.join(".config/letcode/peers");
+        timeout(IO_TIMEOUT, async {
+            loop {
+                let peers: Vec<Value> = if directory.exists() {
+                    std::fs::read_dir(&directory)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| {
+                            path.extension()
+                                .is_some_and(|extension| extension == "json")
+                        })
+                        .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if peers.len() == expected {
+                    return peers;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("peer registration deadline exceeded")
+    }
+
     fn journal(&self, session_id: &str) -> (PathBuf, Vec<u8>, Vec<Value>) {
         let mut pending = vec![self.sessions.clone()];
         let mut matches = Vec::new();
@@ -235,6 +276,91 @@ tools = true
     }
 }
 
+struct Repl {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    out_task: JoinHandle<Vec<u8>>,
+    err_task: JoinHandle<Vec<u8>>,
+}
+
+impl Repl {
+    fn start(sandbox: &Sandbox) -> Self {
+        let mut child = sandbox.command(&["--cli"]).spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let out_task = tokio::spawn(capture_output(child.stdout.take().unwrap(), stdout.clone()));
+        let err_task = tokio::spawn(capture_output(
+            child.stderr.take().unwrap(),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        Self {
+            child,
+            stdin,
+            stdout,
+            out_task,
+            err_task,
+        }
+    }
+
+    async fn wait_for(&self, text: &str) {
+        timeout(IO_TIMEOUT, async {
+            loop {
+                if String::from_utf8_lossy(&self.stdout.lock().unwrap()).contains(text) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "missing {text:?} in CLI stdout: {}",
+                String::from_utf8_lossy(&self.stdout.lock().unwrap())
+            )
+        });
+    }
+
+    async fn exit(mut self) -> Output {
+        self.stdin.write_all(b"/exit\n").await.unwrap();
+        let status = timeout(IO_TIMEOUT, self.child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        Output {
+            status,
+            stdout: self.out_task.await.unwrap(),
+            stderr: self.err_task.await.unwrap(),
+        }
+    }
+}
+
+async fn capture_output(
+    mut reader: impl AsyncRead + Unpin,
+    captured: Arc<Mutex<Vec<u8>>>,
+) -> Vec<u8> {
+    timeout(PROCESS_TIMEOUT, async {
+        let mut chunk = [0; 4096];
+        loop {
+            let read = reader.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                return captured.lock().unwrap().clone();
+            }
+            let mut output = captured.lock().unwrap();
+            output.extend_from_slice(&chunk[..read]);
+            assert!(output.len() < MAX_BYTES, "CLI output limit exceeded");
+        }
+    })
+    .await
+    .expect("CLI output deadline exceeded")
+}
+
+#[derive(Clone)]
+enum ModelScript {
+    File { fail: bool },
+    Peer { reply_allowed: Arc<Notify> },
+}
+
 struct ModelServer {
     address: std::net::SocketAddr,
     requests: Requests,
@@ -244,6 +370,10 @@ struct ModelServer {
 
 impl ModelServer {
     async fn start(fail: bool) -> Self {
+        Self::scripted(ModelScript::File { fail }).await
+    }
+
+    async fn scripted(script: ModelScript) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -259,8 +389,9 @@ impl ModelServer {
                             let (stream, _) = accepted.unwrap();
                             let seen = seen.clone();
                             let failures = failures.clone();
+                            let script = script.clone();
                             connections.spawn(async move {
-                                match timeout(IO_TIMEOUT, serve_request(stream, &seen, fail)).await {
+                                match timeout(IO_TIMEOUT, serve_request(stream, &seen, &script)).await {
                                     Ok(Ok(())) => {}
                                     other => failures.lock().unwrap().push(format!("model connection failed: {other:?}")),
                                 }
@@ -321,7 +452,7 @@ fn has_tools(request: &Value) -> bool {
 async fn serve_request(
     mut stream: TcpStream,
     requests: &Requests,
-    fail: bool,
+    script: &ModelScript,
 ) -> Result<(), String> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 4096];
@@ -382,7 +513,9 @@ async fn serve_request(
     let request: Value = serde_json::from_slice(&bytes[header_end..header_end + content_length])
         .map_err(|error| error.to_string())?;
     requests.lock().unwrap().push(request.clone());
-    let (status, content_type, body) = if fail && has_tools(&request) {
+    let (status, content_type, body) = if matches!(script, ModelScript::File { fail: true })
+        && has_tools(&request)
+    {
         (
             "400 Bad Request",
             "application/json",
@@ -392,6 +525,8 @@ async fn serve_request(
         let input = request["input"].to_string();
         let output = if !has_tools(&request) {
             message("File discussion")
+        } else if let ModelScript::Peer { reply_allowed } = script {
+            peer_response(&request, reply_allowed).await?
         } else if input.contains(FOLLOWUP) {
             message(RESUMED_ANSWER)
         } else if tool_output(&request).is_some() {
@@ -433,6 +568,92 @@ async fn serve_request(
         .await
         .map_err(|error| error.to_string())?;
     stream.shutdown().await.map_err(|error| error.to_string())
+}
+
+fn latest_user(request: &Value) -> (&Value, &[Value]) {
+    let input = request["input"].as_array().unwrap();
+    let index = input
+        .iter()
+        .rposition(|item| item["role"] == "user")
+        .unwrap();
+    (&input[index], &input[index + 1..])
+}
+
+fn user_text(user: &Value) -> String {
+    user["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn peer_response(request: &Value, reply_allowed: &Notify) -> Result<Value, String> {
+    let (user, turn) = latest_user(request);
+    if let Some(output) = turn
+        .iter()
+        .rev()
+        .find(|item| item["type"] == "function_call_output")
+    {
+        let result: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+        if result["ok"] != true {
+            return Err(format!("peer tool failed: {result}"));
+        }
+        return match output["call_id"].as_str().unwrap() {
+            DISCOVER_CALL => {
+                let peers = result["data"]["peers"].as_array().unwrap();
+                assert_eq!(peers.len(), 1, "{result}");
+                assert_ne!(peers[0]["address"], result["data"]["self"]);
+                Ok(peer_call(
+                    SEND_CALL,
+                    "peer__send",
+                    json!({
+                        "to": peers[0]["address"], "message": PEER_GREETING,
+                    }),
+                ))
+            }
+            SEND_CALL | REPLY_CALL => {
+                assert_eq!(result["data"]["status"], "written", "{result}");
+                Ok(message(if output["call_id"] == SEND_CALL {
+                    PEER_SENT
+                } else {
+                    PEER_REPLIED
+                }))
+            }
+            _ => Err(format!("unexpected peer tool output: {output}")),
+        };
+    }
+    let text = user_text(user);
+    if text == PEER_PROMPT {
+        Ok(peer_call(DISCOVER_CALL, "peer__discover", json!({})))
+    } else if text.contains(PEER_GREETING) {
+        let address = peer_source(&text);
+        reply_allowed.notified().await;
+        Ok(peer_call(
+            REPLY_CALL,
+            "peer__send",
+            json!({
+                "to": address, "message": PEER_REPLY,
+            }),
+        ))
+    } else if text.contains(PEER_REPLY) {
+        Ok(message(PEER_ANSWER))
+    } else {
+        Err(format!("unexpected peer model input: {text}"))
+    }
+}
+
+fn peer_source(text: &str) -> Value {
+    let source = text.strip_prefix("[Peer message from ").unwrap();
+    let (source, _) = source
+        .split_once(". The source is routing metadata.]\n")
+        .unwrap();
+    serde_json::from_str(source).unwrap()
+}
+
+fn peer_call(call_id: &str, name: &str, arguments: Value) -> Value {
+    json!({"type":"function_call", "id":format!("fc_{call_id}"), "call_id":call_id, "name":name, "arguments":arguments.to_string()})
 }
 
 fn message(text: &str) -> Value {
@@ -636,4 +857,105 @@ async fn model_rejection_returns_failure_json_and_persists_error() {
         1,
         "non-retryable HTTP 400 was retried: {requests:#?}"
     );
+}
+
+#[tokio::test]
+async fn repl_peers_exchange_messages_and_remove_registrations_on_exit() {
+    let sandbox = Sandbox::new();
+    let reply_allowed = Arc::new(Notify::new());
+    let server = ModelServer::scripted(ModelScript::Peer {
+        reply_allowed: reply_allowed.clone(),
+    })
+    .await;
+    sandbox.configure(&server);
+    timeout(PROCESS_TIMEOUT, async {
+        let mut a = Repl::start(&sandbox);
+        let a_peer = sandbox.peers(1).await.pop().unwrap();
+        let b = Repl::start(&sandbox);
+        let peers = sandbox.peers(2).await;
+        let b_peer = peers
+            .iter()
+            .find(|peer| peer["address"] != a_peer["address"])
+            .unwrap()
+            .clone();
+
+        a.stdin
+            .write_all(format!("{PEER_PROMPT}\n").as_bytes())
+            .await
+            .unwrap();
+        a.wait_for(PEER_SENT).await;
+        let requests = server.main_requests();
+        assert!(
+            requests.iter().any(|request| {
+                request["input"].as_array().unwrap().iter().any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == SEND_CALL
+                })
+            }),
+            "{requests:#?}"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| { user_text(latest_user(request).0).contains(PEER_REPLY) }),
+            "A's initial turn must finish before B is allowed to reply: {requests:#?}"
+        );
+
+        reply_allowed.notify_one();
+        a.wait_for(PEER_ANSWER).await;
+        b.wait_for(PEER_REPLIED).await;
+        let requests = server.main_requests();
+        for (payload, source) in [(PEER_GREETING, &a_peer), (PEER_REPLY, &b_peer)] {
+            let request = requests
+                .iter()
+                .find(|request| user_text(latest_user(request).0).contains(payload))
+                .unwrap_or_else(|| panic!("missing delivered {payload:?}: {requests:#?}"));
+            assert_eq!(
+                peer_source(&user_text(latest_user(request).0)),
+                source["address"]
+            );
+        }
+        for (call_id, name, destination, payload) in [
+            (SEND_CALL, "peer__send", &b_peer, PEER_GREETING),
+            (REPLY_CALL, "peer__send", &a_peer, PEER_REPLY),
+        ] {
+            let call = requests
+                .iter()
+                .flat_map(|request| request["input"].as_array().unwrap())
+                .find(|item| item["type"] == "function_call" && item["call_id"] == call_id)
+                .unwrap_or_else(|| panic!("missing {call_id}: {requests:#?}"));
+            assert_eq!(call["name"], name);
+            let arguments: Value =
+                serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments["to"], destination["address"]);
+            assert_eq!(arguments["message"], payload);
+        }
+
+        let (a_output, b_output) = tokio::join!(a.exit(), b.exit());
+        assert_success(&a_output);
+        assert_success(&b_output);
+        assert!(String::from_utf8_lossy(&a_output.stdout).contains(PEER_ANSWER));
+        assert!(String::from_utf8_lossy(&b_output.stdout).contains(PEER_REPLIED));
+        assert!(sandbox.peers(0).await.is_empty());
+        for (peer, payload, answer) in [
+            (&a_peer, PEER_REPLY, PEER_ANSWER),
+            (&b_peer, PEER_GREETING, PEER_REPLIED),
+        ] {
+            let (_, _, records) = sandbox.journal(peer["address"]["session_id"].as_str().unwrap());
+            assert!(
+                records.iter().any(|record| {
+                    record["kind"] == "user_message" && record.to_string().contains(payload)
+                }),
+                "{records:#?}"
+            );
+            assert!(
+                records.iter().any(|record| {
+                    record["kind"] == "assistant_turn" && record["text"] == answer
+                }),
+                "{records:#?}"
+            );
+        }
+        server.main_requests();
+    })
+    .await
+    .expect("peer round trip deadline exceeded");
 }

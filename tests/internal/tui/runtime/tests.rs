@@ -1361,7 +1361,7 @@ fn history_tree_acceptance_rechecks_pending_running_queued_question_and_inflight
             }
             "inflight" => runtime
                 .queued_prompt_lifecycle
-                .dispatch(UserMessageSubmission::from("inflight")),
+                .accept(UserMessageSubmission::from("inflight")),
             _ => unreachable!(),
         }
 
@@ -1812,10 +1812,10 @@ fn double_escape_confirms_running_turn_interrupt() {
     ));
     assert_eq!(runtime.state.active_tool_call_id.as_deref(), Some("call-1"));
     runtime.state.set_input("follow up");
-    assert_eq!(
+    assert!(matches!(
         runtime.handle_input_action(InputAction::Submit).unwrap(),
-        None
-    );
+        Some(RuntimeCommand::SubmitPrompt(prompt)) if prompt.text() == "follow up"
+    ));
     assert_eq!(runtime.queued_prompts.len(), 1);
 }
 
@@ -1853,7 +1853,7 @@ fn background_children_do_not_hold_parent_turn_open() {
             runtime.handle_input_action(InputAction::Submit).unwrap(),
             Some(RuntimeCommand::SubmitPrompt(prompt)) if prompt.text() == "next prompt"
         ));
-        assert!(runtime.queued_prompts.is_empty());
+        assert_eq!(runtime.queued_prompts.len(), 1);
     }
 }
 
@@ -2738,7 +2738,7 @@ fn running_turn_queues_plain_prompts() {
         .handle_input_action(InputAction::Submit)
         .expect("submit succeeds");
 
-    assert_eq!(command, None);
+    assert!(matches!(command, Some(RuntimeCommand::SubmitPrompt(_))));
     assert!(runtime.state().input_buffer.is_empty());
     assert_eq!(runtime.state().phase, AppPhase::Running);
     assert_eq!(runtime.submitted_prompts(), &["follow up".to_string()]);
@@ -2793,7 +2793,9 @@ fn ctrl_backspace_removes_latest_queued_prompt_without_changing_draft_or_active_
         runtime
             .handle_input_action(action)
             .expect("remove succeeds"),
-        None
+        Some(RuntimeCommand::CancelQueuedPrompt(
+            submission_ids[2].clone()
+        ))
     );
     assert_eq!(
         runtime
@@ -2839,61 +2841,7 @@ fn ctrl_backspace_removes_latest_queued_prompt_without_changing_draft_or_active_
     assert_eq!(runtime.state().composer_tokens, tokens);
 
     runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected remaining queued prompt");
-    };
-    assert_eq!(prompt.id, submission_ids[0]);
-}
-
-#[test]
-fn removing_queued_prompts_preserves_inflight_handoff() {
-    for accepted in [false, true] {
-        let mut runtime = runtime();
-        runtime.state_mut().phase = AppPhase::Running;
-        for text in ["same", "second", "same"] {
-            runtime.state_mut().set_input(text);
-            runtime
-                .handle_input_action(InputAction::Submit)
-                .expect("queue succeeds");
-        }
-        runtime.apply_session_transport_event(SessionTransportEvent::Done);
-        let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime.take_next_queued_prompt_command()
-        else {
-            panic!("expected queued submit command");
-        };
-        if accepted {
-            runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
-                prompt: prompt.clone(),
-            });
-        }
-        let lifecycle = runtime.queued_prompt_lifecycle.clone();
-        for _ in 0..3 {
-            assert_eq!(
-                runtime
-                    .handle_input_action(InputAction::RemoveLastQueuedPrompt)
-                    .expect("remove succeeds"),
-                None
-            );
-        }
-        assert_eq!(runtime.queued_prompts.len(), 1);
-        assert_eq!(runtime.queued_prompts[0].id, prompt.id);
-        assert_eq!(runtime.queued_prompt_lifecycle, lifecycle);
-        assert!(runtime.session_turn_active);
-        assert_eq!(runtime.state().phase, AppPhase::Running);
-        assert!(matches!(
-            runtime.state().timeline.items(),
-            [TimelineItem::User(message)] if message.submission_id.as_deref() == Some(prompt.id.as_str())
-                && message.queued
-        ));
-
-        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
-            UserMessageEvent::from_submission(prompt),
-        ));
-        assert!(runtime.queued_prompts.is_empty());
-        runtime.apply_session_transport_event(SessionTransportEvent::Done);
-        assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    }
+    assert_eq!(runtime.queued_prompts[0].id, submission_ids[0]);
 }
 
 #[test]
@@ -2911,7 +2859,6 @@ fn removing_last_queued_prompt_is_idle_when_queue_is_empty() {
     assert_eq!(runtime.state().phase, phase);
     assert!(runtime.state().timeline.items().is_empty());
     assert!(!runtime.session_turn_active);
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
 }
 
 #[test]
@@ -3019,7 +2966,7 @@ fn running_turn_preserves_selected_skills_in_queued_prompt() {
         .handle_input_action(InputAction::Submit)
         .expect("submit succeeds");
 
-    assert_eq!(command, None);
+    assert!(matches!(command, Some(RuntimeCommand::SubmitPrompt(_))));
     assert_eq!(
         runtime.queued_prompts[0].content.selected_skills,
         vec!["rust-audit"]
@@ -3037,7 +2984,7 @@ fn running_turn_queues_at_prefixed_prompts() {
         .handle_input_action(InputAction::Submit)
         .expect("submit succeeds");
 
-    assert_eq!(command, None);
+    assert!(matches!(command, Some(RuntimeCommand::SubmitPrompt(_))));
     assert_eq!(runtime.queued_prompts.len(), 1);
     assert_eq!(
         runtime.queued_prompts[0].content.text,
@@ -3048,7 +2995,7 @@ fn running_turn_queues_at_prefixed_prompts() {
 }
 
 #[test]
-fn queued_prompt_ack_requires_dispatched_prompt() {
+fn queued_prompt_confirmation_matches_submission_id() {
     let mut runtime = runtime();
     runtime.session_turn_active = true;
     runtime.state_mut().phase = AppPhase::Running;
@@ -3111,10 +3058,7 @@ fn queued_prompt_preview_does_not_reset_active_turn_state_until_ack() {
     assert!(runtime.state().latest_todo.is_some());
 
     runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(submission)) = runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected queued submit command");
-    };
+    let submission = runtime.queued_prompts[0].clone();
     runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
         UserMessageEvent::from_submission(submission),
     ));
@@ -3185,7 +3129,10 @@ fn queued_prompt_survives_parent_view_navigation() {
         runtime.queued_prompts[0].content.attachments[0].id,
         "img-queued"
     );
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+    assert_eq!(
+        runtime.queued_prompt_lifecycle.accepted_submission_id(),
+        None
+    );
     assert!(runtime.session_turn_active);
     assert!(runtime.state().timeline.items().iter().any(|item| {
         matches!(
@@ -3198,17 +3145,15 @@ fn queued_prompt_survives_parent_view_navigation() {
         )
     }));
 
-    // The queued prompt remains dispatchable once the running turn finishes.
     runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(submission)) = runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected queued submit command after parent view navigation");
-    };
-    assert_eq!(submission.content.attachments[0].id, "img-queued");
+    assert_eq!(
+        runtime.queued_prompts[0].content.attachments[0].id,
+        "img-queued"
+    );
 }
 
 #[test]
-fn parent_view_navigation_preserves_inflight_handoff_and_ack_activates_republished_preview() {
+fn parent_view_navigation_preserves_accepted_prompt_and_confirmation_activates_preview() {
     let mut runtime = runtime();
     runtime.session_turn_active = true;
     runtime.state_mut().phase = AppPhase::Running;
@@ -3218,16 +3163,16 @@ fn parent_view_navigation_preserves_inflight_handoff_and_ack_activates_republish
         .handle_input_action(InputAction::Submit)
         .expect("queue succeeds");
 
-    // Dispatch the queued prompt; the handoff is in flight (no ack yet).
     runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(submission)) = runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected queued submit command");
-    };
-    assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
+    let submission = runtime.queued_prompts[0].clone();
+    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+        prompt: submission.clone(),
+    });
+    assert_eq!(
+        runtime.queued_prompt_lifecycle.accepted_submission_id(),
+        Some(submission.id.as_str())
+    );
 
-    // Parent view navigation must preserve the in-flight handoff and
-    // republish the preview for the still-unacked submission.
     runtime.apply_session_transport_event(SessionTransportEvent::ParentSessionViewed {
         session_id: "session-1".into(),
         branch_id: "root".into(),
@@ -3237,7 +3182,10 @@ fn parent_view_navigation_preserves_inflight_handoff_and_ack_activates_republish
         runtime_context: event_context("session-1", 0),
     });
 
-    assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
+    assert_eq!(
+        runtime.queued_prompt_lifecycle.accepted_submission_id(),
+        Some(submission.id.as_str())
+    );
     assert_eq!(runtime.queued_prompts.len(), 1);
     assert!(runtime.state().timeline.items().iter().any(|item| {
         matches!(
@@ -3246,12 +3194,13 @@ fn parent_view_navigation_preserves_inflight_handoff_and_ack_activates_republish
         )
     }));
 
-    // The late ack activates the republished preview instead of duplicating
-    // the message, and the handoff resolves.
     runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
         UserMessageEvent::from_submission(submission),
     ));
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+    assert_eq!(
+        runtime.queued_prompt_lifecycle.accepted_submission_id(),
+        None
+    );
     assert!(runtime.queued_prompts.is_empty());
     assert_eq!(
         runtime
@@ -3395,458 +3344,6 @@ fn parent_view_navigation_projection_failure_restores_pending_question() {
     assert!(matches!(
         runtime.state().toast(),
         Some(toast) if (toast.message.contains("Context projection failed") || toast.message.contains("上下文投影失败")) && toast.kind == ToastKind::Error
-    ));
-}
-
-#[test]
-fn dispatched_queued_prompt_failure_before_ack_clears_handoff_without_redispatch() {
-    let mut runtime = runtime();
-    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(submission)) = runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected queued submit command");
-    };
-    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
-        prompt: submission,
-    });
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
-        "missing API key",
-    )));
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-
-    assert!(runtime.queued_prompts.is_empty());
-    assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert!(!runtime.queued_prompt_lifecycle.failed_after_accept());
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert!(!runtime
-            .state()
-            .timeline
-            .items()
-            .iter()
-            .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
-
-    runtime.state_mut().set_input("after failure");
-    assert_eq!(
-        runtime.handle_input_action(InputAction::Submit).unwrap(),
-        Some(RuntimeCommand::SubmitPrompt("after failure".into()))
-    );
-}
-
-#[test]
-fn old_error_done_before_queued_prompt_accept_does_not_consume_handoff() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("follow up 1");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("first queue succeeds");
-    runtime.state_mut().set_input("follow up 2");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("second queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
-        runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected first queued submit command");
-    };
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
-        "old turn failed",
-    )));
-    runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
-
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert_eq!(
-        runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up 1".to_string(), "follow up 2".to_string()]
-    );
-    assert_eq!(
-        runtime.queued_prompt_lifecycle.dispatched_prompt(),
-        Some("follow up 1")
-    );
-    assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert!(!runtime.queued_prompt_lifecycle.is_accepted());
-    assert!(!runtime.queued_prompt_lifecycle.failed_after_accept());
-
-    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
-        prompt: first_submission.clone(),
-    });
-    runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
-        UserMessageEvent::from_submission(first_submission),
-    ));
-
-    assert_eq!(
-        runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up 2".to_string()]
-    );
-    assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert!(!runtime.queued_prompt_lifecycle.is_accepted());
-    assert!(runtime.state().timeline.items().iter().any(
-            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && !message.queued)
-        ));
-}
-
-#[test]
-fn old_done_before_queued_prompt_ack_does_not_dispatch_next_prompt() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("follow up 1");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("first queue succeeds");
-    runtime.state_mut().set_input("follow up 2");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("second queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-
-    let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
-        runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected first queued submit command");
-    };
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert_eq!(
-        runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up 1".to_string(), "follow up 2".to_string()]
-    );
-    assert_eq!(
-        runtime.queued_prompt_lifecycle.dispatched_prompt(),
-        Some("follow up 1")
-    );
-    assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert!(runtime.state().timeline.items().iter().any(
-            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && message.queued)
-        ));
-
-    runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
-        UserMessageEvent::from_submission(first_submission),
-    ));
-
-    assert_eq!(
-        runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up 2".to_string()]
-    );
-    assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert!(runtime.state().timeline.items().iter().any(
-            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && !message.queued)
-        ));
-}
-
-#[test]
-fn manual_submit_during_queued_handoff_is_queued_behind_pending_prompt() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("follow up 1");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    assert_eq!(
-        runtime.take_next_queued_prompt_command(),
-        Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
-    );
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-
-    runtime.state_mut().set_input("manual follow up");
-    let command = runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("manual submit queues");
-
-    assert_eq!(command, None);
-    assert_eq!(
-        runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up 1".to_string(), "manual follow up".to_string()]
-    );
-    assert_eq!(
-        runtime.queued_prompt_lifecycle.dispatched_prompt(),
-        Some("follow up 1")
-    );
-    assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert!(runtime.state().timeline.items().iter().any(
-            |item| matches!(item, TimelineItem::User(message) if message.text == "manual follow up" && message.queued)
-        ));
-}
-
-#[test]
-fn queued_prompt_dispatches_after_turn_done() {
-    let mut runtime = runtime();
-    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-
-    let command = runtime.take_next_queued_prompt_command();
-
-    let Some(RuntimeCommand::SubmitPrompt(submission)) = command else {
-        panic!("expected queued submit command");
-    };
-    assert_eq!(runtime.queued_prompts.len(), 1);
-    assert_eq!(runtime.state().phase, AppPhase::Running);
-    assert!(matches!(
-        runtime.state().timeline.items().last(),
-        Some(TimelineItem::User(message)) if message.text == "follow up" && message.queued
-    ));
-
-    runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
-        UserMessageEvent::from_submission(submission),
-    ));
-
-    assert_eq!(runtime.queued_prompts.len(), 0);
-    assert!(matches!(
-        runtime.state().timeline.items().last(),
-        Some(TimelineItem::User(message)) if message.text == "follow up" && !message.queued
-    ));
-    assert_eq!(
-        runtime
-            .state()
-            .timeline
-            .items()
-            .iter()
-            .filter(
-                |item| matches!(item, TimelineItem::User(message) if message.text == "follow up")
-            )
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn queued_prompts_become_history_on_interruption() {
-    let mut runtime = runtime();
-    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
-
-    assert!(runtime.queued_prompts.is_empty());
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert!(runtime.state().timeline.items().iter().any(
-            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && !message.queued)
-        ));
-}
-
-#[test]
-fn interrupted_session_transport_event_clears_inflight_queued_prompt_handoff_state() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(submission)) = runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected queued submit command");
-    };
-    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
-        prompt: submission,
-    });
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
-
-    assert!(runtime.queued_prompts.is_empty());
-    assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert!(!runtime.queued_prompt_lifecycle.is_accepted());
-    assert!(!runtime.queued_prompt_lifecycle.failed_after_accept());
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert!(runtime.state().timeline.items().iter().any(
-            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && !message.queued)
-        ));
-}
-
-#[test]
-fn queued_prompt_accept_does_not_consume_history_until_user_message_arrives() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(submission)) = runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected queued submit command");
-    };
-
-    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
-        prompt: submission.clone(),
-    });
-
-    assert_eq!(
-        runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up".to_string()]
-    );
-    assert_eq!(
-        runtime.queued_prompt_lifecycle.dispatched_prompt(),
-        Some("follow up")
-    );
-    assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert!(runtime.queued_prompt_lifecycle.is_accepted());
-    assert!(runtime.state().timeline.items().iter().any(
-            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)
-        ));
-
-    runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
-        UserMessageEvent::from_submission(submission),
-    ));
-
-    assert!(runtime.queued_prompts.is_empty());
-    assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert!(!runtime.queued_prompt_lifecycle.is_accepted());
-    assert!(runtime.state().timeline.items().iter().any(
-            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && !message.queued)
-        ));
-}
-
-#[test]
-fn queued_prompt_does_not_dispatch_on_non_terminal_events() {
-    for event in [
-        SessionTransportEvent::ToolFinished(ToolFinishedEvent::new(
-            "tool-1",
-            "fs__read",
-            "read completed",
-            ToolOutcome::Success,
-        )),
-        SessionTransportEvent::AssistantDelta(AssistantDeltaEvent::new("still generating")),
-    ] {
-        let mut runtime = runtime();
-        runtime.session_turn_active = true;
-        runtime.state_mut().phase = AppPhase::Running;
-        runtime.state_mut().set_input("follow up");
-        runtime
-            .handle_input_action(InputAction::Submit)
-            .expect("queue succeeds");
-
-        runtime.apply_session_transport_event(event);
-
-        assert_eq!(runtime.take_next_queued_prompt_command(), None);
-        assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
-        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
-        assert_eq!(runtime.queued_prompts.len(), 1);
-    }
-}
-
-#[test]
-fn queued_prompt_dispatches_after_tool_batch_finished() {
-    let mut runtime = runtime();
-    runtime.session_turn_active = true;
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::ToolFinished(
-        ToolFinishedEvent::new("tool-1", "fs__read", "read completed", ToolOutcome::Success),
-    ));
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-
-    runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
-
-    assert_eq!(
-        runtime.take_next_queued_prompt_command(),
-        Some(RuntimeCommand::SubmitPrompt("follow up".into()))
-    );
-    assert_eq!(
-        runtime.queued_prompt_lifecycle.dispatched_prompt(),
-        Some("follow up")
-    );
-}
-
-#[test]
-fn non_terminal_error_does_not_drop_or_dispatch_queued_prompt() {
-    let mut runtime = runtime();
-    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
-    runtime.state_mut().set_input("follow up");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
-        "failed to view child transcript",
-    )));
-
-    assert_eq!(runtime.queued_prompts.len(), 1);
-    assert_eq!(runtime.take_next_queued_prompt_command(), None);
-    assert!(runtime
-            .state()
-            .timeline
-            .items()
-            .iter()
-            .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
-}
-
-#[test]
-fn prompt_after_non_terminal_error_still_queues_until_done() {
-    let mut runtime = runtime();
-    runtime.state_mut().phase = AppPhase::Running;
-    runtime.session_turn_active = true;
-    runtime.state_mut().set_input("follow up 1");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("first queue succeeds");
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
-        "failed to view child transcript",
-    )));
-    runtime.state_mut().set_input("follow up 2");
-    let command = runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("second queue succeeds");
-
-    assert_eq!(command, None);
-    assert_eq!(
-        runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up 1".to_string(), "follow up 2".to_string()]
-    );
-
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-
-    assert_eq!(
-        runtime.take_next_queued_prompt_command(),
-        Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
-    );
-    assert_eq!(
-        runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-        vec!["follow up 1".to_string(), "follow up 2".to_string()]
-    );
-    assert!(matches!(
-        runtime.state().timeline.items().iter().find(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1")),
-        Some(TimelineItem::User(message)) if message.queued
     ));
 }
 
@@ -9466,8 +8963,8 @@ mod integration_tests {
                     );
                 }
                 "queued" => runtime
-                    .queued_prompt_lifecycle
-                    .dispatch(UserMessageSubmission::from("queued")),
+                    .queued_prompts
+                    .push_back(UserMessageSubmission::from("queued")),
                 "background" => {
                     runtime.apply_session_transport_event(
                         SessionTransportEvent::ChildSessionEvent {
@@ -9663,4 +9160,89 @@ mod integration_tests {
             "interrupt dispatch makes progress after flood"
         );
     }
+}
+
+#[test]
+fn queued_prompts_are_submitted_once_and_confirmed_in_order() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
+    let mut submitted = Vec::new();
+    for text in ["first", "second", "third"] {
+        runtime.state_mut().set_input(text);
+        let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("submit succeeds")
+        else {
+            panic!("expected immediate submit");
+        };
+        submitted.push(prompt);
+    }
+    assert_eq!(runtime.queued_prompts.len(), 3);
+    runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    assert_eq!(runtime.queued_prompts.len(), 3);
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::RemoveLastQueuedPrompt)
+            .expect("cancel succeeds"),
+        Some(RuntimeCommand::CancelQueuedPrompt(submitted[2].id.clone())),
+    );
+    for prompt in &submitted[..2] {
+        runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+            prompt: prompt.clone(),
+        });
+        if prompt.id == submitted[1].id {
+            assert_eq!(
+                runtime
+                    .handle_input_action(InputAction::RemoveLastQueuedPrompt)
+                    .expect("accepted prompt stays"),
+                None
+            );
+        }
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::from_submission(prompt.clone()),
+        ));
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    }
+    assert!(runtime.queued_prompts.is_empty());
+    let messages = runtime
+        .state()
+        .timeline
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::User(message) => Some(message.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(messages, vec!["first", "second"]);
+}
+
+#[test]
+fn interrupted_turn_preserves_unconsumed_local_prompts() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
+    runtime.state_mut().set_input("next");
+    let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("queue succeeds")
+    else {
+        panic!("expected immediate submit");
+    };
+    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    assert_eq!(runtime.queued_prompts.front(), Some(&prompt));
+    assert!(
+        runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .any(|item| matches!(item, TimelineItem::User(message) if message.queued))
+    );
+    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+        prompt: prompt.clone(),
+    });
+    runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+        UserMessageEvent::from_submission(prompt),
+    ));
+    assert!(runtime.queued_prompts.is_empty());
 }

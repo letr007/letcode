@@ -29,6 +29,7 @@ mod langfuse_trace;
 mod mcp;
 mod memory;
 pub(crate) mod model_runtime;
+mod peer;
 mod permission;
 mod process_tree;
 mod project_memory;

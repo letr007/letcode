@@ -24,6 +24,7 @@ pub(crate) enum ActiveTurnCommandDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCommand {
     SubmitPrompt(UserMessageSubmission),
+    CancelQueuedPrompt(String),
     Compact,
     ShowHistoryTree,
     Undo,
@@ -65,6 +66,7 @@ impl SessionCommand {
             Self::ViewChild { .. } | Self::ViewParent => {
                 (true, ActiveTurnCommandDisposition::Immediate)
             }
+            Self::CancelQueuedPrompt(_) => (false, ActiveTurnCommandDisposition::Immediate),
             Self::SetPermissionMode(_)
             | Self::ToggleFastMode
             | Self::SetReasoningEffort(_)

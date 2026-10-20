@@ -10,12 +10,9 @@ use crate::session::{
     ActiveTurnCommandDisposition, SessionCommand, SessionCommandHandler, SessionEngineIngress,
 };
 
-use crate::tui::UserMessageEvent;
 use crate::tui::state::{AppPhase, ToastKind};
 
-use super::{
-    SESSION_ENGINE_UNAVAILABLE_MESSAGE, SessionTransportEvent, TuiRuntime, child_navigation_anchor,
-};
+use super::{SESSION_ENGINE_UNAVAILABLE_MESSAGE, TuiRuntime, child_navigation_anchor};
 
 /// Applies session commands by enqueueing frontend-neutral engine intent.
 pub(super) struct TuiSessionCommandAdapter<'a> {
@@ -59,29 +56,11 @@ impl<'a> TuiSessionCommandAdapter<'a> {
             self.runtime.show_toast(message, ToastKind::Info);
             return Ok(());
         }
-        let local_prompt = match &command {
-            SessionCommand::SubmitPrompt(prompt)
-                if self
-                    .runtime
-                    .queued_prompt_lifecycle
-                    .dispatched_submission_id()
-                    != Some(prompt.id.as_str()) =>
-            {
-                Some(prompt.clone())
-            }
-            _ => None,
-        };
         if self.ingress.submit(command.clone()).is_err() {
             if let Some(server_name) = pending_mcp_server {
                 self.runtime.clear_mcp_server_updating(&server_name);
             }
             bail!(SESSION_ENGINE_UNAVAILABLE_MESSAGE);
-        }
-        if let Some(prompt) = local_prompt {
-            self.runtime
-                .apply_session_transport_event(SessionTransportEvent::UserMessage(
-                    UserMessageEvent::from_submission(prompt),
-                ));
         }
         if deferred {
             self.runtime.project_deferred_setting(&command);

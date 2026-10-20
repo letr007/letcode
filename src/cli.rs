@@ -61,6 +61,7 @@ impl CliView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandWait {
     UntilDone,
+    UntilManualCompaction,
     UntilModelChanged,
     UntilFastMode,
     UntilHistoryLoaded,
@@ -68,6 +69,52 @@ enum CommandWait {
     UntilSessionStarted,
     UntilPermissionModeChanged,
     UntilReasoningEffortChanged,
+}
+
+struct TerminalInput {
+    lines: std::sync::mpsc::Receiver<io::Result<String>>,
+    ready: Arc<tokio::sync::Notify>,
+}
+
+impl TerminalInput {
+    fn new() -> Self {
+        let (sender, lines) = std::sync::mpsc::channel();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let notify = ready.clone();
+        thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                let result = io::stdin().read_line(&mut line).map(|_| line);
+                let finished = match &result {
+                    Ok(line) => line.is_empty(),
+                    Err(_) => true,
+                };
+                if sender.send(result).is_err() {
+                    break;
+                }
+                notify.notify_one();
+                if finished {
+                    break;
+                }
+            }
+        });
+        Self { lines, ready }
+    }
+
+    async fn next_line(&self) -> Result<String> {
+        loop {
+            let ready = self.ready.notified();
+            match self.lines.try_recv() {
+                Ok(line) => return Ok(line?),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(String::new()),
+                Err(std::sync::mpsc::TryRecvError::Empty) => ready.await,
+            }
+        }
+    }
+
+    fn read_line(&self) -> Result<String> {
+        Ok(self.lines.recv()??)
+    }
 }
 
 pub async fn run_repl(
@@ -80,13 +127,32 @@ pub async fn run_repl(
     let ingress = engine.take_ingress();
     let mut events = engine.take_event_egress().into_receiver();
     let mut view = CliView::from_projection(projection, initial_reasoning);
+    let input_reader = TerminalInput::new();
+    let mut spinners = HashMap::new();
+    let mut compaction_pending = false;
 
     loop {
         print!("> ");
         io::stdout().flush()?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        let input = loop {
+            tokio::select! {
+                line = input_reader.next_line() => break line?,
+                event = events.recv() => {
+                    let Some(event) = event else {
+                        bail!("session engine event stream closed");
+                    };
+                    present_transport_event(
+                        event, OutputMode::Streaming, true, &mut spinners,
+                        &mut compaction_pending, &mut view, &mut String::new(),
+                        &mut None, &mut Vec::new(), Some(&input_reader),
+                    )?;
+                }
+            }
+        };
+        if input.is_empty() {
+            break;
+        }
         let input = input.trim();
 
         match parse_repl_command(input) {
@@ -109,6 +175,7 @@ pub async fn run_repl(
                     SessionCommand::SetPermissionMode(mode),
                     CommandWait::UntilPermissionModeChanged,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
                 if outcome.error.is_none() {
@@ -121,8 +188,7 @@ pub async fn run_repl(
                 );
                 io::stdout().flush()?;
 
-                let mut confirm = String::new();
-                io::stdin().read_line(&mut confirm)?;
+                let confirm = input_reader.read_line()?;
                 let confirm = confirm.trim().to_ascii_lowercase();
 
                 if matches!(confirm.as_str(), "y" | "yes") {
@@ -133,6 +199,7 @@ pub async fn run_repl(
                         SessionCommand::SetPermissionMode(PermissionMode::Yolo),
                         CommandWait::UntilPermissionModeChanged,
                         OutputMode::Streaming,
+                        Some(&input_reader),
                     )
                     .await?;
                     if outcome.error.is_none() {
@@ -164,6 +231,7 @@ pub async fn run_repl(
                     SessionCommand::ToggleFastMode,
                     CommandWait::UntilFastMode,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
             }
@@ -194,6 +262,7 @@ pub async fn run_repl(
                     SessionCommand::SetModel(route_display_name.clone()),
                     CommandWait::UntilModelChanged,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
                 if view.model_id == route_display_name {
@@ -214,6 +283,7 @@ pub async fn run_repl(
                     SessionCommand::ResumeSession(session_id),
                     CommandWait::UntilSessionResumed,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
             }
@@ -236,6 +306,7 @@ pub async fn run_repl(
                     SessionCommand::SetReasoningEffort(effort.clone()),
                     CommandWait::UntilReasoningEffortChanged,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
                 if outcome.error.is_some() || !outcome.notices.is_empty() {
@@ -252,8 +323,9 @@ pub async fn run_repl(
                     &mut events,
                     &mut view,
                     SessionCommand::Compact,
-                    CommandWait::UntilDone,
+                    CommandWait::UntilManualCompaction,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
             }
@@ -265,6 +337,7 @@ pub async fn run_repl(
                     SessionCommand::ShowHistoryTree,
                     CommandWait::UntilHistoryLoaded,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
             }
@@ -284,6 +357,7 @@ pub async fn run_repl(
                     SessionCommand::NewSession,
                     CommandWait::UntilSessionStarted,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
             }
@@ -302,6 +376,7 @@ pub async fn run_repl(
                     SessionCommand::SubmitPrompt(submission),
                     CommandWait::UntilDone,
                     OutputMode::Streaming,
+                    Some(&input_reader),
                 )
                 .await?;
                 if let Some(error) = outcome.error {
@@ -312,6 +387,7 @@ pub async fn run_repl(
         }
     }
 
+    stop_tool_spinners(&mut spinners)?;
     let _ = ingress.shutdown();
     engine.join().await?;
     Ok(())
@@ -339,6 +415,7 @@ pub async fn run_one_shot(
         SessionCommand::SubmitPrompt(submission),
         CommandWait::UntilDone,
         OutputMode::FinalOnly,
+        None,
     )
     .await;
     let duration_ms = started_at.elapsed().as_millis();
@@ -392,11 +469,24 @@ async fn submit_and_wait(
     command: SessionCommand,
     wait: CommandWait,
     output_mode: OutputMode,
+    input: Option<&TerminalInput>,
 ) -> Result<WaitOutcome> {
+    let submission_id = match &command {
+        SessionCommand::SubmitPrompt(prompt) => Some(prompt.id.clone()),
+        _ => None,
+    };
     ingress
         .submit(command)
         .map_err(|_| anyhow!("session engine command ingress closed"))?;
-    wait_for_command(events, view, wait, output_mode).await
+    wait_for_command(
+        events,
+        view,
+        wait,
+        output_mode,
+        submission_id.as_deref(),
+        input,
+    )
+    .await
 }
 
 async fn wait_for_command(
@@ -404,7 +494,10 @@ async fn wait_for_command(
     view: &mut CliView,
     wait: CommandWait,
     output_mode: OutputMode,
+    submission_id: Option<&str>,
+    input: Option<&TerminalInput>,
 ) -> Result<WaitOutcome> {
+    let mut accepted = submission_id.is_none() && wait != CommandWait::UntilManualCompaction;
     let interactive = matches!(output_mode, OutputMode::Streaming);
     let mut spinners = HashMap::new();
     let mut compaction_pending = false;
@@ -418,6 +511,20 @@ async fn wait_for_command(
             None => bail!("session engine event stream closed"),
         };
 
+        match &event {
+            SessionTransportEvent::QueuedPromptAccepted { prompt } if submission_id.is_some() => {
+                accepted = submission_id == Some(prompt.id.as_str());
+            }
+            SessionTransportEvent::ManualCompactionStarted
+                if wait == CommandWait::UntilManualCompaction =>
+            {
+                accepted = true;
+            }
+            _ => {}
+        }
+        let mut other_assistant = String::new();
+        let mut other_error = None;
+        let mut other_notices = Vec::new();
         let marker = present_transport_event(
             event,
             output_mode,
@@ -425,13 +532,29 @@ async fn wait_for_command(
             &mut spinners,
             &mut compaction_pending,
             view,
-            &mut assistant,
-            &mut error,
-            &mut notices,
+            if accepted {
+                &mut assistant
+            } else {
+                &mut other_assistant
+            },
+            if accepted {
+                &mut error
+            } else {
+                &mut other_error
+            },
+            if accepted {
+                &mut notices
+            } else {
+                &mut other_notices
+            },
+            input,
         )?;
 
         let done = match wait {
-            CommandWait::UntilDone => marker.done,
+            CommandWait::UntilDone => accepted && marker.done,
+            CommandWait::UntilManualCompaction => {
+                accepted && (marker.done || marker.error || marker.notice)
+            }
             CommandWait::UntilModelChanged => marker.model_changed || marker.error,
             CommandWait::UntilFastMode => marker.fast_mode || marker.notice || marker.error,
             CommandWait::UntilHistoryLoaded => marker.history_loaded || marker.error,
@@ -459,6 +582,7 @@ async fn wait_for_command(
                     &mut assistant,
                     &mut error,
                     &mut notices,
+                    input,
                 )
                 .await?;
             }
@@ -482,6 +606,7 @@ async fn drain_brief(
     assistant: &mut String,
     error: &mut Option<String>,
     notices: &mut Vec<String>,
+    input: Option<&TerminalInput>,
 ) -> Result<()> {
     let mut spinners = HashMap::new();
     let mut compaction_pending = false;
@@ -504,6 +629,7 @@ async fn drain_brief(
                     assistant,
                     error,
                     notices,
+                    input,
                 )?;
             }
             Ok(None) | Err(_) => break,
@@ -537,6 +663,7 @@ fn present_transport_event(
     assistant: &mut String,
     last_error: &mut Option<String>,
     notices: &mut Vec<String>,
+    input: Option<&TerminalInput>,
 ) -> Result<EventMarker> {
     let mut marker = EventMarker::default();
     match event {
@@ -626,7 +753,8 @@ fn present_transport_event(
                 println!("{rendered}");
             }
         }
-        SessionTransportEvent::Done => {
+        SessionTransportEvent::Done | SessionTransportEvent::Interrupted => {
+            stop_tool_spinners(spinners)?;
             marker.done = true;
         }
         SessionTransportEvent::FastModeChanged { .. } => {
@@ -691,14 +819,14 @@ fn present_transport_event(
             }
         }
         SessionTransportEvent::PermissionRequested { event, handle } if interactive => {
-            respond_permission(&event, &handle)?;
+            respond_permission(&event, &handle, input.expect("interactive terminal input"))?;
         }
         // Non-interactive: drop handle → runner fails with sender dropped.
         SessionTransportEvent::ChildPermissionRequested { event, handle, .. } if interactive => {
-            respond_permission(&event, &handle)?;
+            respond_permission(&event, &handle, input.expect("interactive terminal input"))?;
         }
         SessionTransportEvent::QuestionRequested { request, handle } if interactive => {
-            match ask_questions_in_terminal(&request) {
+            match ask_questions_in_terminal(&request, input.expect("interactive terminal input")) {
                 Ok(response) => handle.answer(response)?,
                 Err(error) => {
                     let _ = handle.cancel(format!("{error:#}"));
@@ -708,13 +836,15 @@ fn present_transport_event(
         }
         SessionTransportEvent::ChildQuestionRequested {
             request, handle, ..
-        } if interactive => match ask_questions_in_terminal(&request) {
-            Ok(response) => handle.answer(response)?,
-            Err(error) => {
-                let _ = handle.cancel(format!("{error:#}"));
-                return Err(error);
+        } if interactive => {
+            match ask_questions_in_terminal(&request, input.expect("interactive terminal input")) {
+                Ok(response) => handle.answer(response)?,
+                Err(error) => {
+                    let _ = handle.cancel(format!("{error:#}"));
+                    return Err(error);
+                }
             }
-        },
+        }
         _ => {}
     }
     Ok(marker)
@@ -730,8 +860,9 @@ fn stop_tool_spinners(spinners: &mut HashMap<String, ToolSpinner>) -> Result<()>
 fn respond_permission(
     event: &PermissionRequestEvent,
     handle: &crate::session::RunnerPermissionRequest,
+    input: &TerminalInput,
 ) -> Result<()> {
-    let approval = confirm_permission_event(event)?;
+    let approval = confirm_permission_event(event, input)?;
     match approval {
         PermissionApproval::AllowOnce => handle.approve(),
         PermissionApproval::AllowAlways => handle.allow_always(),
@@ -946,7 +1077,7 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
         SessionCommand::ViewChild { .. } | SessionCommand::ViewParent => ReplCommand::Unsupported(
             "CLI does not support /child yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
         ),
-        SessionCommand::ToggleMcpServer(_) | SessionCommand::Interrupt => ReplCommand::Unsupported(
+        SessionCommand::ToggleMcpServer(_) | SessionCommand::CancelQueuedPrompt(_) | SessionCommand::Interrupt => ReplCommand::Unsupported(
             "CLI does not support this session command yet; use the TUI.".into(),
         ),
     }
@@ -1052,7 +1183,10 @@ fn print_sessions(base_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn confirm_permission_event(event: &PermissionRequestEvent) -> Result<PermissionApproval> {
+fn confirm_permission_event(
+    event: &PermissionRequestEvent,
+    input: &TerminalInput,
+) -> Result<PermissionApproval> {
     println!();
     let class = event
         .rationale
@@ -1076,8 +1210,7 @@ fn confirm_permission_event(event: &PermissionRequestEvent) -> Result<Permission
     }
     io::stdout().flush()?;
 
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    let input = input.read_line()?;
     Ok(permission_approval_from_input(
         input.trim(),
         event.can_allow_always,
@@ -1092,7 +1225,10 @@ fn permission_approval_from_input(input: &str, can_allow_always: bool) -> Permis
     }
 }
 
-fn ask_questions_in_terminal(request: &QuestionRequest) -> Result<QuestionResponse> {
+fn ask_questions_in_terminal(
+    request: &QuestionRequest,
+    input_reader: &TerminalInput,
+) -> Result<QuestionResponse> {
     println!();
     println!("question tool requires your reply:");
 
@@ -1114,15 +1250,13 @@ fn ask_questions_in_terminal(request: &QuestionRequest) -> Result<QuestionRespon
             }
             io::stdout().flush()?;
 
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
+            let input = input_reader.read_line()?;
             let input = input.trim();
 
             if input == "0" {
                 print!("Your answer: ");
                 io::stdout().flush()?;
-                let mut custom = String::new();
-                io::stdin().read_line(&mut custom)?;
+                let custom = input_reader.read_line()?;
                 let custom = custom.trim();
                 if custom.is_empty() {
                     println!("Please enter a non-empty answer.");

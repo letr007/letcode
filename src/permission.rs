@@ -447,6 +447,8 @@ pub fn is_internal_tool(tool: &str) -> bool {
             | tool_names::TOOL_AGENT_WAIT
             | tool_names::TOOL_AGENT_CANCEL
             | tool_names::TOOL_AGENT_SEND
+            | tool_names::TOOL_PEER_DISCOVER
+            | tool_names::TOOL_PEER_SEND
     )
 }
 
@@ -461,6 +463,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_FS_READ
         | tool_names::TOOL_MEMORY_RECALL
         | tool_names::TOOL_CONFIG_VALIDATE
+        | tool_names::TOOL_PEER_DISCOVER
         | tool_names::TOOL_SEARCH_RG
         | tool_names::TOOL_WEB_FETCH
         | tool_names::TOOL_GIT_STATUS
@@ -478,7 +481,8 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_AGENT_STATUS
         | tool_names::TOOL_AGENT_WAIT
         | tool_names::TOOL_AGENT_CANCEL
-        | tool_names::TOOL_AGENT_SEND => ToolPermissionClass::Preview,
+        | tool_names::TOOL_AGENT_SEND
+        | tool_names::TOOL_PEER_SEND => ToolPermissionClass::Preview,
         tool_names::TOOL_AGENT_FIXER
         | tool_names::TOOL_AGENT_GENERAL
         | tool_names::TOOL_FS_WRITE

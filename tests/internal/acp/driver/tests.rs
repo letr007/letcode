@@ -469,13 +469,17 @@ async fn ask_over_acp(
     let agent = Agent
         .builder()
         .connect_with(agent_transport, async move |connection| {
+            let (_engine, ingress, _egress) = SessionEngine::new();
             driver(elicitation_forms)
-                .ask_question(
+                .handle_event(
                     &connection,
-                    question_request(),
-                    RunnerQuestionRequest::new(answers_tx),
+                    &ingress,
+                    SessionTransportEvent::QuestionRequested {
+                        request: question_request(),
+                        handle: RunnerQuestionRequest::new(answers_tx),
+                    },
                 )
-                .await;
+                .await?;
             Ok(())
         });
     let client = Client
@@ -508,6 +512,96 @@ async fn ask_over_acp(
 
 mod integration_tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_compaction_answers_only_after_engine_acceptance() {
+        for result in [
+            SessionTransportEvent::CompactionCommitted { summary: None },
+            SessionTransportEvent::Error(ErrorEvent::new("missing credentials")),
+            SessionTransportEvent::Notice(crate::session::NoticeEvent::info("Turn still running")),
+        ] {
+            let succeeds = matches!(result, SessionTransportEvent::CompactionCommitted { .. });
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let (agent_transport, client_transport) = Channel::duplex();
+                let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
+                let agent = Agent
+                    .builder()
+                    .on_receive_request(
+                        async move |request: PromptRequest, responder, _connection| {
+                            requests_tx
+                                .send(DriverRequest::Prompt {
+                                    session_id: request.session_id,
+                                    content: prompt_content(&request.prompt)?,
+                                    responder,
+                                })
+                                .map_err(Error::into_internal_error)?;
+                            Ok(())
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .connect_with(agent_transport, async move |connection| {
+                        let (_engine, ingress, _egress) = SessionEngine::new();
+                        let mut driver = driver(false);
+                        let request = requests_rx.recv().await.unwrap();
+                        driver.handle_request(&connection, &ingress, request)?;
+                        for event in [
+                            SessionTransportEvent::CompactionCommitted { summary: None },
+                            SessionTransportEvent::CompactionNoProgress {
+                                blockers: vec!["automatic".into()],
+                            },
+                            SessionTransportEvent::CompactionFailed,
+                            SessionTransportEvent::Notice(crate::session::NoticeEvent::info(
+                                "peer notice",
+                            )),
+                            SessionTransportEvent::Error(ErrorEvent::new("peer error")),
+                            SessionTransportEvent::Done,
+                        ] {
+                            driver.handle_event(&connection, &ingress, event).await?;
+                            assert!(
+                                driver
+                                    .pending_command
+                                    .as_ref()
+                                    .is_some_and(|pending| !pending.accepted)
+                            );
+                        }
+                        driver
+                            .handle_event(
+                                &connection,
+                                &ingress,
+                                SessionTransportEvent::ManualCompactionStarted,
+                            )
+                            .await?;
+                        assert!(driver.pending_command.as_ref().unwrap().accepted);
+                        driver.handle_event(&connection, &ingress, result).await?;
+                        driver
+                            .handle_event(&connection, &ingress, SessionTransportEvent::Done)
+                            .await?;
+                        assert!(driver.pending_command.is_none());
+                        connection.incoming_closed().await;
+                        Ok(())
+                    });
+                let client =
+                    Client
+                        .builder()
+                        .connect_with(client_transport, async move |connection| {
+                            let response = connection
+                                .send_request(PromptRequest::new(
+                                    SessionId::new("session-1"),
+                                    vec![text_block("/compact")],
+                                ))
+                                .block_task()
+                                .await;
+                            assert_eq!(response.is_ok(), succeeds);
+                            Ok(())
+                        });
+                let (agent_result, client_result) = tokio::join!(agent, client);
+                agent_result.unwrap();
+                client_result.unwrap();
+            })
+            .await
+            .expect("manual compaction ACP response timed out");
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_question_the_client_answers_is_asked_as_a_form() {
@@ -606,16 +700,55 @@ mod integration_tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .connect_with(agent_transport, async move |connection| {
-                    let (_engine, ingress, _egress) = SessionEngine::new();
+                    let (mut engine, ingress, _egress) = SessionEngine::new();
                     let mut driver = driver(false);
-                    // Registering the turn before the interrupt keeps the two
-                    // steps in the order the engine reports them. No `Done`
-                    // follows the interrupt, because the engine never sends one.
                     let request = requests_rx.recv().await.expect("the client sent a prompt");
                     driver.handle_request(&connection, &ingress, request)?;
                     driver
+                        .handle_event(
+                            &connection,
+                            &ingress,
+                            SessionTransportEvent::Error(ErrorEvent::new("peer failed")),
+                        )
+                        .await?;
+                    driver
+                        .handle_event(&connection, &ingress, SessionTransportEvent::Done)
+                        .await?;
+                    assert!(
+                        driver
+                            .turn
+                            .as_ref()
+                            .is_some_and(|turn| !turn.accepted && turn.error.is_none())
+                    );
+                    let Some(crate::session::engine::SessionEngineControl::Command(
+                        crate::session::engine::SessionEngineCommand::Prompt(prompt),
+                    )) = engine.recv_control().await
+                    else {
+                        panic!("expected prompt command");
+                    };
+                    driver.cancel(&ingress, SessionId::new("session-1"));
+                    assert!(driver.turn.is_some());
+                    assert!(matches!(
+                        engine.recv_control().await,
+                        Some(crate::session::engine::SessionEngineControl::Command(
+                            crate::session::engine::SessionEngineCommand::CancelPrompt(id)
+                        )) if id == prompt.id
+                    ));
+                    driver
+                        .handle_event(
+                            &connection,
+                            &ingress,
+                            SessionTransportEvent::QueuedPromptAccepted { prompt },
+                        )
+                        .await?;
+                    driver
                         .handle_event(&connection, &ingress, SessionTransportEvent::Interrupted)
                         .await?;
+                    driver.cancel(&ingress, SessionId::new("session-1"));
+                    assert!(matches!(
+                        engine.try_recv_control(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
                     connection.incoming_closed().await;
                     Ok(())
                 });

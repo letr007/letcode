@@ -804,20 +804,6 @@ impl Timeline {
         true
     }
 
-    pub fn activate_queued_user_message_previews(&mut self) -> usize {
-        let mut activated = 0usize;
-        for index in 0..self.items.len() {
-            if let TimelineItem::User(message) = &mut self.items[index]
-                && message.queued
-            {
-                message.queued = false;
-                self.bump_revision(index);
-                activated = activated.saturating_add(1);
-            }
-        }
-        activated
-    }
-
     pub fn remove_queued_user_message_previews(&mut self) {
         let original_len = self.items.len();
         let mut retained_items = Vec::with_capacity(original_len);

@@ -179,6 +179,8 @@ struct Driver {
 }
 
 struct ActiveTurn {
+    submission_id: String,
+    accepted: bool,
     responder: Responder<PromptResponse>,
     cancelled: bool,
     error: Option<String>,
@@ -231,6 +233,7 @@ struct ResumedSession {
 struct PendingCommand {
     outcome: CommandOutcome,
     responder: CommandResponder,
+    accepted: bool,
 }
 
 /// The engine report a client's command is answered from.
@@ -574,6 +577,7 @@ impl Driver {
             }
         }
         let submission = UserMessageSubmission::new(submission_id(), content);
+        let submission_id = submission.id.clone();
         if let Err(error) = ingress.submit(SessionCommand::SubmitPrompt(submission)) {
             let _ = responder.respond_with_error(Error::new(
                 ErrorCode::InternalError.into(),
@@ -582,6 +586,8 @@ impl Driver {
             return;
         }
         self.turn = Some(ActiveTurn {
+            submission_id,
+            accepted: false,
             responder,
             cancelled: false,
             error: None,
@@ -713,7 +719,11 @@ impl Driver {
             ));
             return;
         }
-        self.pending_command = Some(PendingCommand { outcome, responder });
+        self.pending_command = Some(PendingCommand {
+            outcome,
+            responder,
+            accepted: outcome != CommandOutcome::Compaction,
+        });
     }
 
     /// Answers a pending command once the engine reports an outcome for it.
@@ -724,7 +734,7 @@ impl Driver {
         let Some(pending) = self.pending_command.take() else {
             return;
         };
-        if !reports.contains(&pending.outcome) {
+        if !pending.accepted || !reports.contains(&pending.outcome) {
             self.pending_command = Some(pending);
             return;
         }
@@ -742,10 +752,9 @@ impl Driver {
             );
             return;
         }
-        if let Some(turn) = self.turn.as_mut() {
-            turn.cancelled = true;
+        if let Some(turn) = self.turn.as_ref() {
+            let _ = ingress.cancel_prompt(turn.submission_id.clone());
         }
-        let _ = ingress.request_interrupt();
     }
 
     async fn handle_event(
@@ -814,6 +823,13 @@ impl Driver {
             // A fast-mode toggle is answered from the value the engine applied.
             SessionTransportEvent::FastModeChanged { .. } => {
                 self.settle_command(&[CommandOutcome::FastMode], None);
+            }
+            SessionTransportEvent::ManualCompactionStarted => {
+                if let Some(pending) = self.pending_command.as_mut()
+                    && pending.outcome == CommandOutcome::Compaction
+                {
+                    pending.accepted = true;
+                }
             }
             SessionTransportEvent::CompactionCommitted { .. } => {
                 self.settle_command(&[CommandOutcome::Compaction], None);
@@ -890,20 +906,37 @@ impl Driver {
             } => {
                 self.ask_question(connection, request, handle).await;
             }
+            SessionTransportEvent::QueuedPromptAccepted { prompt } => {
+                if let Some(turn) = self.turn.as_mut() {
+                    turn.accepted = turn.submission_id == prompt.id;
+                }
+            }
+            SessionTransportEvent::PromptCancelled { submission_id } => {
+                if let Some(turn) = self.turn.as_mut()
+                    && turn.submission_id == submission_id
+                {
+                    turn.cancelled = true;
+                    self.finish_turn();
+                }
+            }
             SessionTransportEvent::Error(event) => {
                 self.fail_turn(event);
             }
             SessionTransportEvent::Interrupted => {
-                if let Some(turn) = self.turn.as_mut() {
+                if let Some(turn) = self.turn.as_mut().filter(|turn| turn.accepted) {
                     turn.cancelled = true;
                 }
                 // An interrupted run is over: the engine reports the interrupt
                 // with this event and does not follow it with `Done`, so the
                 // prompt the client is waiting on is answered here.
-                self.finish_turn();
+                if self.turn.as_ref().is_some_and(|turn| turn.accepted) {
+                    self.finish_turn();
+                }
             }
             SessionTransportEvent::Done => {
-                self.finish_turn();
+                if self.turn.as_ref().is_some_and(|turn| turn.accepted) {
+                    self.finish_turn();
+                }
                 // A manual compaction ends the run it performs with this report,
                 // whether or not the engine reported anything else about it.
                 self.settle_command(&[CommandOutcome::Compaction], None);
@@ -1088,14 +1121,17 @@ impl Driver {
             return;
         }
         match self.turn.as_mut() {
-            Some(turn) => {
+            Some(turn) if turn.accepted => {
                 if turn.error.is_none() {
                     turn.error = Some(event.message);
                 }
             }
+            Some(_) => {
+                tracing::warn!(message = %event.message, "session engine reported an error");
+            }
             // A command the engine failed is answered here: the engine's reason
             // is its outcome, and no further report is coming.
-            None => match self.pending_command.take() {
+            None => match self.pending_command.take_if(|pending| pending.accepted) {
                 Some(pending) => {
                     if pending.outcome.installs_session() {
                         self.pending_mode_report = false;
@@ -1117,6 +1153,7 @@ impl Driver {
                 responder,
                 cancelled,
                 error,
+                ..
             } = turn;
             match error {
                 Some(message) => {

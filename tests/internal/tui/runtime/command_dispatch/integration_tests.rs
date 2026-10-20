@@ -245,7 +245,7 @@ fn failed_setting_dispatch_does_not_project_pending_value() {
 }
 
 #[test]
-fn successful_prompt_dispatch_adds_immediate_local_echo() {
+fn successful_prompt_dispatch_keeps_queued_preview() {
     let mut runtime = runtime();
     runtime.state_mut().set_input("same");
     let command = runtime
@@ -362,31 +362,21 @@ fn different_submission_id_with_same_text_remains_visible() {
 }
 
 #[test]
-fn failed_queued_prompt_dispatch_clears_unaccepted_handoff() {
+fn failed_queued_prompt_dispatch_clears_preview() {
     let mut runtime = runtime();
     runtime.session_turn_active = true;
     runtime.state.phase = AppPhase::Running;
     runtime.state_mut().set_input("queued prompt");
-    runtime
+    let command = runtime
         .handle_input_action(crate::tui::InputAction::Submit)
-        .expect("queue prompt succeeds");
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
-    let Some(RuntimeCommand::SubmitPrompt(prompt)) = runtime.take_next_queued_prompt_command()
-    else {
-        panic!("expected queued prompt command");
-    };
+        .expect("queue prompt succeeds")
+        .expect("queued command");
     let (engine, ingress, _egress) = SessionEngine::new();
     drop(engine);
 
-    dispatch_command(
-        &mut runtime,
-        RuntimeCommand::SubmitPrompt(prompt),
-        &ingress,
-        true,
-    );
+    dispatch_command(&mut runtime, command, &ingress, true);
 
-    assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
-    assert_eq!(runtime.queued_prompts.len(), 1);
+    assert!(runtime.queued_prompts.is_empty());
     assert!(!runtime.engine_turn_is_active());
 }
 

@@ -44,6 +44,7 @@ mod fs;
 mod git;
 mod memory;
 mod paths;
+pub(crate) mod peer;
 mod question;
 mod registry;
 mod search;

@@ -9,6 +9,9 @@ use super::*;
 #[derive(Debug)]
 pub(crate) enum SessionEngineCommand {
     Prompt(crate::user_content::UserMessageSubmission),
+    CancelQueuedPrompt(String),
+    CancelPrompt(String),
+    PeerMessage(crate::peer::PeerMessage),
     BackgroundSubagentCompleted {
         generation: Option<u64>,
         parent_session_id: String,
@@ -52,6 +55,7 @@ impl SessionEngineCommand {
     pub(crate) fn from_session_command(command: SessionCommand) -> Self {
         match command {
             SessionCommand::SubmitPrompt(prompt) => Self::Prompt(prompt),
+            SessionCommand::CancelQueuedPrompt(id) => Self::CancelQueuedPrompt(id),
             SessionCommand::Compact => Self::Compact,
             SessionCommand::ShowHistoryTree => Self::ShowHistoryTree,
             SessionCommand::Undo => Self::Undo,
@@ -150,7 +154,13 @@ pub(crate) fn session_engine_command_as_session_command(
         SessionEngineCommand::ToggleMcpServer(server_name) => Some(
             crate::session::SessionCommand::ToggleMcpServer(server_name.clone()),
         ),
-        SessionEngineCommand::Prompt(_) | SessionEngineCommand::SwarmMessageReady { .. } => None,
+        SessionEngineCommand::CancelQueuedPrompt(id) => Some(
+            crate::session::SessionCommand::CancelQueuedPrompt(id.clone()),
+        ),
+        SessionEngineCommand::Prompt(_)
+        | SessionEngineCommand::CancelPrompt(_)
+        | SessionEngineCommand::PeerMessage(_)
+        | SessionEngineCommand::SwarmMessageReady { .. } => None,
         #[cfg(test)]
         SessionEngineCommand::InspectHistory(_) => None,
     }
@@ -245,6 +255,9 @@ pub(crate) fn handle_active_turn_command(
             );
         }
         crate::session::ActiveTurnCommandDisposition::Reject => {
+            if matches!(command, SessionEngineCommand::Compact) {
+                let _ = session_transport_tx.send(SessionTransportEvent::ManualCompactionStarted);
+            }
             let _ = session_transport_tx.send(SessionTransportEvent::Notice(
                 NoticeEvent::info("Turn still running").with_message_id(NoticeId::TurnRunning),
             ));
@@ -302,6 +315,9 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         SessionEngineCommand::SetReasoningEffort(_) => Some(DeferredCommandKey::ReasoningEffort),
         SessionEngineCommand::SetFakeClient(_) => Some(DeferredCommandKey::FakeClient),
         SessionEngineCommand::Prompt(_)
+        | SessionEngineCommand::CancelQueuedPrompt(_)
+        | SessionEngineCommand::CancelPrompt(_)
+        | SessionEngineCommand::PeerMessage(_)
         | SessionEngineCommand::BackgroundSubagentCompleted { .. }
         | SessionEngineCommand::SwarmMessageReady { .. }
         | SessionEngineCommand::ContinueSession
@@ -325,6 +341,13 @@ pub(crate) fn enqueue_deferred_command(
     commands: &mut VecDeque<SessionEngineCommand>,
     command: SessionEngineCommand,
 ) {
+    if matches!(command, SessionEngineCommand::CancelPrompt(_)) {
+        commands.push_front(command);
+        return;
+    }
+    if let SessionEngineCommand::CancelQueuedPrompt(id) = &command {
+        cancel_queued_prompt(commands, id);
+    }
     if let Some(key) = deferred_command_key(&command) {
         let batch_start = commands
             .iter()
@@ -343,6 +366,21 @@ pub(crate) fn enqueue_deferred_command(
         }
     }
     commands.push_back(command);
+}
+
+pub(super) fn cancel_queued_prompt(
+    commands: &mut VecDeque<SessionEngineCommand>,
+    id: &str,
+) -> bool {
+    let before = commands.len();
+    commands.retain(
+        |command| !matches!(command, SessionEngineCommand::Prompt(prompt) if prompt.id == id),
+    );
+    commands.len() != before
+}
+
+pub(super) fn discard_queued_peer_messages(commands: &mut VecDeque<SessionEngineCommand>) {
+    commands.retain(|command| !matches!(command, SessionEngineCommand::PeerMessage(_)));
 }
 
 pub(crate) fn park_active_turn_command(
@@ -385,7 +423,10 @@ fn drain_queued_session_controls(
             Ok(SessionEngineControl::Command(command)) => {
                 enqueue_deferred_command(deferred_commands, command)
             }
-            Ok(SessionEngineControl::Interrupt) => interrupted = true,
+            Ok(SessionEngineControl::Interrupt) => {
+                discard_queued_peer_messages(deferred_commands);
+                interrupted = true;
+            }
             Ok(SessionEngineControl::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
                 return QueuedSessionEngineControlSignal::Shutdown;
             }
@@ -410,25 +451,28 @@ pub(crate) async fn next_idle_session_operation(
     control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
     deferred_commands: &mut VecDeque<SessionEngineCommand>,
 ) -> Option<IdleSessionOperation> {
-    if !deferred_commands.is_empty() {
-        match drain_queued_session_controls(control_rx, deferred_commands) {
-            QueuedSessionEngineControlSignal::Shutdown => return None,
-            QueuedSessionEngineControlSignal::Interrupt => {
-                return Some(IdleSessionOperation::Interrupt);
+    if deferred_commands.is_empty() {
+        match control_rx.recv().await? {
+            SessionEngineControl::Command(command @ SessionEngineCommand::PeerMessage(_)) => {
+                enqueue_deferred_command(deferred_commands, command);
             }
-            QueuedSessionEngineControlSignal::NoSignal => {}
+            SessionEngineControl::Command(command) => {
+                return Some(IdleSessionOperation::Command(command));
+            }
+            SessionEngineControl::Interrupt => return Some(IdleSessionOperation::Interrupt),
+            SessionEngineControl::Shutdown => return None,
         }
-
-        return deferred_commands
-            .pop_front()
-            .map(IdleSessionOperation::Command);
     }
-
-    match control_rx.recv().await? {
-        SessionEngineControl::Command(command) => Some(IdleSessionOperation::Command(command)),
-        SessionEngineControl::Interrupt => Some(IdleSessionOperation::Interrupt),
-        SessionEngineControl::Shutdown => None,
+    match drain_queued_session_controls(control_rx, deferred_commands) {
+        QueuedSessionEngineControlSignal::Shutdown => return None,
+        QueuedSessionEngineControlSignal::Interrupt => {
+            return Some(IdleSessionOperation::Interrupt);
+        }
+        QueuedSessionEngineControlSignal::NoSignal => {}
     }
+    deferred_commands
+        .pop_front()
+        .map(IdleSessionOperation::Command)
 }
 
 #[cfg(test)]
@@ -473,6 +517,7 @@ where
             biased;
             control = control_rx.recv() => match control {
                 Some(SessionEngineControl::Interrupt) => {
+                    discard_queued_peer_messages(deferred_commands);
                     return match drain_queued_session_controls(control_rx, deferred_commands) {
                         QueuedSessionEngineControlSignal::Shutdown => ActiveSessionOperation::Shutdown,
                         QueuedSessionEngineControlSignal::Interrupt | QueuedSessionEngineControlSignal::NoSignal => {
@@ -568,7 +613,10 @@ fn drain_manual_compaction_controls(
                     _ => enqueue_deferred_command(deferred_commands, command),
                 }
             }
-            Ok(SessionEngineControl::Interrupt) => drained.interrupted = true,
+            Ok(SessionEngineControl::Interrupt) => {
+                discard_queued_peer_messages(deferred_commands);
+                drained.interrupted = true;
+            }
             Ok(SessionEngineControl::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
                 drained.shutdown = true;
                 return drained;
@@ -610,6 +658,7 @@ where
                     }
                 }
                 Some(SessionEngineControl::Interrupt) => {
+                    discard_queued_peer_messages(deferred_commands);
                     return match drain_queued_session_controls(control_rx, deferred_commands) {
                         QueuedSessionEngineControlSignal::Shutdown => ManualCompactionOperation::Shutdown,
                         QueuedSessionEngineControlSignal::Interrupt | QueuedSessionEngineControlSignal::NoSignal => {
@@ -665,7 +714,9 @@ where
                 };
             }
             control = control_rx.recv(), if control_open => match control {
-                Some(SessionEngineControl::Interrupt) => {}
+                Some(SessionEngineControl::Interrupt) => {
+                    discard_queued_peer_messages(deferred_commands);
+                }
                 Some(SessionEngineControl::Shutdown) => shutdown = true,
                 None => {
                     control_open = false;
