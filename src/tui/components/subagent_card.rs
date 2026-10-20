@@ -275,7 +275,13 @@ pub(super) fn render_subagent_send_document(
     let data = tool_output_data(tool);
     let target = args
         .as_ref()
-        .and_then(|args| args.get("session_id"))
+        .and_then(|args| {
+            if tool.name == crate::tool_names::TOOL_PEER_SEND {
+                args.get("to")?.get("session_id")
+            } else {
+                args.get("session_id")
+            }
+        })
         .or_else(|| data.as_ref().and_then(|data| data.get("session_id")))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();

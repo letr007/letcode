@@ -425,6 +425,75 @@ fn send_card_shows_queue_acceptance_and_copyable_message() {
 }
 
 #[test]
+fn peer_send_card_shows_tool_status_and_copyable_message() {
+    let message = "完整消息，保留空格  和换行\nsecond line";
+    let translator = crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En);
+    for status in [ToolExecutionStatus::Succeeded, ToolExecutionStatus::Failed] {
+        let tool = ToolView {
+            call_id: "peer-send-call".into(),
+            name: crate::tool_names::TOOL_PEER_SEND.into(),
+            summary: "peer__send completed".into(),
+            arguments: Some(serde_json::json!({
+                "to": {"instance_id": "peer-instance", "session_id": "peer-target", "generation": 7},
+                "message": message
+            }).to_string()),
+            output: Some(if status == ToolExecutionStatus::Succeeded {
+                serde_json::json!({"data": {"status": "written"}}).to_string()
+            } else {
+                serde_json::json!({"error": {"message": "connection refused"}}).to_string()
+            }),
+            status,
+        };
+        for width in [0, 1, 2, 3, 4, 5, 10, 32, 80] {
+            for expanded in [false, true] {
+                let document = render_tool_card_document(
+                    &tool,
+                    Theme::dark(),
+                    width,
+                    0,
+                    expanded,
+                    &translator,
+                );
+                assert!(document.validate());
+                let lines = crate::tui::transcript_ratatui::document_to_ratatui(&document);
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| display_width(&line.to_string()) <= width)
+                );
+                if width == 80 {
+                    let rendered = lines
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(rendered.contains("send peer-target"), "{rendered}");
+                    assert!(!rendered.contains("queued"), "{rendered}");
+                    if status == ToolExecutionStatus::Succeeded {
+                        assert!(rendered.contains("completed"), "{rendered}");
+                    } else {
+                        assert!(rendered.contains("failed"), "{rendered}");
+                        if expanded {
+                            assert!(rendered.contains("connection refused"), "{rendered}");
+                        }
+                    }
+                    if expanded {
+                        assert!(
+                            document
+                                .source_blocks
+                                .iter()
+                                .any(|block| block.source == message)
+                        );
+                    } else {
+                        assert!(rendered.contains("expand"), "{rendered}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn subagent_card_summary_only_expands_and_remains_copyable() {
     let tool = ToolView {
         call_id: "run-summary-only".into(),

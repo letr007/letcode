@@ -303,7 +303,10 @@ pub fn render_tool_card_document(
     if tool_card_details(tool, &policy).is_none() {
         return document;
     }
-    if tool.name == crate::tool_names::TOOL_AGENT_SEND {
+    if matches!(
+        tool.name.as_str(),
+        crate::tool_names::TOOL_AGENT_SEND | crate::tool_names::TOOL_PEER_SEND
+    ) {
         return render_subagent_send_document(
             tool,
             theme,

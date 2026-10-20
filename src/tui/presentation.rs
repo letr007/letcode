@@ -77,7 +77,10 @@ fn tool_presentation_impl(
     if is_subagent_tool_name(tool_name)
         || matches!(
             tool_name,
-            crate::tool_names::TOOL_AGENT_SEND | crate::tool_names::TOOL_AGENT_WAIT
+            crate::tool_names::TOOL_AGENT_SEND
+                | crate::tool_names::TOOL_AGENT_WAIT
+                | crate::tool_names::TOOL_PEER_SEND
+                | crate::tool_names::TOOL_PEER_DISCOVER
         )
     {
         return ToolPresentation::CompactCard;
