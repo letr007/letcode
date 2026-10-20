@@ -5,6 +5,17 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [0.25.0] - 2026-10-20
+
+### Added
+
+- 新增本机运行中 letcode 主会话发现与文本通信，支持会话间发送消息和回复。
+
+### Fixed
+
+- 修复项目记忆检索中的标点分词和奖励词覆盖问题。
+- 修复 TUI 空闲提交消息时短暂显示排队标识的问题。
+
 ## [0.24.1] - 2026-10-18
 
 ### Changed
@@ -605,7 +616,8 @@
 - 运行时配置热重载；可选 Langfuse / OpenTelemetry 追踪
 - TUI 主题、工具输出展开、滚动条与 `/` 本地命令补全
 
-[Unreleased]: https://github.com/letr007/letcode/compare/v0.24.1...HEAD
+[Unreleased]: https://github.com/letr007/letcode/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/letr007/letcode/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/letr007/letcode/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/letr007/letcode/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/letr007/letcode/compare/v0.22.0...v0.23.0
