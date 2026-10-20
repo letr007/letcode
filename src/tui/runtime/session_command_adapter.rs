@@ -56,11 +56,30 @@ impl<'a> TuiSessionCommandAdapter<'a> {
             self.runtime.show_toast(message, ToastKind::Info);
             return Ok(());
         }
+        let local_prompt = match &command {
+            SessionCommand::SubmitPrompt(prompt)
+                if !self
+                    .runtime
+                    .queued_prompts
+                    .iter()
+                    .any(|queued| queued.id == prompt.id) =>
+            {
+                Some(prompt.clone())
+            }
+            _ => None,
+        };
         if self.ingress.submit(command.clone()).is_err() {
             if let Some(server_name) = pending_mcp_server {
                 self.runtime.clear_mcp_server_updating(&server_name);
             }
             bail!(SESSION_ENGINE_UNAVAILABLE_MESSAGE);
+        }
+        if let Some(prompt) = local_prompt {
+            self.runtime.apply_session_transport_event(
+                crate::session::SessionTransportEvent::UserMessage(
+                    crate::tui::UserMessageEvent::from_submission(prompt),
+                ),
+            );
         }
         if deferred {
             self.runtime.project_deferred_setting(&command);

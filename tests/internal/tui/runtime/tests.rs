@@ -1853,7 +1853,7 @@ fn background_children_do_not_hold_parent_turn_open() {
             runtime.handle_input_action(InputAction::Submit).unwrap(),
             Some(RuntimeCommand::SubmitPrompt(prompt)) if prompt.text() == "next prompt"
         ));
-        assert_eq!(runtime.queued_prompts.len(), 1);
+        assert!(runtime.queued_prompts.is_empty());
     }
 }
 

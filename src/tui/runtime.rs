@@ -2903,7 +2903,7 @@ impl TuiRuntime {
                     if !self.state.is_read_only_child_view() =>
                 {
                     let submission = UserMessageSubmission::new(next_submission_id(), content);
-                    self.queue_prompt(submission.clone());
+                    self.record_prompt_submission(submission.clone(), true);
                     return Ok(Some(RuntimeCommand::SubmitPrompt(submission)));
                 }
                 Some(crate::session::ActiveTurnCommandDisposition::Reject)
@@ -2937,9 +2937,7 @@ impl TuiRuntime {
         }
 
         let submission = UserMessageSubmission::new(next_submission_id(), content);
-        self.queue_prompt(submission.clone());
-        self.state.phase = super::state::AppPhase::Running;
-        self.session_turn_active = true;
+        self.record_prompt_submission(submission.clone(), false);
 
         Ok(Some(RuntimeCommand::SubmitPrompt(submission)))
     }
@@ -3010,15 +3008,20 @@ impl TuiRuntime {
         self.history_draft = None;
     }
 
-    fn queue_prompt(&mut self, prompt: UserMessageSubmission) {
+    fn record_prompt_submission(&mut self, prompt: UserMessageSubmission, queued: bool) {
         let submitted_draft = composer_draft_for_submission(&self.state);
         self.state.clear_input();
         self.state.clear_composer_tokens();
         self.state.mark_session_active();
         self.submitted_prompts.push(prompt.content.text.clone());
         self.submitted_prompt_drafts.push(submitted_draft);
-        self.queued_prompts.push_back(prompt.clone());
-        self.state.push_queued_user_message_preview(prompt);
+        if queued {
+            self.queued_prompts.push_back(prompt.clone());
+            self.state.push_queued_user_message_preview(prompt);
+        } else {
+            self.state.phase = super::state::AppPhase::Running;
+            self.session_turn_active = true;
+        }
         self.state.toast = None;
     }
 

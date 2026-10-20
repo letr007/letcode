@@ -245,7 +245,7 @@ fn failed_setting_dispatch_does_not_project_pending_value() {
 }
 
 #[test]
-fn successful_prompt_dispatch_keeps_queued_preview() {
+fn idle_prompt_dispatch_shows_message_without_queue_marker() {
     let mut runtime = runtime();
     runtime.state_mut().set_input("same");
     let command = runtime
@@ -265,6 +265,21 @@ fn successful_prompt_dispatch_keeps_queued_preview() {
         Ok(SessionEngineControl::Command(
             crate::session::engine::SessionEngineCommand::Prompt(submitted)
         )) if submitted.id == submission_id
+    ));
+    assert!(runtime.queued_prompts.is_empty());
+    assert!(matches!(
+        runtime.state().timeline.items(),
+        [crate::tui::TimelineItem::User(message)] if !message.queued
+    ));
+    runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+        prompt: crate::user_content::UserMessageSubmission::new(
+            submission_id.clone(),
+            "same".into(),
+        ),
+    });
+    assert!(matches!(
+        runtime.state().timeline.items(),
+        [crate::tui::TimelineItem::User(message)] if !message.queued
     ));
     assert_eq!(
         runtime
