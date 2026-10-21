@@ -2505,6 +2505,7 @@ async fn run_engine_loop(
                                 };
                                 if !targeted_cancel {
                                     discard_queued_peer_messages(&mut parked_commands);
+                                    discard_queued_peer_messages(&mut boundary_prompts);
                                 }
                                 interrupted = Some(interrupt);
                                 if is_shutdown { subagent_runtime.cancel_active(); }

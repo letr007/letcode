@@ -122,6 +122,26 @@ async fn interrupt_discards_only_peer_messages_before_its_fifo_boundary() {
 }
 
 #[test]
+fn discarding_peer_messages_keeps_local_prompts() {
+    let mut commands = VecDeque::from([
+        peer_message("before"),
+        SessionEngineCommand::Prompt(crate::user_content::UserMessageSubmission::new(
+            "local",
+            crate::user_content::UserMessageContent::from("local"),
+        )),
+        peer_message("after"),
+    ]);
+
+    discard_queued_peer_messages(&mut commands);
+
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(
+        &commands[0],
+        SessionEngineCommand::Prompt(prompt) if prompt.id == "local"
+    ));
+}
+
+#[test]
 fn queued_inputs_keep_fifo_order_across_flush_and_local_cancellation() {
     let prompt = |id: &str| {
         SessionEngineCommand::Prompt(crate::user_content::UserMessageSubmission::new(
