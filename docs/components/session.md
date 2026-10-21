@@ -16,7 +16,7 @@
 
 命令解析先将原始输入转换为意图。与后端相关的意图会封装为 `SessionCommand`：
 
-- `SubmitPrompt` 与跨实例消息按 `global.submit_while_running` 处理：`insert`（默认）在当前工具批次结束后关闭活动回合，并把消息作为下一回合执行；`queue` 等当前回合结束后按 FIFO 执行；
+- `SubmitPrompt` 与跨实例消息按 `global.submit_while_running` 处理：`insert`（默认）在下一个工具批次结束时关闭活动回合并把消息作为下一回合执行，没有工具批次时在回合结束时执行；`queue` 等当前回合结束后按 FIFO 执行；
 - `CancelQueuedPrompt` 按提交 ID 撤回尚未消费的本地输入；
 - `ViewChild` 与 `ViewParent` 可立即响应；
 - 权限、模型、思考深度、仿真特征、快速模式和 MCP 设置在活动回合中暂存为延迟设置；同类设置以后一次为准，并在当前回合完成后生效；

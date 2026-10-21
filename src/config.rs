@@ -585,7 +585,7 @@ pub struct GlobalConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubmitWhileRunning {
-    /// Close the active turn at the next tool batch boundary and run the prompt next.
+    /// Close the active turn at the next tool batch boundary, or at turn end, and run the prompt next.
     #[default]
     Insert,
     /// Keep the prompt queued until the active turn finishes.

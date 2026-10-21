@@ -92,7 +92,7 @@ letcode
 没有任务运行时，用 `/exit` 或 `/quit` 退出终端界面。
 
 回合运行中提交的消息进入队列，并标记为 `QUEUED`。
-`global.submit_while_running = "insert"`（默认）在当前工具批次结束后发送，`"queue"` 等当前回合结束后发送。
+`global.submit_while_running = "insert"`（默认）在下一个工具批次结束或回合结束时发送，`"queue"` 等当前回合结束后发送。
 `Ctrl+Backspace` 移除最新一条尚未派发的消息。
 当前执行和输入草稿保持不变。
 移除的消息仍在输入历史中，可按 `↑` 找回。

@@ -72,7 +72,7 @@
             "queue"
           ],
           "default": "insert",
-          "description": "How new input received during an active turn is handled. `insert` closes the turn at the next tool batch boundary and runs the input next; `queue` waits for the active turn to finish."
+          "description": "How new input received during an active turn is handled. `insert` closes the turn at the next tool batch boundary or at turn end and runs the input next; `queue` waits for the active turn to finish."
         },
         "compaction": {
           "type": "object",
