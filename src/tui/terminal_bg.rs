@@ -13,7 +13,7 @@ const QUERY: &[u8] = b"\x1b]11;?\x1b\\";
 #[cfg(any(unix, test))]
 const REPLY_PREFIX: &[u8] = b"\x1b]11;";
 #[cfg(unix)]
-const TIMEOUT: Duration = Duration::from_millis(150);
+const TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const MAX_BYTES: usize = 256;
 
