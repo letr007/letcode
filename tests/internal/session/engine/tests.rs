@@ -316,6 +316,7 @@ fn test_engine_config(
     SessionEngineConfig {
         sessions_dir: std::path::PathBuf::new(),
         workspace_dir: None,
+        submit_while_running: crate::config::SubmitWhileRunning::default(),
         model_routes,
         route_api_key_configured,
         new_session_default_route,
@@ -779,6 +780,7 @@ max_depth = 4
                 SessionEngineConfig {
                     sessions_dir: config.global.sessions_dir.clone(),
                     workspace_dir: None,
+                    submit_while_running: crate::config::SubmitWhileRunning::default(),
                     model_routes: indexmap::IndexMap::from([
                         ("test/current".into(), current_route.clone()),
                         ("test/default".into(), ModelRoute::new("test", "default")),
@@ -2901,6 +2903,287 @@ max_output_tokens = 4096
         }
     }
 
+    #[tokio::test]
+    async fn local_prompt_inserts_at_the_next_tool_batch_boundary() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let stub = tokio::spawn(serve_responses_stub(listener));
+
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            let sessions_dir = directory.path().join("sessions");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+active_provider = "test"
+
+[global]
+sessions_dir = "{}"
+
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.models.model]
+context_window = 128000
+effective_input_limit_tokens = 64000
+[providers.test.models.model.capabilities]
+tools = true
+[providers.test.models.model.capabilities.generation]
+max_output_tokens = true
+[providers.test.models.model.generation]
+max_output_tokens = 4096
+"#,
+                    toml_path(&sessions_dir)
+                ),
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).expect("config");
+
+            let mut recorder = TranscriptRecorder::create(&sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            recorder.record_user_message("earlier prompt").unwrap();
+            recorder.record_assistant_message("earlier answer").unwrap();
+            let transcript = Arc::new(StdMutex::new(recorder));
+
+            let route = ModelRoute::new("test", "model");
+            let primary_factory =
+                Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+            let mut agent = Agent::new("model", None, None);
+            agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
+            agent.set_primary_route_factory(primary_factory);
+            agent
+                .try_register_tool(HoldingTool {
+                    release: Some(Arc::clone(&release)),
+                })
+                .expect("register the holding tool");
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+
+            ingress
+                .submit(SessionCommand::SubmitPrompt(
+                    crate::user_content::UserMessageSubmission::new(
+                        "prompt-1",
+                        crate::user_content::UserMessageContent::from("first prompt"),
+                    ),
+                ))
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !open_tool_call_batch_recorded(&transcript).unwrap_or(false) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the stub tool call never reached the transcript"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            ingress
+                .submit(SessionCommand::SubmitPrompt(
+                    crate::user_content::UserMessageSubmission::new(
+                        "prompt-2",
+                        crate::user_content::UserMessageContent::from("second prompt"),
+                    ),
+                ))
+                .unwrap();
+            release.notify_one();
+
+            let mut assistant_done = None;
+            let mut second_user_message = None;
+            let mut done = false;
+            while !done {
+                match events.recv().await.expect("engine events") {
+                    SessionTransportEvent::AssistantDone { .. } => {
+                        assistant_done.get_or_insert(());
+                    }
+                    SessionTransportEvent::UserMessage(message)
+                        if message.submission_id == "prompt-2" =>
+                    {
+                        assert!(assistant_done.is_some());
+                        second_user_message.get_or_insert(());
+                    }
+                    SessionTransportEvent::Done => done = true,
+                    SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                    _ => {}
+                }
+            }
+            assert!(assistant_done.is_some());
+            assert!(second_user_message.is_some());
+
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+            stub.abort();
+        })
+        .await
+        .expect("boundary prompt insertion timed out");
+    }
+
+    #[tokio::test]
+    async fn peer_message_inserts_at_the_next_tool_batch_boundary() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let stub = tokio::spawn(serve_responses_stub(listener));
+
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            let sessions_dir = directory.path().join("sessions");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+active_provider = "test"
+
+[global]
+sessions_dir = "{}"
+
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.models.model]
+context_window = 128000
+effective_input_limit_tokens = 64000
+[providers.test.models.model.capabilities]
+tools = true
+[providers.test.models.model.capabilities.generation]
+max_output_tokens = true
+[providers.test.models.model.generation]
+max_output_tokens = 4096
+"#,
+                    toml_path(&sessions_dir)
+                ),
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).expect("config");
+
+            let mut recorder = TranscriptRecorder::create(&sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            recorder.record_user_message("earlier prompt").unwrap();
+            recorder.record_assistant_message("earlier answer").unwrap();
+            let transcript = Arc::new(StdMutex::new(recorder));
+
+            let route = ModelRoute::new("test", "model");
+            let primary_factory =
+                Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+            let mut agent = Agent::new("model", None, None);
+            agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
+            agent.set_primary_route_factory(primary_factory);
+            agent
+                .try_register_tool(HoldingTool {
+                    release: Some(Arc::clone(&release)),
+                })
+                .expect("register the holding tool");
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+            let peers = crate::peer::PeerRuntime::start(
+                directory.path(),
+                None,
+                "sender".into(),
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap();
+            let peer_address = loop {
+                let discovered = peers.client().discover().unwrap();
+                if let Some(peer) = discovered
+                    .into_iter()
+                    .find(|peer| peer.address.session_id != "sender")
+                {
+                    break peer.address;
+                }
+                tokio::task::yield_now().await;
+            };
+
+            ingress
+                .submit(SessionCommand::SubmitPrompt(
+                    crate::user_content::UserMessageSubmission::new(
+                        "prompt-1",
+                        crate::user_content::UserMessageContent::from("first prompt"),
+                    ),
+                ))
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !open_tool_call_batch_recorded(&transcript).unwrap_or(false) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the stub tool call never reached the transcript"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            ingress
+                .submit_transitional(SessionEngineCommand::PeerMessage(
+                    crate::peer::PeerMessage {
+                        from: peer_address.clone(),
+                        to: peer_address.clone(),
+                        message: "peer input".into(),
+                    },
+                ))
+                .unwrap();
+            release.notify_one();
+
+            let mut assistant_done = false;
+            let mut peer_user_message = false;
+            let mut done = false;
+            while !done {
+                match events.recv().await.expect("engine events") {
+                    SessionTransportEvent::AssistantDone { .. } => assistant_done = true,
+                    SessionTransportEvent::UserMessage(message)
+                        if message.content.text.contains("peer input") =>
+                    {
+                        assert!(assistant_done);
+                        peer_user_message = true;
+                    }
+                    SessionTransportEvent::Done => done = true,
+                    SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                    _ => {}
+                }
+            }
+            assert!(assistant_done);
+            assert!(peer_user_message);
+
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+            assert_eq!(peers.client().discover().unwrap().len(), 1);
+            stub.abort();
+        })
+        .await
+        .expect("peer boundary prompt insertion timed out");
+    }
+
     async fn check_queued_inputs(peer_first: bool, cancel_active: Option<bool>) {
         tokio::time::timeout(Duration::from_secs(30), async {
             let release = Arc::new(tokio::sync::Notify::new());
@@ -2920,6 +3203,7 @@ max_output_tokens = 4096
 active_provider = "test"
 
 [global]
+submit_while_running = "queue"
 sessions_dir = "{}"
 
 [providers.test]

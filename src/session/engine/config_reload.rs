@@ -260,7 +260,8 @@ pub(crate) fn apply_config_reload(
     // and duplicate watcher events land here with no runtime delta. Stay silent.
     let new_session_default_unchanged = engine_config.new_session_default_route
         == next_new_session_default_route
-        && engine_config.new_session_subagents_policy == config.subagents;
+        && engine_config.new_session_subagents_policy == config.subagents
+        && engine_config.submit_while_running == config.global.submit_while_running;
     if !reload_has_runtime_delta(
         runtime_fingerprint_unchanged,
         maps_unchanged,
@@ -307,6 +308,7 @@ pub(crate) fn apply_config_reload(
         ));
     }
 
+    engine_config.submit_while_running = config.global.submit_while_running;
     engine_config.model_routes = next_model_routes;
     *route_api_key_configured = next_route_api_key_configured;
     if !current_route_available {

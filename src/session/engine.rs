@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome};
 use crate::agent_event_journal::persist_agent_event;
-use crate::config::{AppConfig, ModelRoute, ProviderConfig};
+use crate::config::{AppConfig, ModelRoute, ProviderConfig, SubmitWhileRunning};
 use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
@@ -155,6 +155,7 @@ pub struct SessionEngine {
 pub struct SessionEngineConfig {
     pub sessions_dir: PathBuf,
     pub workspace_dir: Option<PathBuf>,
+    pub submit_while_running: crate::config::SubmitWhileRunning,
     /// Routes keyed by their provider-qualified display name (`provider/model`).
     pub model_routes: indexmap::IndexMap<String, ModelRoute>,
     /// Whether each route has a non-empty credential configured.
@@ -1388,6 +1389,7 @@ async fn run_engine_loop(
     memory_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut deferred_commands = VecDeque::new();
     let mut parked_commands = VecDeque::new();
+    let mut boundary_prompts = VecDeque::new();
     let mut change_notice_sent = false;
     let mut background_deliveries: HashMap<String, BackgroundDelivery> = HashMap::new();
     let mut visible_child_session_id = None;
@@ -2405,7 +2407,14 @@ async fn run_engine_loop(
                     );
                 let historian_control = agent.historian_runtime.clone();
                 let active_submission_id = prompt.id.clone();
-                let (interrupted, shutdown, interrupt_failure, turn_failure) = {
+                let (
+                    interrupted,
+                    shutdown,
+                    interrupt_failure,
+                    turn_failure,
+                    boundary_preempted,
+                    inserted_prompt,
+                ) = {
                     let run: std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
                     > =
@@ -2426,6 +2435,8 @@ async fn run_engine_loop(
                     let mut shutdown = false;
                     let mut interrupt_failure = None;
                     let mut turn_failure = None;
+                    let mut boundary_preempted = false;
+                    let mut inserted_prompt = None;
 
                     loop {
                         let operation = tokio::select! {
@@ -2457,7 +2468,8 @@ async fn run_engine_loop(
                                 } else {
                                     let parked = cancel_queued_prompt(&mut parked_commands, &id);
                                     let deferred = cancel_queued_prompt(&mut deferred_commands, &id);
-                                    if parked || deferred {
+                                    let boundary = cancel_queued_prompt(&mut boundary_prompts, &id);
+                                    if parked || deferred || boundary {
                                         let _ = session_transport_tx.send(SessionTransportEvent::PromptCancelled {
                                             submission_id: id,
                                         });
@@ -2521,7 +2533,21 @@ async fn run_engine_loop(
                                 // settled. This keeps external Done authoritative.
                             }
                             ActiveSessionOperation::RunnerEvent(event) => {
+                                let at_boundary = config.submit_while_running
+                                    == SubmitWhileRunning::Insert
+                                    && matches!(&event, SessionTransportEvent::ToolBatchFinished)
+                                    && !boundary_prompts.is_empty();
                                 let _ = session_transport_tx.send(event);
+                                if at_boundary
+                                    && let Some(prompt) = boundary_prompts.pop_front()
+                                {
+                                    inserted_prompt = Some(prompt);
+                                    boundary_preempted = true;
+                                    let _ = session_transport_tx.send(
+                                        SessionTransportEvent::AssistantDone { message_id: None },
+                                    );
+                                    break;
+                                }
                             }
                             ActiveSessionOperation::Completed(result) => {
                                 turn_failure = result.err().map(|error| error.to_string());
@@ -2537,12 +2563,19 @@ async fn run_engine_loop(
                                     parked_commands.push_back(command);
                                 }
                                 Some(command @ (SessionEngineCommand::Prompt(_)
+                                    | SessionEngineCommand::PeerMessage(_)))
+                                    if config.submit_while_running == SubmitWhileRunning::Insert =>
+                                {
+                                    boundary_prompts.push_back(command);
+                                }
+                                Some(command @ (SessionEngineCommand::Prompt(_)
                                     | SessionEngineCommand::PeerMessage(_))) => {
                                     parked_commands.push_back(command);
                                 }
                                 Some(SessionEngineCommand::CancelQueuedPrompt(id)) => {
                                     cancel_queued_prompt(&mut parked_commands, &id);
                                     cancel_queued_prompt(&mut deferred_commands, &id);
+                                    cancel_queued_prompt(&mut boundary_prompts, &id);
                                 }
                                 Some(SessionEngineCommand::ViewChild {
                                     navigation,
@@ -2656,6 +2689,8 @@ async fn run_engine_loop(
                         shutdown,
                         interrupt_failure,
                         turn_failure,
+                        boundary_preempted,
+                        inserted_prompt,
                     )
                 };
 
@@ -2663,7 +2698,34 @@ async fn run_engine_loop(
                     let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(error)));
                     deferred_commands.clear();
                     parked_commands.clear();
+                    boundary_prompts.clear();
                     break;
+                }
+                if boundary_preempted {
+                    if let Err(error) = derive_interrupt_request(&transcript, &subagent_runtime)
+                        .and_then(|interrupt| record_interrupt_transcript(&transcript, &interrupt))
+                    {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!(
+                                "failed to close the preempted turn before queued prompt: {error}"
+                            )),
+                        ));
+                        deferred_commands.clear();
+                        parked_commands.clear();
+                        boundary_prompts.clear();
+                        break;
+                    }
+                    if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!(
+                                "failed to restore background completion before queued prompt: {error}"
+                            )),
+                        ));
+                        deferred_commands.clear();
+                        parked_commands.clear();
+                        boundary_prompts.clear();
+                        break;
+                    }
                 }
                 if let Some(interrupt) = interrupted {
                     let persisted_interrupt = match record_interrupt_transcript(&transcript, &interrupt) {
@@ -2746,6 +2808,7 @@ async fn run_engine_loop(
                 if shutdown {
                     deferred_commands.clear();
                     parked_commands.clear();
+                    boundary_prompts.clear();
                     break;
                 }
                 if let Some(failure) = &turn_failure
@@ -2800,6 +2863,13 @@ async fn run_engine_loop(
                     Err(_) => tracing::warn!("could not update poisoned project memory source"),
                 }
                 flush_parked_commands(&mut deferred_commands, &mut parked_commands);
+                if let Some(prompt) = inserted_prompt {
+                    deferred_commands.push_front(prompt);
+                } else if !boundary_preempted {
+                    while let Some(prompt) = boundary_prompts.pop_back() {
+                        deferred_commands.push_front(prompt);
+                    }
+                }
                 change_notice_sent = false;
             }
             _ = memory_refresh.tick() => {

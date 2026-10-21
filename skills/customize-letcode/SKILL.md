@@ -67,6 +67,7 @@ fast_mode = false
 # max_iterations = 64
 # max_tool_calls = 128
 # tool_timeout_secs = 60
+# submit_while_running = "insert"  # insert | queue
 sessions_dir = "sessions"
 log_file = "logs/combined.log"
 
@@ -279,6 +280,7 @@ namespace = "my-cache"
 - `capabilities.generation.structured_output` 声明该路由的强制能力（非布尔值）：`json_schema` 由上游在解码层约束 JSON 语法，`json_object` 只表达“输出 JSON”的意图。
 - `[fake.codex]` 与 `[fake.claude]` 省略的字段按真实主机或所模拟客户端的典型值推导；`identity.installation_id` 必须是 UUID，否则会被替换；`clock.timezone` 需为 IANA 名。
 - `[fake.codex.extra]` 的键不超过 64 字节且首字符为 ASCII 字母、只含字母数字与 `_` `.` `-`，值不超过 128 字节；不得使用 turn metadata 已占用的键（如 `session_id`、`thread_id`、`turn_id`、`agent_name`、`request_kind`）。
+- `global.submit_while_running` 控制活动回合中新输入的处理时机，适用于本地提交与跨实例消息：`insert`（默认）在当前工具批次结束后关闭回合并作为下一回合执行，`queue` 等当前回合结束后按 FIFO 执行。
 - `[providers.<name>.retry]` 从 `[global.retry]` 继承未填写字段。`enabled` 控制是否重试；`exponential_backoff = false` 时每次固定等待 `initial_delay_secs`（不叠加 jitter），`true` 时按 `backoff_multiplier` 指数增长并可叠加 `jitter_secs`。服务端有效的 `Retry-After` 仍优先。`max_attempts` 包含首次请求。
 
 ## Skills

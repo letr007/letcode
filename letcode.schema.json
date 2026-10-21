@@ -65,6 +65,15 @@
           "default": "logs/combined.log",
           "description": "Runtime log file, resolved relative to the configuration directory."
         },
+        "submit_while_running": {
+          "type": "string",
+          "enum": [
+            "insert",
+            "queue"
+          ],
+          "default": "insert",
+          "description": "How new input received during an active turn is handled. `insert` closes the turn at the next tool batch boundary and runs the input next; `queue` waits for the active turn to finish."
+        },
         "compaction": {
           "type": "object",
           "additionalProperties": false,

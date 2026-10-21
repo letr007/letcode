@@ -18,6 +18,7 @@ letcode
 ## 队列消息
 
 回合运行期间提交的消息进入队列，界面标记为 `QUEUED`。
+`global.submit_while_running = "insert"`（默认）在当前工具批次结束后把消息作为下一回合发送；`"queue"` 等当前回合结束后再发送。
 在主输入区按 `Ctrl+Backspace`，移除最新一条尚未派发的消息。
 当前执行和输入草稿保持不变。
 

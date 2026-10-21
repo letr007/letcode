@@ -321,6 +321,7 @@ impl AppConfig {
                         .unwrap_or_else(|| DEFAULT_LOG_FILE.to_string()),
                 )?,
             ),
+            submit_while_running: raw_global.submit_while_running.unwrap_or_default(),
             compaction,
             retry: build_retry_config(raw_global.retry.unwrap_or_default(), "global.retry")?,
             session_archive: build_session_archive_config(
@@ -575,9 +576,20 @@ pub struct GlobalConfig {
     pub tool_timeout_secs: Option<u64>,
     pub sessions_dir: PathBuf,
     pub log_file: PathBuf,
+    pub submit_while_running: SubmitWhileRunning,
     pub compaction: CompactionConfig,
     pub retry: RetryConfig,
     pub session_archive: SessionArchiveConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubmitWhileRunning {
+    /// Close the active turn at the next tool batch boundary and run the prompt next.
+    #[default]
+    Insert,
+    /// Keep the prompt queued until the active turn finishes.
+    Queue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -931,6 +943,7 @@ struct RawGlobalConfig {
     tool_timeout_secs: Option<u64>,
     sessions_dir: Option<String>,
     log_file: Option<String>,
+    submit_while_running: Option<SubmitWhileRunning>,
     compaction: Option<RawCompactionConfig>,
     retry: Option<RawRetryConfig>,
     session_archive: Option<RawSessionArchiveConfig>,

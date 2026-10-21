@@ -69,6 +69,7 @@ Schema 检查字段名称、类型、枚举值与必填项，并拒绝未声明�
 sessions_dir = "sessions"
 log_file = "logs/combined.log"
 tool_timeout_secs = 60
+submit_while_running = "insert"
 # max_iterations = 64
 # max_tool_calls = 128
 ```
@@ -76,6 +77,7 @@ tool_timeout_secs = 60
 - `sessions_dir`：会话记录存储目录，相对路径按配置文件所在目录解析。
 - `log_file`：运行日志输出文件，相对路径按配置文件所在目录解析。
 - `tool_timeout_secs`：常规工具默认超时秒数。`shell__exec` 内部保持独立默认值 300 秒。
+- `submit_while_running`：活动回合中新输入的处理方式，适用于本地提交与跨实例消息。`insert`（默认）在下一个工具批次结束后关闭回合并执行该消息；`queue` 等当前回合结束后执行。
 - `max_iterations`：单个交互回合内允许的最大循环轮数。省略表示不设限制。
 - `max_tool_calls`：单个交互回合内允许调用的工具总次数。省略表示不设限制。
 

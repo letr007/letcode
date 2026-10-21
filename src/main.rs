@@ -358,6 +358,7 @@ fn session_engine_config(
     session::SessionEngineConfig {
         sessions_dir: config.global.sessions_dir.clone(),
         workspace_dir,
+        submit_while_running: config.global.submit_while_running,
         model_routes: config
             .providers
             .iter()

@@ -11,7 +11,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{ApiProtocol, PromptCacheRetention, RawMcpServerKind, SubagentMode, SubagentsConfig};
+use super::{
+    ApiProtocol, PromptCacheRetention, RawMcpServerKind, SubagentMode, SubagentsConfig,
+    SubmitWhileRunning,
+};
 use crate::model_runtime::strategy::ModelStrategyId;
 use crate::model_runtime::{
     AuthScheme, ProviderFlavor, ProviderReviewerBackend, StructuredOutputSupport,
@@ -190,6 +193,27 @@ fn targets() -> Result<Vec<Target>> {
         Target {
             pointer: &["definitions", "global", "properties", "tool_timeout_secs"],
             injection: Injection::Default(json!(super::DEFAULT_TOOL_TIMEOUT_SECS)),
+        },
+        Target {
+            pointer: &[
+                "definitions",
+                "global",
+                "properties",
+                "submit_while_running",
+            ],
+            injection: Injection::Enum(wire_values(&[
+                SubmitWhileRunning::Insert,
+                SubmitWhileRunning::Queue,
+            ])?),
+        },
+        Target {
+            pointer: &[
+                "definitions",
+                "global",
+                "properties",
+                "submit_while_running",
+            ],
+            injection: Injection::Default(wire(&SubmitWhileRunning::default())?),
         },
         Target {
             pointer: &[

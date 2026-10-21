@@ -92,6 +92,7 @@ Finish or interrupt current work before creating, restoring or navigating a sess
 Use `/exit` or `/quit` to leave the TUI when no work is running.
 
 Messages submitted during a running turn are queued and marked `QUEUED`.
+`global.submit_while_running = "insert"` (default) sends the next message after the current tool batch, while `"queue"` waits for the whole turn to finish.
 `Ctrl+Backspace` removes the newest message that has not yet been dispatched.
 It leaves the current execution and input draft unchanged.
 Removed messages remain in input history and can be recalled with `↑`.

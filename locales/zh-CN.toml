@@ -422,6 +422,7 @@ fast_mode = "用重试与推理等待换速度。也可在会话内用 /fast 切
 "global/tool_timeout_secs" = "普通工具的默认超时，单位秒，shell__exec 保持自己的 300 秒默认值。"
 "global/sessions_dir" = "会话记录目录，相对于配置目录解析。"
 "global/log_file" = "运行日志文件，相对于配置目录解析。"
+"global/submit_while_running" = "活动回合中新输入的处理方式，适用于本地提交与跨实例消息。insert 在下一个工具批次结束后关闭回合并执行该消息；queue 等当前回合结束后执行。"
 "global/compaction/preserve_recent_tokens" = "压缩时在历史末尾保留的 token 数，省略时按模型输入预算推导。"
 "global/session_archive/enabled" = "后台归档闲置的会话记录。"
 "global/session_archive/older_than_days" = "闲置多少天后归档，归档的会话仍可恢复。"
