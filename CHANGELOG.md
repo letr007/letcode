@@ -5,6 +5,16 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [0.26.0] - 2026-10-21
+
+### Added
+
+- 新增 `[global] submit_while_running` 配置，可选 `insert` 和 `queue`，控制活动回合中新输入的处理方式。
+
+### Changed
+
+- 活动回合中的新输入默认在下一个工具批次结束后开启新回合。
+
 ## [0.25.0] - 2026-10-20
 
 ### Added
