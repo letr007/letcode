@@ -484,6 +484,7 @@ pub struct Timeline {
     last_reasoning_tick_second: Option<u64>,
     tool_indices: HashMap<String, usize>,
     permission_indices: HashMap<String, usize>,
+    bulk_appending: bool,
     subagent_tools_by_run: HashMap<String, SubagentToolBinding>,
     subagent_run_by_child: HashMap<String, String>,
     foreground_waits: HashMap<String, String>,
@@ -510,6 +511,7 @@ impl Default for Timeline {
             last_reasoning_tick_second: None,
             tool_indices: HashMap::new(),
             permission_indices: HashMap::new(),
+            bulk_appending: false,
             subagent_tools_by_run: HashMap::new(),
             subagent_run_by_child: HashMap::new(),
             foreground_waits: HashMap::new(),
@@ -587,14 +589,21 @@ impl Timeline {
         let inserted_tool = matches!(&item, TimelineItem::Tool(_));
         self.mark_mutated();
 
+        let queued_index = if self.bulk_appending {
+            None
+        } else {
+            self.items.iter().position(is_queued_user_item)
+        };
+        let mut shifted = false;
         let index = if is_queued_user_item(&item) {
             let index = self.items.len();
             self.items.push(item);
             self.revisions.push(revision);
             index
-        } else if let Some(index) = self.items.iter().position(is_queued_user_item) {
+        } else if let Some(index) = queued_index {
             self.items.insert(index, item);
             self.revisions.insert(index, revision);
+            shifted = true;
             index
         } else {
             let index = self.items.len();
@@ -605,7 +614,38 @@ impl Timeline {
         if inserted_tool && index > 0 && matches!(self.items[index - 1], TimelineItem::Tool(_)) {
             self.bump_revision(index - 1);
         }
+        if shifted {
+            self.rebuild_lookup_indices();
+        } else {
+            self.index_item(index);
+        }
+    }
+
+    /// Bulk restore appends many items before any lookup runs; scanning for a
+    /// queued preview per item would make the restore quadratic in item count.
+    pub(crate) fn begin_bulk_restore(&mut self) {
+        self.bulk_appending = true;
+    }
+
+    pub(crate) fn finish_bulk_restore(&mut self) {
+        self.bulk_appending = false;
         self.rebuild_lookup_indices();
+    }
+
+    fn index_item(&mut self, index: usize) {
+        match &self.items[index] {
+            TimelineItem::Tool(tool) => {
+                self.tool_indices
+                    .entry(tool.call_id.clone())
+                    .or_insert(index);
+            }
+            TimelineItem::Permission(permission) => {
+                self.permission_indices
+                    .entry(permission.call_id.clone())
+                    .or_insert(index);
+            }
+            _ => {}
+        }
     }
 
     fn rebuild_lookup_indices(&mut self) {

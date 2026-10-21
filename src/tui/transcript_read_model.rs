@@ -19,9 +19,11 @@ use crate::user_content::UserMessageSubmission;
 
 pub(crate) fn timeline_from_transcript_records(records: &[TranscriptRecord]) -> Timeline {
     let mut projection = TranscriptTimelineProjection::default();
+    projection.timeline.begin_bulk_restore();
     for record in records {
         projection.apply_record(record);
     }
+    projection.timeline.finish_bulk_restore();
     projection.timeline
 }
 
