@@ -194,19 +194,20 @@ struct ResolvedBranchContext {
 }
 
 /// Immutable, branch-aware input for validating one pre-append compaction.
-pub(crate) struct ContextCompactionValidationScope {
-    resolved: ResolvedBranchContext,
+pub(crate) struct ContextCompactionValidationScope<'a> {
+    records: std::borrow::Cow<'a, [TranscriptRecord]>,
+    scope_checkout_sequence: Option<u64>,
     actual_append_branch_id: Option<String>,
 }
 
-impl ContextCompactionValidationScope {
+impl ContextCompactionValidationScope<'_> {
     pub(crate) fn selected_history_records(&self) -> &[TranscriptRecord] {
-        &self.resolved.records
+        &self.records
     }
 
     /// Root content retains the journal's canonical global (`None`) scope.
     pub(crate) fn checkout_revision(&self) -> u64 {
-        self.resolved.scope_checkout_sequence.unwrap_or(0)
+        self.scope_checkout_sequence.unwrap_or(0)
     }
 
     pub(crate) fn actual_append_branch_id(&self) -> &Option<String> {
@@ -218,26 +219,44 @@ pub(crate) fn context_compaction_validation_scope(
     records: &[TranscriptRecord],
     expected_frontier: u64,
     cursor: SessionContextCursor,
-) -> anyhow::Result<ContextCompactionValidationScope> {
-    let journal_records = records
-        .iter()
-        .filter(|record| record.sequence <= expected_frontier)
-        .cloned()
-        .collect::<Vec<_>>();
+) -> anyhow::Result<ContextCompactionValidationScope<'_>> {
+    debug_assert!(
+        records
+            .windows(2)
+            .all(|window| window[0].sequence < window[1].sequence),
+        "transcript records are expected in sequence order"
+    );
+    let frontier_index = records.partition_point(|record| record.sequence <= expected_frontier);
+    let journal_records = &records[..frontier_index];
     ensure!(
         journal_records
-            .iter()
+            .last()
             .map(|record| record.sequence)
-            .max()
             .unwrap_or(0)
             == expected_frontier,
         "context compaction journal frontier does not match committed transcript"
     );
-    let resolved = resolve_branch_context(&journal_records, cursor)?;
+    let root_scope = cursor
+        .branch_id
+        .as_deref()
+        .is_none_or(|branch_id| branch_id == ROOT_CONTEXT_BRANCH_ID);
+    if root_scope
+        && journal_records.iter().all(|record| {
+            record.context_branch_id.is_none() && !record.event.is_context_branch_metadata()
+        })
+    {
+        return Ok(ContextCompactionValidationScope {
+            records: std::borrow::Cow::Borrowed(journal_records),
+            scope_checkout_sequence: None,
+            actual_append_branch_id: None,
+        });
+    }
+    let resolved = resolve_branch_context(journal_records, cursor)?;
     let actual_append_branch_id =
         (resolved.branch_id != ROOT_CONTEXT_BRANCH_ID).then(|| resolved.branch_id.clone());
     Ok(ContextCompactionValidationScope {
-        resolved,
+        records: std::borrow::Cow::Owned(resolved.records),
+        scope_checkout_sequence: resolved.scope_checkout_sequence,
         actual_append_branch_id,
     })
 }
@@ -507,7 +526,7 @@ fn validate_projection_events(
     Ok(())
 }
 pub(crate) fn validate_context_compaction_event_in_scope(
-    scope: &ContextCompactionValidationScope,
+    scope: &ContextCompactionValidationScope<'_>,
     event: &crate::agent::ContextCompactionEvent,
 ) -> anyhow::Result<()> {
     ensure!(
@@ -539,7 +558,7 @@ pub(crate) fn validate_context_compaction_event_in_scope(
 
 /// Validate source coverage against the selected branch BEFORE appending the event.
 pub(crate) fn validate_history_event_in_scope(
-    scope: &ContextCompactionValidationScope,
+    scope: &ContextCompactionValidationScope<'_>,
     event: &TranscriptEvent,
 ) -> anyhow::Result<()> {
     let records = scope.selected_history_records();
