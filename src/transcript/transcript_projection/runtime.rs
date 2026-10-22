@@ -3,9 +3,9 @@ use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::analyze_history_items;
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::{
-    FrameVisibility, PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession,
-    RuntimeFrame, RuntimeFrameId, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance,
-    RuntimeSnapshot, RuntimeSource, SourceSpan,
+    ActiveContextMetadata, FrameVisibility, PromptContributorKind, PromptContributorPlaceholder,
+    RuntimeChildSession, RuntimeFrame, RuntimeFrameId, RuntimeFrameIdSeed, RuntimeFrameKind,
+    RuntimeFrameProvenance, RuntimeSnapshot, RuntimeSource, SourceSpan,
 };
 use crate::transcript::{ChildSessionSummary, TranscriptEvent, TranscriptRecord};
 use std::collections::BTreeSet;
@@ -16,6 +16,47 @@ use super::history::{
     restore_history_projection,
 };
 use super::{ResolvedBranchContext, context_scope_revision, replay_context_tree};
+
+/// Derived context state shared by the full runtime snapshot and the
+/// lightweight `RuntimeActiveContext` payload.
+pub(super) struct RuntimeContextProjection {
+    pub context_tree: crate::context_tree::ContextTreeState,
+    pub context_view: ContextViewProjection,
+    pub history_entries: Vec<HistoryProjectionEntry>,
+    pub retired_source_spans: Vec<SourceSpan>,
+    pub active_context: ActiveContextMetadata,
+}
+
+impl RuntimeContextProjection {
+    pub(super) fn build(
+        all_records: &[TranscriptRecord],
+        resolved: &ResolvedBranchContext,
+    ) -> anyhow::Result<Self> {
+        let projection_records = runtime_projection_records(all_records, resolved);
+        let context_tree = replay_context_tree(&projection_records)?;
+        let mut context_view = project_context_view_unvalidated(&projection_records)?;
+        let history_entries = restore_history_projection(&resolved.records);
+        let retired_source_spans = compacted_source_spans(&history_entries);
+        context_view.apply_retired_spans(&retired_source_spans);
+
+        let mut active_context = ActiveContextMetadata::new(&resolved.branch_id);
+        active_context.parent_branch_id = branch_parent_id(all_records, &resolved.branch_id)?;
+        active_context.active_node_id = context_tree
+            .active_node_id()
+            .map(|node_id| node_id.as_str().to_string());
+        active_context.open_detail_block_id = context_view.provider_open_detail_block_id();
+        active_context.visible_block_ids = context_view.provider_visible_block_ids();
+        active_context.pinned_block_ids = context_view.provider_pinned_block_ids();
+
+        Ok(Self {
+            context_tree,
+            context_view,
+            history_entries,
+            retired_source_spans,
+            active_context,
+        })
+    }
+}
 
 pub(super) fn runtime_snapshot_from_resolved_context_unbound(
     session_id: &str,
@@ -39,39 +80,30 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
             .with_current_segment_id(segment_id);
     }
 
-    let projection_records = runtime_projection_records(all_records, resolved);
-    let context_tree = replay_context_tree(&projection_records)?;
-    // `projection_records` is selected content, not a standalone journal. The
-    // caller validates the complete journal and selected branch before this
-    // branch-aware projection is built.
-    let mut context_view = project_context_view_unvalidated(&projection_records)?;
-    let history_entries = restore_history_projection(&resolved.records);
-    let retired_source_spans = compacted_source_spans(&history_entries);
-    context_view.apply_retired_spans(&retired_source_spans);
+    let context = RuntimeContextProjection::build(all_records, resolved)?;
     let evidence = crate::evidence::restore_evidence_records(&resolved.records)?
         .into_iter()
-        .filter(|record| !evidence_is_retired(record, &retired_source_spans))
+        .filter(|record| !evidence_is_retired(record, &context.retired_source_spans))
         .collect::<Vec<_>>();
 
-    snapshot.active_context.parent_branch_id = branch_parent_id(all_records, &resolved.branch_id)?;
-    snapshot.active_context.active_node_id = context_tree
-        .active_node_id()
-        .map(|node_id| node_id.as_str().to_string());
-    snapshot.active_context.open_detail_block_id = context_view.provider_open_detail_block_id();
-    snapshot.active_context.visible_block_ids = context_view.provider_visible_block_ids();
-    snapshot.active_context.pinned_block_ids = context_view.provider_pinned_block_ids();
-    snapshot.set_context_tree(context_tree.clone());
-    snapshot.set_context_view(context_view.clone());
+    snapshot.active_context = context.active_context.clone();
+    snapshot.set_context_tree(context.context_tree.clone());
+    snapshot.set_context_view(context.context_view.clone());
     snapshot.set_evidence(evidence.clone());
     snapshot.history_archive =
         crate::context_history::HistoryArchive::from_records(&resolved.records)?;
 
-    let history_frame_ids = append_history_frames(&mut snapshot, &history_entries);
-    append_context_frames(&mut snapshot, &context_view)?;
+    let history_frame_ids = append_history_frames(&mut snapshot, &context.history_entries);
+    append_context_frames(&mut snapshot, &context.context_view)?;
     append_evidence_frames(&mut snapshot, &evidence)?;
-    append_summary_artifact_frames(&mut snapshot, &context_view)?;
+    append_summary_artifact_frames(&mut snapshot, &context.context_view)?;
     append_child_sessions(&mut snapshot, child_sessions)?;
-    append_prompt_contributors(&mut snapshot, &context_view, &evidence, child_sessions)?;
+    append_prompt_contributors(
+        &mut snapshot,
+        &context.context_view,
+        &evidence,
+        child_sessions,
+    )?;
     snapshot.compaction.compacted_frame_ids = snapshot
         .frames
         .iter()
@@ -81,7 +113,7 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
     snapshot.compaction.compacted_frame_ids.sort();
     snapshot.compaction.compacted_frame_ids.dedup();
     snapshot.set_turn_protected_frame_ids(protected_history_frame_ids(
-        &history_entries,
+        &context.history_entries,
         &history_frame_ids,
         snapshot.current_turn_id,
         snapshot.current_segment_id,

@@ -305,30 +305,15 @@ pub(crate) fn project_runtime_active_context(
     cursor: SessionContextCursor,
 ) -> anyhow::Result<crate::runtime_context::RuntimeActiveContext> {
     let resolved = resolve_branch_context(records, cursor)?;
-    let projection_records = runtime_projection_records(records, &resolved);
-    let context_tree = replay_context_tree(&projection_records)?;
-    let mut context_view =
-        crate::context_view::project_context_view_unvalidated(&projection_records)?;
-    let history_entries = restore_history_projection(&resolved.records);
-    context_view.apply_retired_spans(&runtime::compacted_source_spans(&history_entries));
-
-    let mut active_context =
-        crate::runtime_context::ActiveContextMetadata::new(&resolved.branch_id);
-    active_context.parent_branch_id = branch_parent_id(records, &resolved.branch_id)?;
-    active_context.active_node_id = context_tree
-        .active_node_id()
-        .map(|node_id| node_id.as_str().to_string());
-    active_context.open_detail_block_id = context_view.provider_open_detail_block_id();
-    active_context.visible_block_ids = context_view.provider_visible_block_ids();
-    active_context.pinned_block_ids = context_view.provider_pinned_block_ids();
+    let context = runtime::RuntimeContextProjection::build(records, &resolved)?;
 
     Ok(crate::runtime_context::RuntimeActiveContext {
         session_id: session_id.to_string(),
         leaf_sequence: resolved.leaf_sequence,
         context_scope_revision: context_scope_revision(records, &resolved),
-        active_context,
-        context_tree,
-        context_view,
+        active_context: context.active_context,
+        context_tree: context.context_tree,
+        context_view: context.context_view,
     })
 }
 
