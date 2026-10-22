@@ -240,7 +240,7 @@ fn span_intersects_allowed_sequences(
     }
 }
 
-fn compacted_source_spans(entries: &[HistoryProjectionEntry]) -> Vec<SourceSpan> {
+pub(super) fn compacted_source_spans(entries: &[HistoryProjectionEntry]) -> Vec<SourceSpan> {
     super::history::merge_source_spans(
         entries
             .iter()

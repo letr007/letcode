@@ -10,7 +10,7 @@ use crate::request_builder::ModelReasoningEffort;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::tool::{QuestionRequest, QuestionResponse, ToolResult};
 use crate::tool_format::format_tool_call;
-use crate::transcript::{TranscriptRecord, TranscriptRecorder, read_records};
+use crate::transcript::{TranscriptRecord, TranscriptRecorder};
 use crate::user_content::UserMessageSubmission;
 
 use crate::session::{
@@ -748,22 +748,18 @@ pub(super) fn emit_context_projection_update(
     let recorder = transcript
         .lock()
         .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-    let path = recorder.path().to_path_buf();
     let session_id = recorder.session_id().to_string();
     let branch_id = recorder.current_context_branch_id().map(str::to_string);
+    let records = recorder.records().to_vec();
     drop(recorder);
-    let records = read_records(&path)?;
-    let snapshot = crate::transcript::transcript_projection::project_runtime_restore_snapshot(
-        session_id,
-        records,
+    let context = crate::transcript::transcript_projection::project_runtime_active_context(
+        &session_id,
+        &records,
         crate::transcript::transcript_projection::SessionContextCursor {
             branch_id,
             leaf_sequence: None,
         },
-        &[],
-    )?
-    .snapshot;
-    let context = RuntimeActiveContext::try_from(&snapshot)?;
+    )?;
     send_scoped_event(
         sender,
         child_session_id,

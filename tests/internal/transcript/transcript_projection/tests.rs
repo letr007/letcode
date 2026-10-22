@@ -1388,6 +1388,55 @@ fn runtime_snapshot_projection_respects_branch_cursor() {
 }
 
 #[test]
+fn active_context_projection_matches_the_full_runtime_snapshot() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("root-before"),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "feature".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: Some("feature".into()),
+            },
+        ),
+        branch_record_at(
+            3,
+            "feature",
+            TranscriptEvent::AssistantMessage {
+                content: "feature-only".into(),
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::AssistantMessage {
+                content: "root-after".into(),
+            },
+        ),
+    ];
+    let cursor = SessionContextCursor {
+        branch_id: Some("feature".into()),
+        leaf_sequence: Some(3),
+    };
+
+    let active =
+        project_runtime_active_context("s", &records, cursor.clone()).expect("active context");
+    let full = project_runtime_restore_snapshot("s".into(), records, cursor, &[])
+        .expect("runtime snapshot");
+
+    assert_eq!(
+        active,
+        crate::runtime_context::RuntimeActiveContext::try_from(&full.snapshot)
+            .expect("snapshot context")
+    );
+}
+
+#[test]
 fn runtime_snapshot_projects_workflow_state_from_resolved_turn() {
     let records = vec![
         record_at(
