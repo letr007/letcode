@@ -1805,3 +1805,26 @@ fn decoder_reports_malformed_failed_error_incomplete_and_missing_terminal() {
         Some("missing_terminal_event")
     );
 }
+
+#[test]
+fn sse_framer_events_do_not_depend_on_chunk_boundaries_or_newline_style() {
+    let source = "event: a\r\ndata: one\r\ndata: two\r\n\r\ndata: three\n\n";
+
+    let mut byte_wise = IncrementalSseFramer::new();
+    let mut events = Vec::new();
+    for byte in source.as_bytes() {
+        events.extend(byte_wise.push(&[*byte]).expect("push byte"));
+    }
+    events.extend(byte_wise.finish().expect("finish"));
+
+    let mut whole = IncrementalSseFramer::new();
+    let mut once = whole.push(source.as_bytes()).expect("push whole");
+    once.extend(whole.finish().expect("finish"));
+
+    assert_eq!(events, once);
+    assert_eq!(once.len(), 2);
+    assert_eq!(once[0].event.as_deref(), Some("a"));
+    assert_eq!(once[0].data, "one\ntwo");
+    assert_eq!(once[1].event, None);
+    assert_eq!(once[1].data, "three");
+}

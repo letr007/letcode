@@ -3554,23 +3554,29 @@ impl IncrementalSseFramer {
 
     fn drain_lines(&mut self, flush_partial: bool) -> Result<Vec<SseEvent>, std::str::Utf8Error> {
         let mut events = Vec::new();
-        while let Some(index) = self
-            .buffer
+        let mut consumed = 0usize;
+        while let Some(relative) = self.buffer[consumed..]
             .iter()
             .position(|byte| *byte == b'\n' || *byte == b'\r')
         {
-            let line = self.buffer.drain(..index).collect::<Vec<_>>();
-            let delimiter = self.buffer[0];
-            self.buffer.drain(..1);
-            if delimiter == b'\r' && self.buffer.first() == Some(&b'\n') {
-                self.buffer.drain(..1);
+            let index = consumed + relative;
+            let delimiter = self.buffer[index];
+            if delimiter == b'\r' && index + 1 == self.buffer.len() && !flush_partial {
+                break;
+            }
+            let line = self.buffer[consumed..index].to_vec();
+            consumed = index + 1;
+            if delimiter == b'\r' && self.buffer.get(consumed) == Some(&b'\n') {
+                consumed += 1;
             }
             events.extend(self.process_line(&line)?);
         }
-        if flush_partial && !self.buffer.is_empty() {
-            let line = std::mem::take(&mut self.buffer);
+        if flush_partial && consumed < self.buffer.len() {
+            let line = self.buffer[consumed..].to_vec();
             events.extend(self.process_line(&line)?);
+            consumed = self.buffer.len();
         }
+        self.buffer.drain(..consumed);
         Ok(events)
     }
 
