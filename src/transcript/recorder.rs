@@ -231,6 +231,7 @@ pub struct TranscriptRecorder {
     pub(crate) context_scope_state: Arc<Mutex<ContextScopeState>>,
     pub(crate) reasoning_started_at: std::collections::HashMap<String, std::time::Instant>,
     pub(crate) active_turn_trackers: HashMap<String, ActiveTurnTracker>,
+    records: Vec<TranscriptRecord>,
 }
 
 impl TranscriptRecorder {
@@ -268,6 +269,7 @@ impl TranscriptRecorder {
                 ROOT_CONTEXT_BRANCH_ID.to_string(),
                 ActiveTurnTracker::default(),
             )]),
+            records: Vec::new(),
         })
     }
 
@@ -433,6 +435,7 @@ impl TranscriptRecorder {
         Ok(Self {
             session_id: session_id.to_string(),
             path: file_path,
+            records: records.to_vec(),
             sink: Box::new(FileJournalSink(file)),
             writer_lock: Some(writer_lock),
             sequence,
@@ -470,7 +473,13 @@ impl TranscriptRecorder {
                 ROOT_CONTEXT_BRANCH_ID.to_string(),
                 ActiveTurnTracker::default(),
             )]),
+            records: Vec::new(),
         }
+    }
+
+    /// Records already written by this recorder, in append order.
+    pub(crate) fn records(&self) -> &[TranscriptRecord] {
+        &self.records
     }
 
     #[cfg(test)]
@@ -1630,6 +1639,7 @@ impl TranscriptRecorder {
             return Err(error.into());
         }
         self.sequence = sequence;
+        self.records.push(envelope.record.clone());
         self.apply_active_turn_record(&envelope.record);
         Ok(())
     }
@@ -1754,6 +1764,7 @@ impl TranscriptRecorder {
         for record in &index_records {
             self.apply_active_turn_record(record);
         }
+        self.records.extend(index_records);
         Ok(())
     }
 }
