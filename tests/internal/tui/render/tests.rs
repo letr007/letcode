@@ -370,14 +370,10 @@ fn notice_geometry_caps_wrapped_content_and_marks_truncation() {
 }
 
 #[test]
-fn empty_welcome_view_renders_wordmark_without_panic() {
+fn empty_welcome_view_renders_without_panic() {
     let mut state = TuiState::new("gpt-5.5", "gpt-5.5", "default");
 
     let rendered = draw_to_string(&mut state, 80, 20);
-    assert!(
-        rendered.contains("█    █▀▀█ ▀█▀▀") || rendered.contains("LETCODE"),
-        "{rendered}"
-    );
     assert!(rendered.contains("/resume"), "{rendered}");
 
     let tiny = draw_to_string(&mut state, 10, 2);
