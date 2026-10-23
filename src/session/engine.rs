@@ -448,7 +448,7 @@ fn current_runtime_context(
             .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
         (
             recorder.session_id().to_string(),
-            read_records(recorder.path())?,
+            recorder.records().to_vec(),
             recorder
                 .current_context_branch_id()
                 .unwrap_or(crate::transcript::ROOT_CONTEXT_BRANCH_ID)
@@ -480,17 +480,14 @@ fn runtime_context_from_records(
     session_id: &str,
     branch_id: Option<&str>,
 ) -> Result<RuntimeActiveContext> {
-    let snapshot = transcript_projection::project_runtime_restore_snapshot(
-        session_id.to_string(),
-        records.to_vec(),
+    transcript_projection::project_runtime_active_context(
+        session_id,
+        records,
         transcript_projection::SessionContextCursor {
             branch_id: branch_id.map(str::to_string),
             leaf_sequence: None,
         },
-        &[],
-    )?
-    .snapshot;
-    RuntimeActiveContext::try_from(&snapshot)
+    )
 }
 
 fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Result<PathBuf> {
