@@ -1271,18 +1271,41 @@ fn is_programmer_day() -> bool {
     if crate::env_flag_enabled("LETCODE_DEBUG_PROGRAMMER_DAY") {
         return true;
     }
-    let Ok(since_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+    let Some(local) = local_time() else {
         return false;
     };
-    let Ok(seconds) = libc::time_t::try_from(since_epoch.as_secs()) else {
-        return false;
-    };
+    local.tm_mon == 9 && local.tm_mday == 24
+}
+
+fn local_time() -> Option<libc::tm> {
+    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    let seconds = libc::time_t::try_from(since_epoch.as_secs()).ok()?;
+    local_tm(seconds)
+}
+
+#[cfg(unix)]
+fn local_tm(seconds: libc::time_t) -> Option<libc::tm> {
     let mut local: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: localtime_r only writes into the buffer it is given.
     if unsafe { libc::localtime_r(&seconds, &mut local) }.is_null() {
-        return false;
+        return None;
     }
-    local.tm_mon == 9 && local.tm_mday == 24
+    Some(local)
+}
+
+#[cfg(windows)]
+fn local_tm(seconds: libc::time_t) -> Option<libc::tm> {
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_s writes into the tm it is given and reports failure by return value.
+    if unsafe { libc::localtime_s(&mut local, &seconds) } != 0 {
+        return None;
+    }
+    Some(local)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_tm(_seconds: libc::time_t) -> Option<libc::tm> {
+    None
 }
 
 fn render_welcome(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
