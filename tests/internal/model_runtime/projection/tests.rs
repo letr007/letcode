@@ -468,3 +468,53 @@ base_url = "https://example.invalid/v1"
     assert_eq!(request.tools.len(), 1);
     assert_eq!(request.generation.max_output_tokens, Some(128));
 }
+
+#[test]
+fn skill_only_user_content_projects_to_a_text_marker() {
+    let project = |content: crate::user_content::UserMessageContent| {
+        let frames = vec![ProtocolFrame::from_history_item(
+            0,
+            &HistoryItem::UserMessage { content },
+        )];
+        let plan = build_prompt_plan(PromptPlanBuildInput {
+            model_id: "model",
+            prelude: &[PromptMessage::system("system")],
+            snapshot: &RuntimeSnapshot::new("test"),
+            selected_frames: &frames,
+            segment_order_offset: 0,
+            protected_suffix_len: 1,
+            evidence_message: None,
+            selected_evidence_ids: &[],
+        });
+        model_request_from_prompt_plan(
+            &replay_test_route("anthropic"),
+            &ModelRequestMetadata::default(),
+            &plan,
+            &[],
+        )
+        .unwrap()
+    };
+
+    let request = project(
+        crate::user_content::UserMessageContent::new("", vec![])
+            .with_selected_skills(vec!["demo".into(), "second".into()]),
+    );
+    let user_messages = request
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .collect::<Vec<_>>();
+    assert_eq!(user_messages.len(), 1);
+    assert_eq!(
+        user_messages[0].content,
+        vec![ContentPart::Text("[Skill: demo] [Skill: second]".into())]
+    );
+
+    let request = project(crate::user_content::UserMessageContent::new("", vec![]));
+    assert!(
+        request
+            .messages
+            .iter()
+            .all(|message| message.role != MessageRole::User)
+    );
+}

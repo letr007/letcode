@@ -2847,6 +2847,13 @@ impl TuiRuntime {
         if content.is_empty() {
             return Ok(None);
         }
+        if content.parts().is_empty() {
+            self.state.show_toast(
+                self.state.t("runtime.skill_requires_message"),
+                ToastKind::Info,
+            );
+            return Ok(None);
+        }
 
         let command_input = self
             .state

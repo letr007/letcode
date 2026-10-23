@@ -63,6 +63,19 @@ pub(crate) fn model_request_from_prompt_plan(
                         }
                     }
                 }
+                if parts.is_empty() {
+                    if content.selected_skills.is_empty() {
+                        continue;
+                    }
+                    parts.push(ContentPart::Text(
+                        content
+                            .selected_skills
+                            .iter()
+                            .map(|name| format!("[Skill: {name}]"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ));
+                }
                 request.messages.push(ModelMessage {
                     role: MessageRole::User,
                     content: parts,
