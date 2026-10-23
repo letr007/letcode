@@ -5,6 +5,14 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [0.26.1] - 2026-10-23
+
+### Changed
+
+- 长会话的转录与上下文刷新改为增量处理，滚动、恢复和持续输出更省开销。
+- 流式响应解析改为单次扫描，长回复的 CPU 占用更低。
+- 终端背景探测超时从 150ms 缩短到 50ms，启动等待更短。
+
 ## [0.26.0] - 2026-10-21
 
 ### Added
