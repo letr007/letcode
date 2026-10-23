@@ -758,7 +758,7 @@ fn init_langfuse_provider() -> (Option<SdkTracerProvider>, LangfuseTracingStatus
     )
 }
 
-fn env_flag_enabled(name: &str) -> bool {
+pub(crate) fn env_flag_enabled(name: &str) -> bool {
     env::var(name)
         .map(|value| {
             matches!(

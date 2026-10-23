@@ -2079,6 +2079,10 @@ impl TuiRuntime {
                 self.state.scroll_sidebar_down(1);
                 Ok(None)
             }
+            InputAction::ReplayWelcomeIntro => {
+                self.state.replay_welcome_intro();
+                Ok(None)
+            }
             InputAction::ToggleSidebarContext => {
                 self.state.toggle_sidebar_context();
                 Ok(None)

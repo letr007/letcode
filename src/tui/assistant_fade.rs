@@ -143,7 +143,7 @@ fn weight(fade: &AssistantFade<'_>, index: usize) -> Option<f32> {
     None
 }
 
-fn faded_style(style: Style, backdrop: (u8, u8, u8), weight: f32) -> Style {
+pub(crate) fn faded_style(style: Style, backdrop: (u8, u8, u8), weight: f32) -> Style {
     let Some(Color::Rgb(red, green, blue)) = style.fg else {
         return style;
     };

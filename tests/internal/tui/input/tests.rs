@@ -1281,6 +1281,33 @@ fn permission_picker_does_not_accept_filter_text() {
 }
 
 #[test]
+fn clicking_the_welcome_logo_replays_the_programmer_day_intro() {
+    let mut state = TuiState::default();
+    state.last_welcome_logo = ratatui::layout::Rect::new(30, 4, 34, 4);
+    let mouse = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert_eq!(
+        map_mouse_event(
+            &state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 31, 5)
+        ),
+        InputAction::ReplayWelcomeIntro
+    );
+    assert_ne!(
+        map_mouse_event(
+            &state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 5)
+        ),
+        InputAction::ReplayWelcomeIntro
+    );
+}
+
+#[test]
 fn mouse_on_the_scrollbar_thumb_drags_instead_of_selecting() {
     let mut state = TuiState::default();
     state.set_transcript_scrollbar_for_test(

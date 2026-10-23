@@ -61,6 +61,7 @@ pub enum InputAction {
     SidebarScrollUp,
     SidebarScrollDown,
     ToggleSidebarContext,
+    ReplayWelcomeIntro,
     ToggleSidebarMcp,
     ToggleSidebarTodos,
     CopySessionId,
@@ -654,6 +655,13 @@ pub fn map_mouse_event(state: &TuiState, mouse: MouseEvent) -> InputAction {
         && mouse.row < state.last_sidebar_area.bottom();
 
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left)
+            if state
+                .last_welcome_logo
+                .contains((mouse.column, mouse.row).into()) =>
+        {
+            InputAction::ReplayWelcomeIntro
+        }
         MouseEventKind::Down(MouseButton::Left)
             if state
                 .last_sidebar_context_header

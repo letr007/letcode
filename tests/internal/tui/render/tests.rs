@@ -1,6 +1,56 @@
 use super::*;
 
 #[test]
+fn programmer_day_intro_steps_through_each_frame() {
+    let mut state = TuiState::default();
+    let frame = WELCOME_INTRO_FADE_IN + WELCOME_INTRO_HOLD + WELCOME_INTRO_FADE_OUT;
+    let at = |state: &mut TuiState, elapsed: std::time::Duration| {
+        state.welcome_intro_started_at = Some(std::time::Instant::now() - elapsed);
+        welcome_mark(state, true)
+    };
+
+    let fading_in = at(&mut state, WELCOME_INTRO_FADE_IN / 2);
+    assert_eq!(fading_in.left.join("\n"), WELCOME_ART_1024_LEFT.join("\n"));
+    assert!(fading_in.brightness > 0.0 && fading_in.brightness < 1.0);
+
+    let held = at(&mut state, WELCOME_INTRO_FADE_IN + WELCOME_INTRO_HOLD / 2);
+    assert_eq!(held.right.join("\n"), WELCOME_ART_1024_RIGHT.join("\n"));
+    assert_eq!(held.brightness, 1.0);
+
+    let fading_out = at(&mut state, frame - WELCOME_INTRO_FADE_OUT / 2);
+    assert_eq!(fading_out.left.join("\n"), WELCOME_ART_1024_LEFT.join("\n"));
+    assert!(fading_out.brightness > 0.0 && fading_out.brightness < 1.0);
+
+    let errors = at(
+        &mut state,
+        frame + WELCOME_INTRO_FADE_IN + WELCOME_INTRO_HOLD / 2,
+    );
+    assert_eq!(errors.left.join("\n"), WELCOME_ART_ERR_LEFT.join("\n"));
+    assert_eq!(errors.right.join("\n"), WELCOME_ART_ERR_RIGHT.join("\n"));
+    assert_eq!(errors.brightness, 1.0);
+
+    let warnings = at(
+        &mut state,
+        frame * 2 + WELCOME_INTRO_FADE_IN + WELCOME_INTRO_HOLD / 2,
+    );
+    assert_eq!(warnings.right.join("\n"), WELCOME_ART_WRN_RIGHT.join("\n"));
+    assert_eq!(warnings.brightness, 1.0);
+
+    let revealing = at(&mut state, frame * 3 + WELCOME_INTRO_REVEAL / 2);
+    assert_eq!(revealing.left.join("\n"), WELCOME_ART_LEFT.join("\n"));
+    assert!(revealing.brightness > 0.0 && revealing.brightness < 1.0);
+
+    let settled = at(&mut state, frame * 3 + WELCOME_INTRO_REVEAL);
+    assert_eq!(settled.left.join("\n"), WELCOME_ART_LEFT.join("\n"));
+    assert_eq!(settled.brightness, 1.0);
+
+    let mut plain = TuiState::default();
+    let everyday = welcome_mark(&mut plain, false);
+    assert_eq!(everyday.left.join("\n"), WELCOME_ART_LEFT.join("\n"));
+    assert_eq!(plain.welcome_intro_started_at, None);
+}
+
+#[test]
 fn wordmark_shadow_ignores_the_background() {
     let expected = wordmark_shadow_color(Theme::dark());
 

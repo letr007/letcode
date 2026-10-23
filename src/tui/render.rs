@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
@@ -7,6 +9,7 @@ use ratatui::{
 };
 
 use super::{
+    assistant_fade,
     components::{choice, composer, dialog, footer, layout, sidebar, slash_panel, transcript},
     measure::{display_width, wrap_text_to_width, wrapped_row_count},
     state::{ToastKind, TuiState},
@@ -26,6 +29,32 @@ const WELCOME_ART_RIGHT: &[&str] = &[
     "█    █  █ █  █ █▀▀▀",
     "▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
 ];
+const WELCOME_ART_1024_LEFT: &[&str] = &["  ▄  ▄▄▄▄", "  █  █  █", "  █  █  █", "  █  █▄▄█"];
+const WELCOME_ART_1024_RIGHT: &[&str] = &["▄▄▄▄ ▄  ▄", "   █ █  █", "█▀▀▀ ▀▀▀█", "█▄▄▄    █"];
+const WELCOME_ART_ERR_LEFT: &[&str] = &["▄▄▄▄", "█  █", "█  █", "█▄▄█"];
+const WELCOME_ART_ERR_RIGHT: &[&str] = &[
+    "   ▄▄▄▄ ▄▄▄▄ ▄▄▄▄",
+    "   █    █  █ █  █",
+    "   █▀▀  █▀▀█ █▀▀█",
+    "   █▄▄▄ █  █ █  █",
+];
+const WELCOME_ART_WRN_LEFT: &[&str] = &["▄▄▄▄", "█  █", "█  █", "█▄▄█"];
+const WELCOME_ART_WRN_RIGHT: &[&str] = &[
+    "   ▄  ▄ ▄▄▄▄ ▄  ▄",
+    "   █  █ █  █ █▄ █",
+    "   █  █ █▀▀█ █ ▀█",
+    "   ▀▄▄▀ █  █ █  █",
+];
+const WELCOME_ART_ROWS: u16 = 4;
+const WELCOME_INTRO_FRAMES: [(&[&str], &[&str]); 3] = [
+    (WELCOME_ART_1024_LEFT, WELCOME_ART_1024_RIGHT),
+    (WELCOME_ART_ERR_LEFT, WELCOME_ART_ERR_RIGHT),
+    (WELCOME_ART_WRN_LEFT, WELCOME_ART_WRN_RIGHT),
+];
+const WELCOME_INTRO_FADE_IN: Duration = Duration::from_millis(400);
+const WELCOME_INTRO_HOLD: Duration = Duration::from_millis(600);
+const WELCOME_INTRO_FADE_OUT: Duration = Duration::from_millis(400);
+const WELCOME_INTRO_REVEAL: Duration = Duration::from_millis(300);
 const EXIT_EPILOGUE_TITLE_CHARS: usize = 50;
 
 /// Plain-text exit banner for the restored main screen (logo + resume hint).
@@ -68,6 +97,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     state.frame_hyperlink_cells.clear();
     state.last_sidebar_area = Rect::default();
+    state.last_welcome_logo = Rect::default();
     state.last_sidebar_bounds = Rect::default();
     state.last_sidebar_context_header = Rect::default();
     state.last_sidebar_mcp_header = Rect::default();
@@ -141,7 +171,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     ] = layout::split_workspace_layout(workspace, metrics);
 
     if state.active_timeline().items().is_empty() {
-        render_welcome(frame, transcript_area, theme);
+        render_welcome(frame, state, transcript_area, theme);
     } else {
         transcript::render_transcript(frame, state, transcript_area, state.transcript_theme());
     }
@@ -1110,7 +1140,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, the
             .saturating_div(2);
 
     let logo_area = Rect::new(area.x, stack_y, area.width, logo_height);
-    render_welcome(frame, logo_area, theme);
+    render_welcome(frame, state, logo_area, theme);
 
     let prompt_y = stack_y.saturating_add(logo_height).saturating_add(logo_gap);
     let prompt_x = content_area.x
@@ -1175,24 +1205,131 @@ fn render_dashboard_hint(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
     );
 }
 
-fn render_welcome(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+struct WelcomeMark {
+    left: &'static [&'static str],
+    right: &'static [&'static str],
+    brightness: f32,
+}
+
+impl WelcomeMark {
+    fn with_brightness(self, brightness: f32) -> Self {
+        Self {
+            brightness: brightness.clamp(0.0, 1.0),
+            ..self
+        }
+    }
+}
+
+fn welcome_mark(state: &mut TuiState, celebrate: bool) -> WelcomeMark {
+    let wordmark = WelcomeMark {
+        left: WELCOME_ART_LEFT,
+        right: WELCOME_ART_RIGHT,
+        brightness: 1.0,
+    };
+    if !celebrate {
+        return wordmark;
+    }
+    let started = *state
+        .welcome_intro_started_at
+        .get_or_insert_with(Instant::now);
+    let elapsed = started.elapsed();
+
+    let frame = WELCOME_INTRO_FADE_IN + WELCOME_INTRO_HOLD + WELCOME_INTRO_FADE_OUT;
+    let intro = frame * WELCOME_INTRO_FRAMES.len() as u32;
+    if elapsed >= intro {
+        let reveal = elapsed - intro;
+        if reveal < WELCOME_INTRO_REVEAL {
+            return wordmark.with_brightness(ease(reveal, WELCOME_INTRO_REVEAL));
+        }
+        return wordmark;
+    }
+    let index = (elapsed.as_millis() / frame.as_millis()) as usize;
+    let (left, right) = WELCOME_INTRO_FRAMES[index];
+    let mark = WelcomeMark {
+        left,
+        right,
+        brightness: 1.0,
+    };
+    let elapsed = elapsed - frame * index as u32;
+    if elapsed < WELCOME_INTRO_FADE_IN {
+        return mark.with_brightness(ease(elapsed, WELCOME_INTRO_FADE_IN));
+    }
+    let elapsed = elapsed - WELCOME_INTRO_FADE_IN;
+    if elapsed < WELCOME_INTRO_HOLD {
+        return mark;
+    }
+    let elapsed = elapsed - WELCOME_INTRO_HOLD;
+    mark.with_brightness(1.0 - ease(elapsed, WELCOME_INTRO_FADE_OUT))
+}
+
+fn ease(elapsed: Duration, window: Duration) -> f32 {
+    let progress = (elapsed.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0);
+    progress * progress * (3.0 - 2.0 * progress)
+}
+
+fn is_programmer_day() -> bool {
+    if crate::env_flag_enabled("LETCODE_DEBUG_PROGRAMMER_DAY") {
+        return true;
+    }
+    let Ok(since_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let Ok(seconds) = libc::time_t::try_from(since_epoch.as_secs()) else {
+        return false;
+    };
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r only writes into the buffer it is given.
+    if unsafe { libc::localtime_r(&seconds, &mut local) }.is_null() {
+        return false;
+    }
+    local.tm_mon == 9 && local.tm_mday == 24
+}
+
+fn render_welcome(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
         return;
     }
 
     if area.width >= 52 && area.height >= 4 {
-        let lines: Vec<Line<'static>> = WELCOME_ART_LEFT
+        let celebrate = is_programmer_day();
+        let mark = welcome_mark(state, celebrate);
+        let backdrop = assistant_fade::fade_backdrop(theme, state.terminal_background());
+        let (title_style, shadow_style) = match backdrop {
+            Color::Rgb(red, green, blue) => (
+                assistant_fade::faded_style(
+                    wordmark_style(theme),
+                    (red, green, blue),
+                    mark.brightness,
+                ),
+                assistant_fade::faded_style(
+                    wordmark_shadow_style(theme),
+                    (red, green, blue),
+                    mark.brightness,
+                ),
+            ),
+            _ => (wordmark_style(theme), wordmark_shadow_style(theme)),
+        };
+        let lines: Vec<Line<'static>> = mark
+            .left
             .iter()
-            .zip(WELCOME_ART_RIGHT.iter())
+            .zip(mark.right.iter())
             .map(|(left, right)| {
                 Line::from(vec![
-                    Span::styled(format!("{left} "), wordmark_shadow_style(theme)),
-                    Span::styled((*right).to_string(), wordmark_style(theme)),
+                    Span::styled(format!("{left} "), shadow_style),
+                    Span::styled((*right).to_string(), title_style),
                 ])
             })
             .collect();
         let lines_height = lines.len() as u16;
-        let title_y = area.y + area.height.saturating_sub(lines_height).saturating_div(2);
+        let block_height = WELCOME_ART_ROWS.max(lines_height);
+        let title_y = area.y
+            + area.height.saturating_sub(block_height).saturating_div(2)
+            + block_height.saturating_sub(lines_height);
+        if celebrate {
+            let logo_width = display_width(mark.left[0]) + 1 + display_width(mark.right[0]);
+            let logo_x = area.x + area.width.saturating_sub(logo_width as u16) / 2;
+            state.last_welcome_logo = Rect::new(logo_x, title_y, logo_width as u16, lines_height);
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .style(theme.app_style())

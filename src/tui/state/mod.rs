@@ -1350,6 +1350,7 @@ pub struct TuiState {
     pub sidebar_mcp_expanded: bool,
     pub sidebar_todos_expanded: bool,
     pub last_sidebar_area: ratatui::layout::Rect,
+    pub last_welcome_logo: ratatui::layout::Rect,
     /// 面板外框（绘制时记录）。覆盖布局下面板遮挡的终端区域，命中判定与之一致。
     pub last_sidebar_bounds: ratatui::layout::Rect,
     pub last_sidebar_context_header: ratatui::layout::Rect,
@@ -1365,6 +1366,7 @@ pub struct TuiState {
     pub theme_id: String,
     pub custom_theme: Option<Theme>,
     terminal_bg: Option<Rgb>,
+    pub(crate) welcome_intro_started_at: Option<std::time::Instant>,
     pub fake_client: Option<crate::fake::FakeClient>,
     pub fake_installation_id: Option<String>,
     pub transcript_render_cache: TranscriptRenderCache,
@@ -1457,6 +1459,7 @@ impl Default for TuiState {
             sidebar_mcp_expanded: true,
             sidebar_todos_expanded: true,
             last_sidebar_area: ratatui::layout::Rect::default(),
+            last_welcome_logo: ratatui::layout::Rect::default(),
             last_sidebar_bounds: ratatui::layout::Rect::default(),
             last_sidebar_context_header: ratatui::layout::Rect::default(),
             last_sidebar_mcp_header: ratatui::layout::Rect::default(),
@@ -1471,6 +1474,7 @@ impl Default for TuiState {
             theme_id: ThemeName::default().as_str().to_string(),
             custom_theme: None,
             terminal_bg: None,
+            welcome_intro_started_at: None,
             fake_client: None,
             fake_installation_id: None,
             transcript_render_cache: TranscriptRenderCache::default(),
@@ -1680,6 +1684,10 @@ impl TuiState {
 
     pub fn set_fake_client(&mut self, client: Option<crate::fake::FakeClient>) {
         self.fake_client = client;
+    }
+
+    pub fn replay_welcome_intro(&mut self) {
+        self.welcome_intro_started_at = Some(std::time::Instant::now());
     }
 
     pub fn set_terminal_bg(&mut self, terminal_bg: Option<Rgb>) {
