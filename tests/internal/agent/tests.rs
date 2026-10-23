@@ -6056,3 +6056,21 @@ mod integration_tests {
         }
     }
 }
+
+#[test]
+fn builtin_tool_schemas_avoid_root_level_composition() {
+    let mut agent = test_agent();
+    agent.set_subagent_delegate(static_delegate(ToolResult::ok(
+        "agent__explore",
+        json!({"status": "completed"}),
+    )));
+    for spec in agent.tool_definitions_for_test() {
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            assert!(
+                spec.parameters.get(keyword).is_none(),
+                "{} uses root-level {keyword}",
+                spec.name
+            );
+        }
+    }
+}

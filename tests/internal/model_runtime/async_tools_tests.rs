@@ -99,11 +99,19 @@ fn async_tools_change_route_fingerprint() {
 fn responses_wire_marks_only_declared_tools_and_keeps_replay_canonical() {
     let binding = responses_binding();
     let mut input = ModelRequestInput::new("model", Vec::new());
-    let mut async_tool = ToolDefinition::new("lookup", "lookup", json!({"type":"object"}));
+    let mut async_tool = ToolDefinition::new(
+        "lookup",
+        "lookup",
+        json!({"type":"object","additionalProperties":false}),
+    );
     async_tool.async_call = true;
     input.tools = vec![
         async_tool,
-        ToolDefinition::new("plain", "plain", json!({"type":"object"})),
+        ToolDefinition::new(
+            "plain",
+            "plain",
+            json!({"type":"object","additionalProperties":false}),
+        ),
     ];
     input.messages.push(crate::model_runtime::ModelMessage {
         role: MessageRole::Assistant,

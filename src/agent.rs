@@ -4568,7 +4568,6 @@ fn subagent_control_tool_specs(
                         "run_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
                         "session_id": {"type": "string", "minLength": 1, "pattern": "\\S"}
                     },
-                    "oneOf": [{"required": ["run_id"]}, {"required": ["session_id"]}],
                     "additionalProperties": false
                 })
             } else {

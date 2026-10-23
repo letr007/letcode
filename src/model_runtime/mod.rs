@@ -12,6 +12,7 @@ pub(crate) mod decorator;
 pub(crate) mod projection;
 pub(crate) mod runtime;
 pub(crate) mod strategy;
+pub(crate) mod tool_schema;
 pub(crate) mod websocket;
 
 use serde::de::DeserializeOwned;

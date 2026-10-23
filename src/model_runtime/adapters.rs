@@ -578,7 +578,10 @@ impl ProtocolBinding for AnthropicBinding {
             .map(|tool| AnthropicTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                input_schema: tool.parameters.clone(),
+                input_schema: super::tool_schema::project(
+                    &tool.parameters,
+                    super::tool_schema::ToolSchemaDialect::Anthropic,
+                ),
                 strict: tool.strict,
                 cache_control: None,
             })
@@ -2364,7 +2367,10 @@ impl CompletionsRequest {
                 function: CompletionsToolFunction {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
-                    parameters: tool.parameters.clone(),
+                    parameters: super::tool_schema::project(
+                        &tool.parameters,
+                        super::tool_schema::ToolSchemaDialect::OpenAiStrict,
+                    ),
                     strict: tool.strict,
                 },
             })
@@ -2969,7 +2975,10 @@ impl ResponsesRequest {
                 tool_type: "function",
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
+                parameters: super::tool_schema::project(
+                    &tool.parameters,
+                    super::tool_schema::ToolSchemaDialect::OpenAiStrict,
+                ),
                 strict: tool.strict,
                 async_call: tool.async_call,
             })

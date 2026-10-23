@@ -155,7 +155,7 @@ fn responses_websocket_frame_crops_only_input_and_preserves_request_controls() {
     input.tools = vec![super::super::ToolDefinition::new(
         "lookup",
         "look something up",
-        serde_json::json!({"type":"object"}),
+        serde_json::json!({"type":"object","additionalProperties":false}),
     )];
     let request = binding.prepare_request(&input).unwrap();
     let normal: Value = serde_json::from_slice(&request.body).unwrap();
@@ -560,7 +560,7 @@ anthropic_thinking = { mode = "adaptive" }"#,
     request.tools = vec![ToolDefinition::new(
         "search",
         "Search",
-        serde_json::json!({"type":"object"}),
+        serde_json::json!({"type":"object","additionalProperties":false}),
     )];
     request.generation.max_output_tokens = Some(2048);
     request.cache = CacheIntent {
@@ -628,6 +628,47 @@ fn anthropic_adapter_settings_and_capability_guards() {
     assert_eq!(body["temperature"], 0.2);
     assert_eq!(body["top_p"], 0.8);
     assert_eq!(body["stop_sequences"][0], "END");
+}
+
+#[test]
+fn tool_schema_projection_degrades_what_a_protocol_cannot_express() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "choice": {"type": "string", "minLength": 1, "maxLength": 10},
+            "tags": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 3,
+                "items": {"type": "string"}
+            }
+        },
+        "oneOf": [{"required": ["choice"]}, {"required": ["tags"]}],
+        "required": ["choice"]
+    });
+
+    let anthropic = crate::model_runtime::tool_schema::project(
+        &schema,
+        crate::model_runtime::tool_schema::ToolSchemaDialect::Anthropic,
+    );
+    assert!(anthropic.get("oneOf").is_none());
+    assert!(anthropic["description"].as_str().unwrap().contains("oneOf"));
+    assert!(anthropic["properties"]["choice"].get("minLength").is_none());
+    assert!(
+        anthropic["properties"]["choice"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("minLength: 1")
+    );
+    assert!(anthropic["properties"]["tags"].get("maxItems").is_none());
+
+    let openai = crate::model_runtime::tool_schema::project(
+        &schema,
+        crate::model_runtime::tool_schema::ToolSchemaDialect::OpenAiStrict,
+    );
+    assert_eq!(openai["properties"]["choice"]["minLength"], 1);
+    assert_eq!(openai["properties"]["tags"]["maxItems"], 3);
+    assert!(openai.get("oneOf").is_none());
 }
 
 #[test]
@@ -1577,7 +1618,7 @@ fn deepseek_replay_is_before_tool_call_and_images_and_tools_are_typed() {
         tools: vec![ToolDefinition::new(
             "search",
             "Search",
-            serde_json::json!({"type":"object"}),
+            serde_json::json!({"type":"object","additionalProperties":false}),
         )],
         generation: GenerationSettings::default(),
         cache: CacheIntent::default(),

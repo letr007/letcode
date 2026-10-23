@@ -784,7 +784,7 @@ tools = true
         input.tools = vec![crate::model_runtime::ToolDefinition::new(
             "lookup",
             "look something up",
-            serde_json::json!({"type":"object"}),
+            serde_json::json!({"type":"object","additionalProperties":false}),
         )];
         let mut request = route.binding.prepare_request(&input).unwrap();
         request

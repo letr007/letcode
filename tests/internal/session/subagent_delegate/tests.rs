@@ -246,7 +246,8 @@ mod integration_tests {
                 );
             } else {
                 assert!(status.parameters["properties"].get("session_id").is_some());
-                assert_eq!(status.parameters["oneOf"].as_array().unwrap().len(), 2);
+                assert!(status.parameters.get("oneOf").is_none());
+                assert!(status.description.contains("exactly one selector"));
             }
         }
         let jobs = delegate
