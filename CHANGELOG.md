@@ -5,6 +5,13 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [0.26.2] - 2026-10-24
+
+### Fixed
+
+- 修复 Anthropic 协议模型携带内置工具时请求失败的问题。
+- 修复只引用 skill 未输入文字时请求失败的问题。
+
 ## [0.26.1] - 2026-10-23
 
 ### Changed
