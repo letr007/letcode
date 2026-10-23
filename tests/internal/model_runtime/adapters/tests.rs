@@ -763,7 +763,7 @@ fn anthropic_adapter_chunked_signed_tool_usage_ping_and_terminal() {
 }
 
 #[test]
-fn anthropic_replay_rejects_thinking_without_text() {
+fn anthropic_replay_skips_thinking_without_text() {
     let replay = OpaqueReplayState::new(
         "anthropic.thinking_blocks",
         1,
@@ -789,12 +789,15 @@ fn anthropic_replay_rejects_thinking_without_text() {
             ],
         }],
     );
-    assert!(
-        anthropic_binding("")
+    let body: Value = serde_json::from_slice(
+        &anthropic_binding("")
             .unwrap()
             .prepare_request(&input)
-            .is_err()
-    );
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(body["messages"][0]["content"][0]["type"], "text");
 }
 
 #[test]
@@ -1868,4 +1871,21 @@ fn sse_framer_events_do_not_depend_on_chunk_boundaries_or_newline_style() {
     assert_eq!(once[0].data, "one\ntwo");
     assert_eq!(once[1].event, None);
     assert_eq!(once[1].data, "three");
+}
+
+#[test]
+fn anthropic_replay_drops_thinking_blocks_without_signatures() {
+    let blocks = parse_anthropic_replay(&serde_json::json!([
+        {"type": "thinking", "thinking": "one", "signature": ""},
+        {"type": "thinking", "thinking": "two", "signature": "sig"},
+        {"type": "thinking", "thinking": "", "signature": "sig"},
+        {"type": "redacted_thinking", "data": ""}
+    ]))
+    .unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(
+        &blocks[0],
+        AnthropicBlock::Thinking { thinking, signature, .. }
+            if thinking == "two" && signature == "sig"
+    ));
 }

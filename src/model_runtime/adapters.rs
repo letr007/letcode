@@ -852,49 +852,51 @@ fn parse_anthropic_replay(payload: &Value) -> Result<Vec<AnthropicBlock>, ModelF
     let items = payload
         .as_array()
         .ok_or_else(|| unsupported("replay", "Anthropic replay payload must be an array"))?;
-    items
-        .iter()
-        .map(|item| {
-            let block_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-            if !matches!(block_type, "thinking" | "redacted_thinking") {
-                return Err(unsupported(
-                    "replay",
-                    "invalid Anthropic thinking replay block",
-                ));
+    let mut blocks = Vec::new();
+    for item in items {
+        let block_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(block_type, "thinking" | "redacted_thinking") {
+            return Err(unsupported(
+                "replay",
+                "invalid Anthropic thinking replay block",
+            ));
+        }
+        match block_type {
+            "thinking" => {
+                let thinking = item
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                let signature = item
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                let (Some(thinking), Some(signature)) = (thinking, signature) else {
+                    continue;
+                };
+                blocks.push(AnthropicBlock::Thinking {
+                    thinking: thinking.to_owned(),
+                    signature: signature.to_owned(),
+                    cache_control: None,
+                });
             }
-            match block_type {
-                "thinking" => {
-                    let thinking = item
-                        .get("thinking")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| unsupported("replay", "thinking text is required"))?;
-                    let signature = item
-                        .get("signature")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| unsupported("replay", "thinking signature is required"))?;
-                    Ok(AnthropicBlock::Thinking {
-                        thinking: thinking.to_owned(),
-                        signature: signature.to_owned(),
-                        cache_control: None,
-                    })
-                }
-                "redacted_thinking" => {
-                    let data = item
-                        .get("data")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| unsupported("replay", "redacted data is required"))?;
-                    Ok(AnthropicBlock::RedactedThinking {
-                        data: data.to_owned(),
-                        cache_control: None,
-                    })
-                }
-                _ => unreachable!(),
+            "redacted_thinking" => {
+                let Some(data) = item
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                blocks.push(AnthropicBlock::RedactedThinking {
+                    data: data.to_owned(),
+                    cache_control: None,
+                });
             }
-        })
-        .collect()
+            _ => unreachable!(),
+        }
+    }
+    Ok(blocks)
 }
 
 struct AnthropicDecoder {
