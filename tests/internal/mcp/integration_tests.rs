@@ -167,3 +167,119 @@ async fn wait_for_process_exit(pid: i32) {
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for process {pid} to exit"));
 }
+
+#[tokio::test]
+async fn remote_http_negotiates_protocol_before_sending_version_header() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        timeout(Duration::from_secs(10), async {
+            for method in ["initialize", "notifications/initialized", "tools/list"] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("POST /mcp HTTP/1.1"));
+                let mut length = 0;
+                let mut versions = Vec::new();
+                let mut session_id = None;
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.trim_end().split_once(':').unwrap();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    } else if name.eq_ignore_ascii_case("mcp-protocol-version") {
+                        versions.push(value.trim().to_string());
+                    } else if name.eq_ignore_ascii_case("mcp-session-id") {
+                        session_id = Some(value.trim().to_string());
+                    }
+                }
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], method);
+                let (status, body) = if method == "initialize" {
+                    assert!(versions.is_empty(), "unnegotiated header: {versions:?}");
+                    assert!(session_id.is_none());
+                    assert_eq!(request["params"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+                    (
+                        "200 OK",
+                        json!({
+                            "jsonrpc": "2.0", "id": request["id"],
+                            "result": {
+                                "protocolVersion": "2025-11-25",
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "test", "version": "1"}
+                            }
+                        }).to_string(),
+                    )
+                } else {
+                    assert_eq!(versions, ["2025-11-25"]);
+                    assert_eq!(session_id.as_deref(), Some("test-session"));
+                    if method == "notifications/initialized" {
+                        assert!(request.get("id").is_none());
+                        ("202 Accepted", String::new())
+                    } else {
+                        (
+                            "200 OK",
+                            json!({
+                                "jsonrpc": "2.0", "id": request["id"],
+                                "result": {"tools": [{
+                                    "name": "probe", "inputSchema": {"type": "object"}
+                                }]}
+                            }).to_string(),
+                        )
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nMcp-Session-Id: test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.get_mut().write_all(response.as_bytes()).await.unwrap();
+            }
+        })
+        .await
+        .expect("mock MCP server timed out");
+    });
+    let session = McpSession::new(
+        McpTransportConfig::Remote(McpRemoteServerConfig {
+            url,
+            headers: IndexMap::new(),
+            oauth: false,
+        }),
+        5_000,
+    );
+    let result = list_tools("test", &session).await;
+    server.await.unwrap();
+    let tools = result.expect("discovery should negotiate the protocol version");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "probe");
+    session.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly supplied MCP_TEST_URL; only discovers tools"]
+async fn remote_http_live_tool_discovery() {
+    let url = std::env::var("MCP_TEST_URL").expect("set MCP_TEST_URL to the test server");
+    let (session, tools) = discover_server_tools(
+        "live-test".into(),
+        McpServerConfig {
+            enabled: true,
+            timeout_ms: 10_000,
+            transport: McpTransportConfig::Remote(McpRemoteServerConfig {
+                url,
+                headers: IndexMap::new(),
+                oauth: false,
+            }),
+        },
+    )
+    .await
+    .expect("live MCP discovery should succeed");
+    assert!(!tools.is_empty());
+    println!("Discovered {} tools", tools.len());
+    session.shutdown().await;
+}

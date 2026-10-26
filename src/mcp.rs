@@ -699,8 +699,10 @@ impl RemoteMcpSession {
             .client
             .post(&self.url)
             .header("Accept", "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", &self.protocol_version)
             .json(&message);
+        if message.get("method").and_then(Value::as_str) != Some("initialize") {
+            request = request.header("MCP-Protocol-Version", &self.protocol_version);
+        }
         for (key, value) in &self.headers {
             request = request.header(key, value);
         }
