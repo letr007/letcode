@@ -247,6 +247,33 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             projection.timeline.cancel_foreground_subagent_waits();
             projection.timeline.cancel_active_tools();
         }
+        SessionEvent::TurnFinished { outcome } => {
+            projection
+                .timeline
+                .seal_active_reasoning(std::time::Instant::now());
+            let had_retry = projection.retry.take().is_some();
+            *projection.compaction_active = false;
+            projection.timeline.finish_compaction(false);
+            *projection.phase = match outcome {
+                crate::session::TurnOutcome::Completed
+                | crate::session::TurnOutcome::Interrupted => AppPhase::Completed,
+                crate::session::TurnOutcome::Failed | crate::session::TurnOutcome::Aborted => {
+                    AppPhase::Error
+                }
+            };
+            *projection.active_tool_call_id = None;
+            *projection.pending_permission = None;
+            *projection.latest_auto_continue = AutoContinueState::default();
+            if let Some(todo) = projection.latest_todo.as_mut() {
+                todo.auto_continue = AutoContinueState::default();
+            }
+            *projection.ignore_late_tool_events = true;
+            projection.timeline.cancel_foreground_subagent_waits();
+            projection.timeline.cancel_active_tools();
+            if had_retry {
+                *projection.toast = None;
+            }
+        }
         SessionEvent::Error(error) => {
             projection
                 .timeline
@@ -254,7 +281,6 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             let had_retry = projection.retry.take().is_some();
             *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
-            *projection.phase = AppPhase::Error;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
             *projection.latest_auto_continue = AutoContinueState::default();

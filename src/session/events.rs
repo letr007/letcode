@@ -20,7 +20,7 @@ use crate::session::{
     ReasoningDeltaEvent, ReasoningDoneEvent, RetryLifecycleEvent, RuntimeContextDisposition,
     RuntimeContextUpdatedEvent, SessionEvent, TodoSnapshotEvent, TokenUsageEvent,
     ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
-    ToolStartedEvent, UserMessageEvent,
+    ToolStartedEvent, TurnOutcome, UserMessageEvent,
 };
 
 use super::formatting::{output_json, output_summary};
@@ -275,7 +275,10 @@ pub(crate) enum SessionTransportEvent {
         session_id: String,
         title: String,
     },
-    Interrupted,
+    /// Authoritative turn boundary. Every turn emits exactly one of these.
+    TurnFinished {
+        outcome: TurnOutcome,
+    },
     SessionResumed {
         session_id: String,
         branch_id: String,
@@ -412,7 +415,9 @@ impl SessionTransportEvent {
             | Self::McpDiscoveryUnavailable(_)
             | Self::McpDiagnostic(_)
             | Self::SessionTitleUpdated { .. } => None,
-            Self::Interrupted => Some(SessionEvent::Interrupted),
+            Self::TurnFinished { outcome } => {
+                Some(SessionEvent::TurnFinished { outcome: *outcome })
+            }
             Self::SessionStarted {
                 session_id,
                 runtime_context,
@@ -676,12 +681,14 @@ pub(super) fn wrap_child_session_transport_event(
             event: SessionEvent::RetryStarted(event),
         },
         SessionTransportEvent::SessionTitleUpdated { .. } => event,
-        SessionTransportEvent::Interrupted => SessionTransportEvent::ChildSessionEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: SessionEvent::Interrupted,
-        },
+        SessionTransportEvent::TurnFinished { outcome } => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::TurnFinished { outcome },
+            }
+        }
         SessionTransportEvent::Error(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),

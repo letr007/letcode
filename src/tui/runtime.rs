@@ -886,7 +886,9 @@ impl TuiRuntime {
                 "TUI session event stream closed unexpectedly",
             )));
             if terminalize {
-                self.apply_session_transport_event(SessionTransportEvent::Done);
+                self.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+                    outcome: crate::session::TurnOutcome::Aborted,
+                });
             }
             self.clear_unaccepted_queued_prompt();
         }
@@ -1424,11 +1426,33 @@ impl TuiRuntime {
             {
                 self.permission_lifecycle.clear();
             }
-            SessionTransportEvent::Done => {
+            SessionTransportEvent::Done => {}
+            SessionTransportEvent::TurnFinished { outcome } => {
+                let interrupting_message = self.state.t("runtime.interrupting");
+                if self
+                    .state
+                    .toast()
+                    .is_some_and(|toast| toast.message == interrupting_message)
+                {
+                    self.state.toast = None;
+                }
                 self.output_rate_samples
                     .retain(|sample| sample.child_session_id.is_some());
                 self.permission_lifecycle.clear_if_parent();
-                self.cancel_pending_question_if_parent("question cancelled because the turn ended");
+                match outcome {
+                    crate::session::TurnOutcome::Completed
+                    | crate::session::TurnOutcome::Failed => {
+                        self.cancel_pending_question_if_parent(
+                            "question cancelled because the turn ended",
+                        );
+                    }
+                    crate::session::TurnOutcome::Interrupted
+                    | crate::session::TurnOutcome::Aborted => {
+                        let _ = self.cancel_pending_question(
+                            "question cancelled because the turn was interrupted",
+                        );
+                    }
+                }
                 self.interrupt_confirmation_pending = false;
                 if let Some(prompt) = self.queued_prompt_lifecycle.take() {
                     self.queued_prompts.retain(|queued| queued.id != prompt.id);
@@ -1509,29 +1533,6 @@ impl TuiRuntime {
                 if self.state.session_id.as_deref() == Some(session_id) =>
             {
                 self.session_title = Some(title.clone());
-            }
-            SessionTransportEvent::Interrupted => {
-                let interrupting_message = self.state.t("runtime.interrupting");
-                if self
-                    .state
-                    .toast()
-                    .is_some_and(|toast| toast.message == interrupting_message)
-                {
-                    self.state.toast = None;
-                }
-                self.output_rate_samples
-                    .retain(|sample| sample.child_session_id.is_some());
-                self.permission_lifecycle.clear_if_parent();
-                let _ = self
-                    .cancel_pending_question("question cancelled because the turn was interrupted");
-                self.interrupt_confirmation_pending = false;
-                if let Some(prompt) = self.queued_prompt_lifecycle.take() {
-                    self.queued_prompts.retain(|queued| queued.id != prompt.id);
-                    self.state
-                        .timeline
-                        .remove_first_queued_user_message_preview(&prompt.id);
-                }
-                self.session_turn_active = false;
             }
             SessionTransportEvent::UserMessage(user_message) => {
                 self.session_turn_active = true;

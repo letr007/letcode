@@ -922,24 +922,24 @@ impl Driver {
             SessionTransportEvent::Error(event) => {
                 self.fail_turn(event);
             }
-            SessionTransportEvent::Interrupted => {
-                if let Some(turn) = self.turn.as_mut().filter(|turn| turn.accepted) {
+            SessionTransportEvent::TurnFinished { outcome } => {
+                if let Some(turn) = self.turn.as_mut().filter(|turn| turn.accepted)
+                    && matches!(
+                        outcome,
+                        crate::session::TurnOutcome::Interrupted
+                            | crate::session::TurnOutcome::Aborted
+                    )
+                {
                     turn.cancelled = true;
                 }
-                // An interrupted run is over: the engine reports the interrupt
-                // with this event and does not follow it with `Done`, so the
-                // prompt the client is waiting on is answered here.
                 if self.turn.as_ref().is_some_and(|turn| turn.accepted) {
                     self.finish_turn();
                 }
+                // A manual compaction ends through the same boundary event.
+                self.settle_command(&[CommandOutcome::Compaction], None);
             }
             SessionTransportEvent::Done => {
-                if self.turn.as_ref().is_some_and(|turn| turn.accepted) {
-                    self.finish_turn();
-                }
-                // A manual compaction ends the run it performs with this report,
-                // whether or not the engine reported anything else about it.
-                self.settle_command(&[CommandOutcome::Compaction], None);
+                // Engine-internal runner completion; the public boundary is TurnFinished.
             }
             event => {
                 if let Some(update) = self.projection.project(&event) {

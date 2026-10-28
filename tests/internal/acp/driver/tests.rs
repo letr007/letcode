@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 
 use crate::acp::session_state::SessionSettings;
 use crate::request_builder::ModelReasoningEffort;
+use crate::session::TurnOutcome;
 use crate::tool::QuestionOption;
 
 /// `bGV0Y29kZQ==` is "letcode".
@@ -742,7 +743,13 @@ mod integration_tests {
                         )
                         .await?;
                     driver
-                        .handle_event(&connection, &ingress, SessionTransportEvent::Interrupted)
+                        .handle_event(
+                            &connection,
+                            &ingress,
+                            SessionTransportEvent::TurnFinished {
+                                outcome: TurnOutcome::Interrupted,
+                            },
+                        )
                         .await?;
                     driver.cancel(&ingress, SessionId::new("session-1"));
                     assert!(matches!(

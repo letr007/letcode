@@ -20,7 +20,9 @@ fn handle_session_engine_unavailable(runtime: &mut TuiRuntime) {
     runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
         SESSION_ENGINE_UNAVAILABLE_MESSAGE,
     )));
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: crate::session::TurnOutcome::Aborted,
+    });
     runtime.clear_unaccepted_queued_prompt();
 }
 

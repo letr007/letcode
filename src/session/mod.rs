@@ -59,7 +59,7 @@ pub use event::{
     PermissionResolutionEvent, ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
     RetryLifecycleEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent, SessionEvent,
     TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome,
-    ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
+    ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent, TurnOutcome, UserMessageEvent,
 };
 
 pub use lifecycle::{prepare_new_session_package, resolve_session_prefix};

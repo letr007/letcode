@@ -753,7 +753,7 @@ fn present_transport_event(
                 println!("{rendered}");
             }
         }
-        SessionTransportEvent::Done | SessionTransportEvent::Interrupted => {
+        SessionTransportEvent::Done | SessionTransportEvent::TurnFinished { .. } => {
             stop_tool_spinners(spinners)?;
             marker.done = true;
         }

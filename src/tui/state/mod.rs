@@ -3941,6 +3941,14 @@ fn child_phase_for_event(event: &SessionEvent) -> AppPhase {
     match event {
         SessionEvent::Error(_) => AppPhase::Error,
         SessionEvent::Done | SessionEvent::Interrupted => AppPhase::Completed,
+        SessionEvent::TurnFinished { outcome } => match outcome {
+            crate::session::TurnOutcome::Failed | crate::session::TurnOutcome::Aborted => {
+                AppPhase::Error
+            }
+            crate::session::TurnOutcome::Completed | crate::session::TurnOutcome::Interrupted => {
+                AppPhase::Completed
+            }
+        },
         SessionEvent::PermissionRequested(_) => AppPhase::WaitingForPermission,
         _ => AppPhase::Running,
     }
@@ -3987,6 +3995,9 @@ fn apply_event_to_child_transcript(
             child.timeline.resolve_permission(resolution);
         }
         event => {
+            if matches!(event, SessionEvent::Error(_)) {
+                child.phase = AppPhase::Error;
+            }
             let accepts_tool_events = !child.ignore_late_tool_events;
             let mut child_quit_requested = false;
             apply_projected_session_event(

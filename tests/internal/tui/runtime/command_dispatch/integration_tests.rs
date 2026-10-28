@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::{SessionEngine, engine::SessionEngineControl};
+use crate::session::{SessionEngine, TurnOutcome, engine::SessionEngineControl};
 use crate::tui::{AppPhase, TuiState, map_key_event};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -46,7 +46,9 @@ fn idle_compact_reaches_engine_and_returns_to_completed() {
         runtime.apply_session_transport_event(SessionTransportEvent::CompactionNoProgress {
             blockers: Vec::new(),
         });
-        runtime.apply_session_transport_event(SessionTransportEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+            outcome: TurnOutcome::Completed,
+        });
         assert!(!runtime.engine_turn_is_active());
         assert_eq!(runtime.state.phase, AppPhase::Completed);
     }
@@ -128,7 +130,7 @@ fn failed_compact_dispatch_does_not_leave_running_state() {
     dispatch_command(&mut runtime, command, &ingress, true);
 
     assert!(!runtime.engine_turn_is_active());
-    assert_eq!(runtime.state.phase, AppPhase::Completed);
+    assert_eq!(runtime.state.phase, AppPhase::Error);
 }
 
 #[test]
@@ -146,7 +148,7 @@ fn failed_resume_dispatch_clears_pending_state() {
     dispatch_command(&mut runtime, command, &ingress, true);
 
     assert!(!runtime.session_resume_pending);
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(runtime.state().phase, AppPhase::Error);
 }
 
 #[tokio::test]
@@ -219,7 +221,7 @@ fn failed_mcp_dispatch_clears_updating_state() {
     );
 
     assert!(!runtime.state().mcp_updating.contains("docs"));
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(runtime.state().phase, AppPhase::Error);
 }
 
 #[test]
@@ -241,7 +243,7 @@ fn failed_setting_dispatch_does_not_project_pending_value() {
         runtime.state().pending_composer_settings.permission_mode,
         None
     );
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(runtime.state().phase, AppPhase::Error);
 }
 
 #[test]
@@ -300,7 +302,9 @@ fn idle_prompt_dispatch_shows_message_without_queue_marker() {
 #[test]
 fn matching_user_message_event_does_not_duplicate_local_echo() {
     let mut runtime = runtime();
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
     runtime.state_mut().set_input("same");
     let command = runtime
         .handle_input_action(crate::tui::InputAction::Submit)

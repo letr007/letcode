@@ -83,9 +83,21 @@ pub enum SessionEvent {
     RetryScheduled(RetryLifecycleEvent),
     RetryStarted(RetryLifecycleEvent),
     Interrupted,
+    /// Authoritative turn boundary. Every turn ends with exactly one of these.
+    TurnFinished {
+        outcome: TurnOutcome,
+    },
     Error(ErrorEvent),
     Done,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Completed,
+    Failed,
+    Interrupted,
+    Aborted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -82,7 +82,7 @@ tools = true
         control.send(SessionEngineControl::Command(SessionEngineCommand::Prompt(crate::user_content::UserMessageSubmission::new("initial", crate::user_content::UserMessageContent::from("initial"))))).unwrap();
         loop {
             match event_rx.recv().await.unwrap() {
-                SessionTransportEvent::Done => break,
+                SessionTransportEvent::TurnFinished { .. } => break,
                 SessionTransportEvent::Error(error) => panic!("{}", error.message),
                 _ => {}
             }
@@ -91,7 +91,7 @@ tools = true
         runtime.enqueue_member_message(&sessions, &records, &root, "idle member message").unwrap();
         loop {
             match event_rx.recv().await.unwrap() {
-                SessionTransportEvent::Done => break,
+                SessionTransportEvent::TurnFinished { .. } => break,
                 SessionTransportEvent::Error(error) => panic!("{}", error.message),
                 _ => {}
             }
@@ -141,7 +141,7 @@ tools = true
             let records = read_records(transcript.lock().unwrap().path()).unwrap();
             runtime.enqueue_member_message(&sessions, &records, &root, message).unwrap();
             loop { match event_rx.recv().await.unwrap() {
-                SessionTransportEvent::Done => break,
+                SessionTransportEvent::TurnFinished { .. } => break,
                 SessionTransportEvent::Error(error) => panic!("{}", error.message), _ => {}
             } }
             let records = read_records(transcript.lock().unwrap().path()).unwrap();

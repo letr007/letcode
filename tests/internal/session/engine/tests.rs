@@ -282,7 +282,7 @@ async fn command_ingress_preserves_fifo_order() {
 }
 
 #[test]
-fn missing_api_key_error_emits_error_then_exactly_one_done() {
+fn missing_api_key_error_emits_error_then_one_turn_finished() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     send_missing_api_key_error(
         &tx,
@@ -296,7 +296,12 @@ fn missing_api_key_error_emits_error_then_exactly_one_done() {
         Ok(SessionTransportEvent::Error(error))
             if error.message == "API key is not set for the selected provider. Set EXPERT_API_KEY."
     ));
-    assert!(matches!(rx.try_recv(), Ok(SessionTransportEvent::Done)));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(SessionTransportEvent::TurnFinished {
+            outcome: TurnOutcome::Aborted,
+        })
+    ));
     assert!(rx.try_recv().is_err());
 }
 
@@ -542,16 +547,6 @@ mod integration_tests {
         assert!(
             rx.try_recv().is_err(),
             "the still-running child stays untouched"
-        );
-
-        send_subagent_interrupted(&tx);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(SessionTransportEvent::Interrupted)
-        ));
-        assert!(
-            rx.try_recv().is_err(),
-            "the parent interrupt carries no child-scope event"
         );
     }
 
@@ -968,7 +963,7 @@ base_url = "http://127.0.0.1:1"
                     SessionTransportEvent::CompactionFailed => {
                         panic!("interrupted manual compaction must report cancellation")
                     }
-                    SessionTransportEvent::Done => break,
+                    SessionTransportEvent::TurnFinished { .. } => break,
                     _ => {}
                 }
             }
@@ -2533,7 +2528,9 @@ max_output_tokens = 4096
                             panic!("execution must start before model output");
                         }
                         SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
-                        SessionTransportEvent::Done | SessionTransportEvent::Interrupted => {
+                        SessionTransportEvent::Done | SessionTransportEvent::TurnFinished {
+                outcome: TurnOutcome::Interrupted,
+            } => {
                             panic!("the continuation ended before execution started");
                         }
                         _ => {}
@@ -2557,7 +2554,9 @@ max_output_tokens = 4096
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     match events.recv().await.expect("engine event stream") {
-                        SessionTransportEvent::Interrupted => break,
+                        SessionTransportEvent::TurnFinished {
+                outcome: TurnOutcome::Interrupted,
+            } => break,
                         SessionTransportEvent::TurnStarted
                         | SessionTransportEvent::BackgroundSubagentCompleted { .. } => {
                             panic!("the result must start exactly one execution");
@@ -2567,7 +2566,7 @@ max_output_tokens = 4096
                             panic!("the stub holds the first model output until interruption");
                         }
                         SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
-                        SessionTransportEvent::Done => panic!("the held request completed before interruption"),
+                        SessionTransportEvent::TurnFinished { .. } => panic!("the held request completed before interruption"),
                         _ => {}
                     }
                 }
@@ -3018,7 +3017,7 @@ max_output_tokens = 4096
                         assert!(assistant_done.is_some());
                         second_user_message.get_or_insert(());
                     }
-                    SessionTransportEvent::Done => done = true,
+                    SessionTransportEvent::TurnFinished { .. } => done = true,
                     SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
                     _ => {}
                 }
@@ -3167,7 +3166,7 @@ max_output_tokens = 4096
                         assert!(assistant_done);
                         peer_user_message = true;
                     }
-                    SessionTransportEvent::Done => done = true,
+                    SessionTransportEvent::TurnFinished { .. } => done = true,
                     SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
                     _ => {}
                 }
@@ -3296,7 +3295,9 @@ max_output_tokens = 4096
                 loop {
                     match events.recv().await.unwrap() {
                         SessionTransportEvent::QueuedPromptAccepted { prompt } => accepted.push(prompt.id),
-                        SessionTransportEvent::Interrupted => {
+                        SessionTransportEvent::TurnFinished {
+                outcome: TurnOutcome::Interrupted,
+            } => {
                             assert!(cancel_active);
                             break;
                         }
@@ -3318,12 +3319,14 @@ max_output_tokens = 4096
                 ingress.cancel_prompt("target").unwrap();
                 loop {
                     match events.recv().await.unwrap() {
-                        SessionTransportEvent::Done => break,
+                        SessionTransportEvent::TurnFinished { .. } => break,
                         SessionTransportEvent::QueuedPromptAccepted { prompt } => {
                             assert!(cancel_active);
                             assert!(prompt.text().contains("peer input"));
                         }
-                        SessionTransportEvent::Interrupted | SessionTransportEvent::PromptCancelled { .. } => {
+                        SessionTransportEvent::TurnFinished {
+                outcome: TurnOutcome::Interrupted,
+            } | SessionTransportEvent::PromptCancelled { .. } => {
                             panic!("completed or unrelated submissions stay unchanged");
                         }
                         SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
@@ -3407,7 +3410,7 @@ max_output_tokens = 4096
             while done != 3 {
                 match events.recv().await.unwrap() {
                     SessionTransportEvent::QueuedPromptAccepted { prompt } => accepted.push(prompt.content.text),
-                    SessionTransportEvent::Done => done += 1,
+                    SessionTransportEvent::TurnFinished { .. } => done += 1,
                     SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
                     _ => {}
                 }

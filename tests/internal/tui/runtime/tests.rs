@@ -18,13 +18,14 @@ use crate::session::engine::{
     format_background_subagent_completion, initial_session_metadata,
     manual_compaction_session_token_usage, next_idle_session_operation, park_active_turn_command,
     record_interrupt_transcript, rehydrate_agent_from_transcript, run_manual_compaction,
-    select_active_session_operation, select_manual_compaction_operation, send_subagent_interrupted,
+    select_active_session_operation, select_manual_compaction_operation,
     wait_for_subagent_cancel_settle,
 };
 use crate::session::restore::restored_session_token_usage;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
 use crate::session::{
     PermissionResponse, RunnerPermissionRequest, SessionTransportEvent, TokenUsageEvent,
+    TurnOutcome,
 };
 use crate::transcript::sync_recorder_branch;
 use crate::transcript::{
@@ -1788,7 +1789,9 @@ fn running_turn_blocks_exit_and_quit_commands() {
 #[test]
 fn double_escape_confirms_running_turn_interrupt() {
     let mut runtime = runtime();
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
     runtime.state.phase = AppPhase::Running;
     assert!(!runtime.engine_turn_is_active());
 
@@ -1821,10 +1824,7 @@ fn double_escape_confirms_running_turn_interrupt() {
 
 #[test]
 fn background_children_do_not_hold_parent_turn_open() {
-    for terminal in [
-        SessionTransportEvent::Done,
-        SessionTransportEvent::Interrupted,
-    ] {
+    for outcome in [TurnOutcome::Completed, TurnOutcome::Interrupted] {
         let mut runtime = runtime();
         runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
         runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
@@ -1833,7 +1833,7 @@ fn background_children_do_not_hold_parent_turn_open() {
             parent_tool_call_id: None,
             event: SessionEvent::UserMessage(UserMessageEvent::new("background work")),
         });
-        runtime.apply_session_transport_event(terminal);
+        runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished { outcome });
 
         assert!(!runtime.engine_turn_is_active());
         assert!(runtime.state.has_running_child_session());
@@ -1855,6 +1855,29 @@ fn background_children_do_not_hold_parent_turn_open() {
         ));
         assert!(runtime.queued_prompts.is_empty());
     }
+}
+
+#[test]
+fn failed_turn_releases_history_navigation_after_turn_finished() {
+    let mut runtime = runtime();
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnStarted);
+    runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
+        "model Http failure during Transport (status 400), code http_status, retry hint Never",
+    )));
+    assert!(runtime.engine_turn_is_active());
+
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Failed,
+    });
+
+    assert!(!runtime.engine_turn_is_active());
+    assert_eq!(runtime.state().phase, AppPhase::Error);
+
+    runtime.state_mut().set_input("/tree");
+    assert!(matches!(
+        runtime.handle_input_action(InputAction::Submit).unwrap(),
+        Some(RuntimeCommand::ShowHistoryTree)
+    ));
 }
 
 fn timeline_has_streaming_reasoning(runtime: &TuiRuntime) -> bool {
@@ -1942,7 +1965,9 @@ fn real_interrupted_after_second_escape_is_idempotent() {
     let items_before = runtime.state().timeline.items().len();
     let text_before = timeline_assistant_text(&runtime);
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
 
     assert_eq!(runtime.state().phase, AppPhase::Completed);
     assert!(runtime.assistant_typewriters.is_empty());
@@ -2058,7 +2083,7 @@ fn interrupt_uses_runner_active_after_non_terminal_error() {
     runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
         "failed to view child transcript",
     )));
-    assert_eq!(runtime.state().phase, AppPhase::Error);
+    assert_eq!(runtime.state().phase, AppPhase::Running);
 
     let first = runtime
         .handle_input_action(InputAction::Interrupt)
@@ -2076,7 +2101,9 @@ fn interrupted_session_transport_event_returns_to_prompt_ready_state() {
     let mut runtime = runtime();
     runtime.state.phase = AppPhase::Running;
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
 
     assert_eq!(runtime.state().phase, AppPhase::Completed);
 
@@ -2091,7 +2118,9 @@ fn interrupted_clears_only_its_progress_toast() {
         .state_mut()
         .show_toast("Setting changed; preference not saved", ToastKind::Info);
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
 
     assert_eq!(
         runtime.state().toast().map(|toast| toast.message.as_str()),
@@ -2108,7 +2137,9 @@ async fn interrupted_cancels_parent_question_and_clears_local_state() {
         handle: RunnerQuestionRequest::new(tx),
     });
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
 
     assert!(runtime.state().pending_question.is_none());
     assert!(runtime.pending_question_handle.is_none());
@@ -2129,7 +2160,9 @@ fn interrupted_clears_question_when_receiver_was_dropped() {
         handle: RunnerQuestionRequest::new(tx),
     });
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
 
     assert!(runtime.state().pending_question.is_none());
     assert!(runtime.pending_question_handle.is_none());
@@ -2146,7 +2179,9 @@ async fn interrupted_cancels_child_question_and_clears_local_state() {
         handle: RunnerQuestionRequest::new(tx),
     });
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
 
     assert!(runtime.state().pending_question.is_none());
     assert!(runtime.pending_question_handle.is_none());
@@ -2190,7 +2225,7 @@ async fn child_terminal_event_cancels_matching_question_and_clears_local_state()
 }
 
 #[test]
-fn error_preserves_question_while_done_clears_parent_question() {
+fn error_preserves_question_while_turn_finished_clears_parent_question() {
     let mut runtime = runtime();
     let (tx, mut rx) = oneshot::channel();
     runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
@@ -2208,7 +2243,9 @@ fn error_preserves_question_while_done_clears_parent_question() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
 
-    runtime.apply_session_transport_event(SessionTransportEvent::Done);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Completed,
+    });
 
     assert!(runtime.state().pending_question.is_none());
     assert!(runtime.pending_question_handle.is_none());
@@ -4361,12 +4398,12 @@ fn deferred_transport_events_are_bounded_per_drain() {
     drop(tx);
     for _ in 0..(MAX_SESSION_EVENTS_PER_FRAME * 2) {
         runtime.try_drain_session_events();
-        if runtime.state().phase == AppPhase::Completed {
+        if runtime.state().phase == AppPhase::Error {
             break;
         }
     }
     assert!(runtime.deferred_session_events.is_empty());
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(runtime.state().phase, AppPhase::Error);
     assert_eq!(
         runtime
             .state()
@@ -5739,7 +5776,7 @@ fn closed_session_transport_event_stream_terminalizes_running_state() {
     runtime.try_drain_session_events();
 
     assert!(!runtime.session_turn_active);
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(runtime.state().phase, AppPhase::Error);
     assert!(runtime.state().timeline.items().iter().any(|item| matches!(
             item,
             TimelineItem::Error(error) if error.message == "TUI session event stream closed unexpectedly"
@@ -5770,7 +5807,7 @@ fn closed_session_transport_event_stream_reports_idle_engine_failure() {
     runtime.try_drain_session_events();
 
     assert!(!runtime.state().has_running_child_session());
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(runtime.state().phase, AppPhase::Error);
     assert_eq!(
         runtime
             .state()
@@ -5804,7 +5841,7 @@ fn closed_session_transport_event_stream_reports_pending_idle_resume() {
     runtime.try_drain_session_events();
 
     assert!(!runtime.session_resume_pending);
-    assert_eq!(runtime.state().phase, AppPhase::Completed);
+    assert_eq!(runtime.state().phase, AppPhase::Error);
     assert!(runtime.state().timeline.items().iter().any(|item| matches!(
             item,
             TimelineItem::Error(error) if error.message == "TUI session event stream closed unexpectedly"
@@ -8342,7 +8379,10 @@ mod integration_tests {
         runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
 
-        send_subagent_interrupted(&tx);
+        tx.send(SessionTransportEvent::TurnFinished {
+            outcome: TurnOutcome::Interrupted,
+        })
+        .expect("send turn boundary");
         runtime.try_drain_session_events();
 
         assert!(!runtime.session_turn_active);
@@ -8372,7 +8412,10 @@ mod integration_tests {
             1,
         );
 
-        send_subagent_interrupted(&tx);
+        tx.send(SessionTransportEvent::TurnFinished {
+            outcome: TurnOutcome::Interrupted,
+        })
+        .expect("send turn boundary");
         runtime.try_drain_session_events();
 
         assert!(!runtime.session_turn_active);
@@ -8410,7 +8453,10 @@ mod integration_tests {
             )),
         );
 
-        send_subagent_interrupted(&tx);
+        tx.send(SessionTransportEvent::TurnFinished {
+            outcome: TurnOutcome::Interrupted,
+        })
+        .expect("send turn boundary");
         tx.send(SessionTransportEvent::ChildSessionEvent {
             child_session_id: "child-session".into(),
             agent_name: Some("explorer".into()),
@@ -9228,7 +9274,9 @@ fn interrupted_turn_preserves_unconsumed_local_prompts() {
     else {
         panic!("expected immediate submit");
     };
-    runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
+    runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Interrupted,
+    });
     assert_eq!(runtime.queued_prompts.front(), Some(&prompt));
     assert!(
         runtime

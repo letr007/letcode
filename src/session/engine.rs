@@ -33,7 +33,7 @@ use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCata
 use crate::session::{
     AgentRunner, ErrorEvent, NoticeEvent, NoticeId, RuntimeContextDisposition,
     RuntimeContextUpdatedEvent, SessionCommand, SessionEvent, SessionTransportEvent,
-    TokenUsageEvent,
+    TokenUsageEvent, TurnOutcome,
 };
 use crate::subagent::{SubagentJob, SubagentPool, SubagentStatus};
 use crate::tool::ToolHandler;
@@ -436,7 +436,9 @@ fn send_missing_api_key_error(
 ) {
     let hint = route_api_key_hint(route_display_name, provider_api_key_hints, api_key_hint);
     let _ = session_transport_tx.send(SessionTransportEvent::Error(missing_api_key_error(&hint)));
-    let _ = session_transport_tx.send(SessionTransportEvent::Done);
+    let _ = session_transport_tx.send(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Aborted,
+    });
 }
 
 fn current_runtime_context(
@@ -597,12 +599,6 @@ fn emit_dropped_child_terminals(
             emit_child_terminal(session_transport_tx, &run.child_session_id);
         }
     }
-}
-
-pub(crate) fn send_subagent_interrupted(
-    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
-) {
-    let _ = session_transport_tx.send(SessionTransportEvent::Interrupted);
 }
 
 pub(crate) fn record_interrupt_transcript(
@@ -972,7 +968,9 @@ where
         }
     }
 
-    let _ = session_transport_tx.send(SessionTransportEvent::Done);
+    let _ = session_transport_tx.send(SessionTransportEvent::TurnFinished {
+        outcome: TurnOutcome::Completed,
+    });
     shutdown
 }
 
@@ -1978,7 +1976,11 @@ async fn run_engine_loop(
                                 )
                                 .with_message_id(NoticeId::WaitForSubagentBeforeCompaction),
                             ));
-                            let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                            let _ = session_transport_tx.send(
+                                SessionTransportEvent::TurnFinished {
+                                    outcome: TurnOutcome::Aborted,
+                                },
+                            );
                             continue;
                         }
 
@@ -2549,11 +2551,6 @@ async fn run_engine_loop(
                             }
                             ActiveSessionOperation::Completed(result) => {
                                 turn_failure = result.err().map(|error| error.to_string());
-                                forward_queued_runner_events(
-                                    &mut runner_event_rx,
-                                    &session_transport_tx,
-                                );
-                                let _ = session_transport_tx.send(SessionTransportEvent::Done);
                                 break;
                             }
                             ActiveSessionOperation::Command(command) => match command {
@@ -2692,8 +2689,28 @@ async fn run_engine_loop(
                     )
                 };
 
-                if let Some(error) = interrupt_failure {
-                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(error)));
+                // Single authoritative turn boundary: every exit publishes exactly one
+                // TurnFinished, and runner events still queued behind it are drained first.
+                if !boundary_preempted {
+                    if let Some(error) = &interrupt_failure {
+                        let _ = session_transport_tx
+                            .send(SessionTransportEvent::Error(ErrorEvent::new(error.clone())));
+                    }
+                    forward_queued_runner_events(&mut runner_event_rx, &session_transport_tx);
+                    let outcome = if interrupt_failure.is_some() || shutdown {
+                        TurnOutcome::Aborted
+                    } else if interrupted.is_some() {
+                        TurnOutcome::Interrupted
+                    } else if turn_failure.is_some() {
+                        TurnOutcome::Failed
+                    } else {
+                        TurnOutcome::Completed
+                    };
+                    let _ = session_transport_tx
+                        .send(SessionTransportEvent::TurnFinished { outcome });
+                }
+
+                if interrupt_failure.is_some() {
                     deferred_commands.clear();
                     parked_commands.clear();
                     boundary_prompts.clear();
@@ -2708,6 +2725,9 @@ async fn run_engine_loop(
                                 "failed to close the preempted turn before queued prompt: {error}"
                             )),
                         ));
+                        let _ = session_transport_tx.send(SessionTransportEvent::TurnFinished {
+                            outcome: TurnOutcome::Aborted,
+                        });
                         deferred_commands.clear();
                         parked_commands.clear();
                         boundary_prompts.clear();
@@ -2719,6 +2739,9 @@ async fn run_engine_loop(
                                 "failed to restore background completion before queued prompt: {error}"
                             )),
                         ));
+                        let _ = session_transport_tx.send(SessionTransportEvent::TurnFinished {
+                            outcome: TurnOutcome::Aborted,
+                        });
                         deferred_commands.clear();
                         parked_commands.clear();
                         boundary_prompts.clear();
@@ -2795,7 +2818,6 @@ async fn run_engine_loop(
                                 &interrupt.active_runs,
                                 &mut background_deliveries,
                             );
-                            send_subagent_interrupted(&session_transport_tx);
                         }
                     } else {
                         deferred_commands.clear();
@@ -2815,21 +2837,31 @@ async fn run_engine_loop(
                     drop(recorder);
                     subagent_runtime.fail_member_messages(&root, &root, failure, false);
                 }
-                if let Some(failure) = turn_failure
-                    && agent.has_incomplete_tool_call_groups()
-                {
-                    tracing::warn!(
-                        error = %failure,
-                        "failed turn left unfinished tool calls; closing the turn"
-                    );
-                    match close_failed_turn(&mut agent, &transcript, &subagent_runtime) {
-                        Ok(()) => {
-                            if let Err(error) =
-                                send_rehydrated_runtime_context(&session_transport_tx, &agent)
-                            {
+                if let Some(failure) = turn_failure {
+                    if agent.has_incomplete_tool_call_groups() {
+                        tracing::warn!(
+                            error = %failure,
+                            "failed turn left unfinished tool calls; closing the turn"
+                        );
+                        match close_failed_turn(&mut agent, &transcript, &subagent_runtime) {
+                            Ok(()) => {
+                                if let Err(error) =
+                                    send_rehydrated_runtime_context(&session_transport_tx, &agent)
+                                {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                        ErrorEvent::new(format!(
+                                            "failed to emit context after the failed turn: {error}"
+                                        )),
+                                    ));
+                                    deferred_commands.clear();
+                                    parked_commands.clear();
+                                    break;
+                                }
+                            }
+                            Err(error) => {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(
                                     ErrorEvent::new(format!(
-                                        "failed to emit context after the failed turn: {error}"
+                                        "failed to close the failed turn: {error}"
                                     )),
                                 ));
                                 deferred_commands.clear();
@@ -2837,16 +2869,15 @@ async fn run_engine_loop(
                                 break;
                             }
                         }
-                        Err(error) => {
-                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
-                                ErrorEvent::new(format!(
-                                    "failed to close the failed turn: {error}"
-                                )),
-                            ));
-                            deferred_commands.clear();
-                            parked_commands.clear();
-                            break;
-                        }
+                    } else if let Ok(interrupt) =
+                        derive_interrupt_request(&transcript, &subagent_runtime)
+                        && let Ok(mut recorder) = transcript.lock()
+                        && let Err(error) = recorder.record_turn_interrupted(interrupt.turn_id)
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to finalize the failed turn transcript"
+                        );
                     }
                 }
                 // A terminal turn is now durable. Record its journal frontier;
