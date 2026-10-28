@@ -11,7 +11,7 @@ Tools 模块将模型工具调用分发到本地处理器、子代理任务池�
 - 子代理委派：`agent__explore`、`agent__fixer`、`agent__oracle`、`agent__designer`、`agent__librarian`、`agent__general`；
 - 任务池控制：`agent__jobs`、`agent__status`、`agent__wait`、`agent__cancel`；
 - 文件与代码：`fs__list`、`fs__read`、`fs__write`、`fs__append`、`fs__mkdir`、`edit__apply_patch`、`code__ast_search`、`code__ast_replace_preview`；
-- 命令与版本库：`shell__exec`、`search__rg`、`git__status`、`git__diff`、`git__log`；
+- 命令与版本库：`shell__exec`、`search__rg`、`git`；
 - 网络通信：`web__fetch`；
 - 本机会话：`peer__discover`、`peer__send`。
 
@@ -37,7 +37,7 @@ Tools 模块将模型工具调用分发到本地处理器、子代理任务池�
 
 文件工具 `fs__*` 统一操作工作区内的文件与目录，强制执行路径规范化、文件大小限制、行数截断和作用域检查。`fs__write` 与 `fs__append` 在执行前先锁定目标路径；`edit__apply_patch` 预先解析补丁受影响的文件。获得用户授权后，执行引擎在真正修改前重新核验目标路径与文件特征，文件被外部篡改时立即终止。
 
-`code__ast_search` 和 `code__ast_replace_preview` 依赖语法树分析后端。预览工具仅返回代码差异（Diff），不落盘修改文件；实际变更必须通过显式调用补丁工具完成。`search__rg` 负责文本检索，支持上下文行、仅列出命中文件和按文件计数三种模式。匹配行受 `max_results` 限制，文件列表与计数返回完整结果，结果过大时折叠到本地文件并返回 `local_path`，可用 `fs__read` 分页读取，或用 `search__rg` 指向该路径继续筛选。`config__validate` 仅解析和检验指定的配置文件，不自动应用变更。
+`code__ast_search` 和 `code__ast_replace_preview` 依赖语法树分析后端。预览工具仅返回代码差异（Diff），不落盘修改文件；实际变更必须通过显式调用补丁工具完成。`git` 提供只读版本库查询，`action` 可选 `status`、`diff`、`log`、`show`、`blame` 和 `branch`，支持限定路径、查看暂存区（staged）和指定提交或分支（ref）；写操作仍需 `shell__exec`。`search__rg` 负责文本检索，支持上下文行、仅列出命中文件和按文件计数三种模式。匹配行受 `max_results` 限制，文件列表与计数返回完整结果，结果过大时折叠到本地文件并返回 `local_path`，可用 `fs__read` 分页读取，或用 `search__rg` 指向该路径继续筛选。`config__validate` 仅解析和检验指定的配置文件，不自动应用变更。
 
 ## 命令执行与超时控制
 

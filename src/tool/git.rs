@@ -1,108 +1,54 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::args::{optional_bool, optional_string, optional_usize};
+use super::args::{optional_bool, optional_string, optional_usize, required_string};
 use super::paths::safe_relative_path_arg;
 use super::{COMMAND_TIMEOUT_SECS, ToolHandler, ToolParallelism, ToolRegistry};
 
 pub(super) fn register(registry: &mut ToolRegistry) {
-    registry.register(GitStatusTool);
-    registry.register(GitDiffTool);
-    registry.register(GitLogTool);
+    registry.register(GitTool);
 }
 
-struct GitStatusTool;
+struct GitTool;
 
 #[async_trait]
-impl ToolHandler for GitStatusTool {
+impl ToolHandler for GitTool {
     fn name(&self) -> &'static str {
-        "git__status"
+        "git"
     }
 
     fn description(&self) -> &'static str {
-        "Show git working tree status for the current workspace."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        })
-    }
-
-    fn parallelism(&self) -> ToolParallelism {
-        ToolParallelism::Parallel
-    }
-
-    async fn execute(&self, _args: Value) -> Result<Value> {
-        git_status().await
-    }
-}
-
-struct GitDiffTool;
-
-#[async_trait]
-impl ToolHandler for GitDiffTool {
-    fn name(&self) -> &'static str {
-        "git__diff"
-    }
-
-    fn description(&self) -> &'static str {
-        "Show git diff for the current workspace. Supports unstaged or staged diff and optional path."
+        "Run a read-only git query in the current workspace: status, diff, log, show, blame, or branch."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "staged": {
-                    "type": "boolean",
-                    "description": "Show staged diff instead of unstaged diff. Defaults to false"
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "diff", "log", "show", "blame", "branch"],
+                    "description": "Query to run. status shows working tree state; diff shows changes; log lists commits; show renders one commit; blame annotates a file; branch lists local branches."
                 },
                 "path": {
                     "type": ["string", "null"],
-                    "description": "Optional workspace-relative path to limit the diff"
-                }
-            },
-            "required": ["staged", "path"],
-            "additionalProperties": false
-        })
-    }
-
-    fn parallelism(&self) -> ToolParallelism {
-        ToolParallelism::Parallel
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        git_diff(args).await
-    }
-}
-
-struct GitLogTool;
-
-#[async_trait]
-impl ToolHandler for GitLogTool {
-    fn name(&self) -> &'static str {
-        "git__log"
-    }
-
-    fn description(&self) -> &'static str {
-        "Show recent git commits for the current workspace."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
+                    "description": "Workspace-relative file or directory to scope the query. Required for blame."
+                },
+                "staged": {
+                    "type": ["boolean", "null"],
+                    "description": "For diff: show staged changes instead of unstaged. Defaults to false."
+                },
                 "max_count": {
-                    "type": "integer",
-                    "description": "Maximum number of commits. Defaults to 10, capped at 50"
+                    "type": ["integer", "null"],
+                    "description": "For log: maximum commits to show. Defaults to 10, capped at 50."
+                },
+                "ref": {
+                    "type": ["string", "null"],
+                    "description": "Commit, branch, or tag to inspect for diff, log, show, and blame. show defaults to HEAD."
                 }
             },
-            "required": ["max_count"],
+            "required": ["action", "path", "staged", "max_count", "ref"],
             "additionalProperties": false
         })
     }
@@ -112,45 +58,97 @@ impl ToolHandler for GitLogTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        git_log(args).await
+        let action = required_string(&args, "action")?;
+        let path = optional_string(&args, "path").filter(|path| !path.trim().is_empty());
+        let staged = optional_bool(&args, "staged").unwrap_or(false);
+        let max_count = optional_usize(&args, "max_count")
+            .unwrap_or(10)
+            .clamp(1, 50);
+        let reference = optional_string(&args, "ref").filter(|value| !value.trim().is_empty());
+
+        let mut git_args: Vec<String> = Vec::new();
+        match action {
+            "status" => {
+                git_args.extend(["status".into(), "--short".into(), "--branch".into()]);
+            }
+            "diff" => {
+                git_args.push("diff".into());
+                if staged {
+                    git_args.push("--cached".into());
+                }
+                push_ref(&mut git_args, reference)?;
+                push_path(&mut git_args, path)?;
+            }
+            "log" => {
+                git_args.push("log".into());
+                git_args.push(format!("--max-count={max_count}"));
+                git_args.push("--oneline".into());
+                git_args.push("--decorate".into());
+                push_ref(&mut git_args, reference)?;
+                push_path(&mut git_args, path)?;
+            }
+            "show" => {
+                git_args.push("show".into());
+                git_args.push("--no-color".into());
+                git_args.push(
+                    reference
+                        .map(safe_ref_arg)
+                        .transpose()?
+                        .unwrap_or_else(|| "HEAD".to_string()),
+                );
+                push_path(&mut git_args, path)?;
+            }
+            "blame" => {
+                let Some(path) = path else {
+                    bail!("blame requires a path");
+                };
+                git_args.push("blame".into());
+                git_args.push("--no-color".into());
+                push_ref(&mut git_args, reference)?;
+                push_path(&mut git_args, Some(path))?;
+            }
+            "branch" => {
+                git_args.extend(["branch".into(), "--list".into(), "--no-color".into()]);
+            }
+            other => bail!("unsupported git action: {other}"),
+        }
+
+        super::command::run_workspace_command("git", &git_args, COMMAND_TIMEOUT_SECS).await
     }
 }
 
-async fn git_status() -> Result<Value> {
-    let args = vec![
-        "status".to_string(),
-        "--short".to_string(),
-        "--branch".to_string(),
-    ];
-    super::command::run_workspace_command("git", &args, COMMAND_TIMEOUT_SECS).await
-}
-
-async fn git_diff(args: Value) -> Result<Value> {
-    let staged = optional_bool(&args, "staged").unwrap_or(false);
-    let mut command_args = vec!["diff".to_string()];
-
-    if staged {
-        command_args.push("--cached".to_string());
+fn push_ref(args: &mut Vec<String>, reference: Option<&str>) -> Result<()> {
+    if let Some(reference) = reference {
+        args.push(safe_ref_arg(reference)?);
     }
+    Ok(())
+}
 
-    if let Some(path) = optional_string(&args, "path").filter(|path| !path.trim().is_empty()) {
-        command_args.push("--".to_string());
-        command_args.push(safe_relative_path_arg(path)?);
+fn push_path(args: &mut Vec<String>, path: Option<&str>) -> Result<()> {
+    if let Some(path) = path {
+        args.push("--".to_string());
+        args.push(safe_relative_path_arg(path)?);
     }
-
-    super::command::run_workspace_command("git", &command_args, COMMAND_TIMEOUT_SECS).await
+    Ok(())
 }
 
-async fn git_log(args: Value) -> Result<Value> {
-    let max_count = optional_usize(&args, "max_count")
-        .unwrap_or(10)
-        .clamp(1, 50);
-    let command_args = vec![
-        "log".to_string(),
-        format!("--max-count={max_count}"),
-        "--oneline".to_string(),
-        "--decorate".to_string(),
-    ];
-
-    super::command::run_workspace_command("git", &command_args, COMMAND_TIMEOUT_SECS).await
+fn safe_ref_arg(reference: &str) -> Result<String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        bail!("ref cannot be empty");
+    }
+    if reference.starts_with('-') {
+        bail!("ref must not start with '-': {reference}");
+    }
+    if reference
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        bail!("ref must not contain whitespace or control characters: {reference}");
+    }
+    Ok(reference.to_string())
 }
+
+#[cfg(test)]
+#[path = "../../tests/internal/tool/git/tests.rs"]
+mod tests;

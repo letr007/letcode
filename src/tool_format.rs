@@ -17,18 +17,24 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
             .and_then(Value::as_str)
             .map(|url| format!("web__fetch {}", truncate_label(url, 120)))
             .unwrap_or_else(|| "web__fetch".to_string()),
-        "git__status" => "git status".to_string(),
-        "git__diff" => {
-            let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let staged_flag = if staged { " --cached" } else { "" };
-            format!("git diff{} {}", staged_flag, path)
-                .trim()
-                .to_string()
-        }
-        "git__log" => {
-            let max_count = args.get("max_count").and_then(Value::as_u64).unwrap_or(10);
-            format!("git log -{}", max_count)
+        "git" => {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status");
+            let mut label = format!("git {action}");
+            if let Some(path) = args
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            {
+                label.push(' ');
+                label.push_str(path);
+            }
+            if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
+                label.push_str(" --cached");
+            }
+            label
         }
         "skill" => args
             .get("name")

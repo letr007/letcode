@@ -4706,9 +4706,7 @@ impl ToolEffects {
                     | "search__rg"
                     | "web__fetch"
                     | "code__ast_search"
-                    | "git__status"
-                    | "git__diff"
-                    | "git__log"
+                    | "git"
                     | "code__ast_replace_preview" => ToolEffectKind::Read,
                     "agent__fixer" | "agent__general" | "fs__write" | "fs__append"
                     | "fs__mkdir" | "edit__apply_patch" => ToolEffectKind::Write,

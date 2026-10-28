@@ -168,9 +168,7 @@ fn tool_kind(name: &str) -> ToolKind {
         | tool_names::TOOL_SKILL_RESOURCE_LIST
         | tool_names::TOOL_SKILL_RESOURCE_READ
         | tool_names::TOOL_MEMORY_RECALL
-        | tool_names::TOOL_GIT_STATUS
-        | tool_names::TOOL_GIT_DIFF
-        | tool_names::TOOL_GIT_LOG
+        | tool_names::TOOL_GIT
         | tool_names::TOOL_AGENT_STATUS
         | tool_names::TOOL_AGENT_WAIT => ToolKind::Read,
         tool_names::TOOL_FS_WRITE

@@ -118,9 +118,7 @@ fn is_read_only_explorer_tool(tool: &str) -> bool {
             | tool_names::TOOL_FS_READ
             | tool_names::TOOL_SEARCH_RG
             | tool_names::TOOL_WEB_FETCH
-            | tool_names::TOOL_GIT_STATUS
-            | tool_names::TOOL_GIT_DIFF
-            | tool_names::TOOL_GIT_LOG
+            | tool_names::TOOL_GIT
             | tool_names::TOOL_CODE_AST_SEARCH
     )
 }
@@ -466,9 +464,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_PEER_DISCOVER
         | tool_names::TOOL_SEARCH_RG
         | tool_names::TOOL_WEB_FETCH
-        | tool_names::TOOL_GIT_STATUS
-        | tool_names::TOOL_GIT_DIFF
-        | tool_names::TOOL_GIT_LOG
+        | tool_names::TOOL_GIT
         | tool_names::TOOL_CODE_AST_SEARCH => ToolPermissionClass::Read,
         tool_names::TOOL_CODE_AST_REPLACE_PREVIEW
         | tool_names::TOOL_WORKFLOW_TODOS

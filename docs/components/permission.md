@@ -24,7 +24,7 @@ mode = "default" # safe | default | auto | yolo
 
 | 安全类别 | 代表工具 | 默认模式策略 |
 | --- | --- | --- |
-| `Read`（安全读取） | `fs__list`、`fs__read`、`search__rg`、`git__status`、`git__diff` 和 `git__log` | 放行 |
+| `Read`（安全读取） | `fs__list`、`fs__read`、`search__rg` 和 `git` | 放行 |
 | `Preview`（只读预览） | `code__ast_replace_preview` | 放行 |
 | `Write`（写入修改） | `fs__write`、`fs__append`、`fs__mkdir` 和 `edit__apply_patch` | 审批 |
 | `Command`（命令执行） | `shell__exec` | 审批 |

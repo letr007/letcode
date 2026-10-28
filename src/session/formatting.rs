@@ -19,10 +19,7 @@ pub(super) fn output_summary(output: &ToolResult) -> Option<String> {
         tool_names::TOOL_FS_MKDIR => summarize_path_action(data, "created"),
         tool_names::TOOL_SEARCH_RG => summarize_search(data),
         tool_names::TOOL_WEB_FETCH => summarize_web_fetch(data),
-        tool_names::TOOL_SHELL_EXEC
-        | tool_names::TOOL_GIT_STATUS
-        | tool_names::TOOL_GIT_DIFF
-        | tool_names::TOOL_GIT_LOG => summarize_command(data),
+        tool_names::TOOL_SHELL_EXEC | tool_names::TOOL_GIT => summarize_command(data),
         tool_names::TOOL_EDIT_APPLY_PATCH => summarize_apply_patch(data),
         tool_names::TOOL_CODE_AST_SEARCH => summarize_array_count(data, "matches", "matches"),
         tool_names::TOOL_CODE_AST_REPLACE_PREVIEW => {

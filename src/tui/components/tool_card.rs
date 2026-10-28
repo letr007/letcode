@@ -741,9 +741,7 @@ fn tool_trace_label(tool: &ToolView) -> String {
             "Fetch {}",
             value_str(args, "url").unwrap_or_else(|| fallback_tail(&tool.summary))
         ),
-        "git__status" => "Git status".into(),
-        "git__diff" => "Git diff".into(),
-        "git__log" => "Git log".into(),
+        "git" => format!("Git {}", value_str(args, "action").unwrap_or("status")),
         "skill" => format!(
             "Skill {:?}",
             truncate_display_width(value_str(args, "name").unwrap_or("skill"), 60)
@@ -777,9 +775,7 @@ fn tool_trace_label(tool: &ToolView) -> String {
 fn pending_tool_trace_label(name: &str) -> String {
     match name {
         crate::tool_names::TOOL_QUESTION => "Ask a question".into(),
-        "git__status" => "Git status".into(),
-        "git__diff" => "Git diff".into(),
-        "git__log" => "Git log".into(),
+        "git" => "Git".into(),
         "skill" => "Skill".into(),
         "edit__apply_patch" => "Apply patch".into(),
         "workflow__todos" => "Update todos".into(),
