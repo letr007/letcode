@@ -29,7 +29,7 @@ impl ToolHandler for RgTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search text in the current workspace using ripgrep. Returns matching lines with optional context, matching file paths, or per-file match counts."
+        "Search text in the current workspace using ripgrep. Returns matching lines with optional context, matching file paths, or per-file match counts. Large results fold to a temp file and include local_path: read it with fs__read (offset/limit) or search it again with search__rg."
     }
 
     fn parameters(&self) -> Value {
