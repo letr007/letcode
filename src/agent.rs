@@ -108,16 +108,7 @@ pub(crate) enum ToolExecutionRejection {
     PermissionDeniedByUser,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolEffectKind {
-    Read,
-    Write,
-    Command,
-    Validation,
-    WorkflowControl,
-    Diagnostic,
-    Unknown,
-}
+pub(crate) use crate::tool::ToolEffectKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolEffects {
@@ -4510,18 +4501,13 @@ fn subagent_tool_permission_class(
     if is_subagent_control_tool_name(tool_name) {
         return Some(crate::permission::ToolPermissionClass::Preview);
     }
-    let entry = subagent_catalog_entry_by_tool_name(tool_name)?;
-    Some(if entry.read_only {
-        crate::permission::ToolPermissionClass::Preview
-    } else {
-        crate::permission::ToolPermissionClass::Write
-    })
+    subagent_catalog_entry_by_tool_name(tool_name)?;
+    crate::tool::tool_class(tool_name).map(|class| class.permission)
 }
 
 fn is_read_only_subagent_tool_name(name: &str) -> bool {
-    subagent_catalog_entry_by_tool_name(name)
-        .map(|entry| entry.read_only)
-        .unwrap_or(false)
+    subagent_catalog_entry_by_tool_name(name).is_some()
+        && crate::tool::tool_class(name).is_some_and(|class| class.effect == ToolEffectKind::Read)
 }
 
 pub(crate) fn is_subagent_control_tool_name(name: &str) -> bool {
@@ -4693,37 +4679,18 @@ impl ToolEffects {
 
         let kind = if !output.ok {
             ToolEffectKind::Diagnostic
-        } else {
-            if is_read_only_subagent_tool_name(tool_name)
-                || is_subagent_control_tool_name(tool_name)
-            {
-                ToolEffectKind::Read
+        } else if tool_name == tool_names::TOOL_SHELL_EXEC
+            && command.as_deref().is_some_and(is_validation_command_text)
+        {
+            if shell_command_succeeded(output) {
+                ToolEffectKind::Validation
             } else {
-                match tool_name {
-                    "fs__read"
-                    | "fs__list"
-                    | "skill"
-                    | "search__rg"
-                    | "web__fetch"
-                    | "code__ast_search"
-                    | "git"
-                    | "code__ast_replace_preview" => ToolEffectKind::Read,
-                    "agent__fixer" | "agent__general" | "fs__write" | "fs__append"
-                    | "fs__mkdir" | "edit__apply_patch" => ToolEffectKind::Write,
-                    "shell__exec" if command.as_deref().is_some_and(is_validation_command_text) => {
-                        if shell_command_succeeded(output) {
-                            ToolEffectKind::Validation
-                        } else {
-                            ToolEffectKind::Diagnostic
-                        }
-                    }
-                    "shell__exec" => ToolEffectKind::Command,
-                    "workflow__todos" | "workflow__auto_continue" => {
-                        ToolEffectKind::WorkflowControl
-                    }
-                    _ => ToolEffectKind::Unknown,
-                }
+                ToolEffectKind::Diagnostic
             }
+        } else {
+            crate::tool::tool_class(tool_name)
+                .map(|class| class.effect)
+                .unwrap_or(ToolEffectKind::Unknown)
         };
 
         Self {

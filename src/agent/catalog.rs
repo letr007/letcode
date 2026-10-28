@@ -24,7 +24,6 @@ pub(crate) struct SubagentCatalogEntry {
     pub tool_name: &'static str,
     pub task_description: &'static str,
     pub tool_description: &'static str,
-    pub read_only: bool,
 }
 
 pub(crate) const SUBAGENT_CATALOG: &[SubagentCatalogEntry] = &[
@@ -33,42 +32,36 @@ pub(crate) const SUBAGENT_CATALOG: &[SubagentCatalogEntry] = &[
         tool_name: tool_names::TOOL_AGENT_EXPLORE,
         task_description: "交给 explorer 子代理执行的聚焦只读调研任务",
         tool_description: "将限定范围的只读仓库调研任务委派给 explorer 子代理，并返回摘要。",
-        read_only: true,
     },
     SubagentCatalogEntry {
         agent_name: "fixer",
         tool_name: tool_names::TOOL_AGENT_FIXER,
         task_description: "交给 fixer 子代理执行的聚焦实现或修复任务",
         tool_description: "将限定范围的实现或修复任务委派给 fixer 子代理，并返回摘要。",
-        read_only: false,
     },
     SubagentCatalogEntry {
         agent_name: "oracle",
         tool_name: tool_names::TOOL_AGENT_ORACLE,
         task_description: "交给 oracle 子代理执行的根因分析、风险判断或验证建议任务",
         tool_description: "将限定范围的根因分析、风险判断或验证建议任务委派给 oracle 子代理，并返回摘要。",
-        read_only: true,
     },
     SubagentCatalogEntry {
         agent_name: "designer",
         tool_name: tool_names::TOOL_AGENT_DESIGNER,
         task_description: "交给 designer 子代理执行的设计、方案整理或接口梳理任务",
         tool_description: "将限定范围的设计、方案整理或接口梳理任务委派给 designer 子代理，并返回摘要。",
-        read_only: true,
     },
     SubagentCatalogEntry {
         agent_name: "librarian",
         tool_name: tool_names::TOOL_AGENT_LIBRARIAN,
         task_description: "交给 librarian 子代理执行的资料整理、证据检索或上下文归档任务",
         tool_description: "将限定范围的仓库资料整理、证据检索或上下文归档任务委派给 librarian 子代理，并返回摘要。",
-        read_only: true,
     },
     SubagentCatalogEntry {
         agent_name: "general",
         tool_name: tool_names::TOOL_AGENT_GENERAL,
         task_description: "交给 general 子代理执行的限定范围通用任务，可读取和修改文件",
         tool_description: "将限定范围的通用任务委派给可读可写的 general 子代理，并返回摘要。",
-        read_only: false,
     },
 ];
 

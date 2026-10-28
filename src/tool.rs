@@ -48,6 +48,7 @@ pub(crate) mod peer;
 mod question;
 mod registry;
 mod search;
+mod spec;
 mod web_fetch;
 mod workflow;
 
@@ -57,6 +58,7 @@ pub(crate) use delegation::{
     SubagentPathScope, delegation_scope_denial, is_delegation_path_scoped_tool,
     normalize_subagent_input, subagent_parameters_schema,
 };
+pub(crate) use spec::{ToolEffectKind, tool_class};
 
 pub(crate) fn workspace_root_for_subagent_lock() -> Result<PathBuf> {
     workspace_root()
@@ -515,6 +517,13 @@ impl ToolRegistry {
         git::register(&mut registry);
         apply_patch::register(&mut registry);
         code_analysis::register(&mut registry);
+        debug_assert!(
+            registry
+                .specs()
+                .iter()
+                .all(|spec| tool_class(&spec.name).is_some()),
+            "a built-in tool is missing a ToolClass entry"
+        );
         registry
     }
 }

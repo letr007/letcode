@@ -16,9 +16,9 @@ struct HistoryTool {
 impl ToolHandler for HistoryTool {
     fn name(&self) -> &'static str {
         if self.expand {
-            "context__expand"
+            crate::tool_names::TOOL_CONTEXT_EXPAND
         } else {
-            "context__search"
+            crate::tool_names::TOOL_CONTEXT_SEARCH
         }
     }
     fn description(&self) -> &'static str {

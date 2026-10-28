@@ -7,7 +7,6 @@ fn writable_templates_match_catalog_contracts() {
         let writable = matches!(entry.agent_name, "fixer" | "general");
         let contract = template.capability_contract();
         assert_eq!(template.can_write, writable);
-        assert_eq!(entry.read_only, !writable);
         assert_eq!(contract.can_write, writable);
         assert!(!contract.can_delegate);
         assert_eq!(contract.permission_mode, PermissionMode::Default);
@@ -25,6 +24,14 @@ fn writable_templates_match_catalog_contracts() {
                 crate::permission::ToolPermissionClass::Write
             } else {
                 crate::permission::ToolPermissionClass::Preview
+            }
+        );
+        assert_eq!(
+            crate::tool::tool_class(entry.tool_name).unwrap().effect,
+            if writable {
+                crate::tool::ToolEffectKind::Write
+            } else {
+                crate::tool::ToolEffectKind::Read
             }
         );
     }

@@ -107,20 +107,7 @@ impl ToolScope {
 }
 
 fn is_read_only_explorer_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        tool_names::TOOL_UTIL_ECHO
-            | tool_names::TOOL_QUESTION
-            | tool_names::TOOL_SKILL
-            | tool_names::TOOL_SKILL_RESOURCE_LIST
-            | tool_names::TOOL_SKILL_RESOURCE_READ
-            | tool_names::TOOL_FS_LIST
-            | tool_names::TOOL_FS_READ
-            | tool_names::TOOL_SEARCH_RG
-            | tool_names::TOOL_WEB_FETCH
-            | tool_names::TOOL_GIT
-            | tool_names::TOOL_CODE_AST_SEARCH
-    )
+    crate::tool::tool_class(tool).is_some_and(|class| class.explorer_allowed)
 }
 
 impl std::fmt::Display for ToolScope {
@@ -451,43 +438,9 @@ pub fn is_internal_tool(tool: &str) -> bool {
 }
 
 pub fn classify_tool(tool: &str) -> ToolPermissionClass {
-    match tool {
-        tool_names::TOOL_UTIL_ECHO
-        | tool_names::TOOL_QUESTION
-        | tool_names::TOOL_SKILL
-        | tool_names::TOOL_SKILL_RESOURCE_LIST
-        | tool_names::TOOL_SKILL_RESOURCE_READ
-        | tool_names::TOOL_FS_LIST
-        | tool_names::TOOL_FS_READ
-        | tool_names::TOOL_MEMORY_RECALL
-        | tool_names::TOOL_CONFIG_VALIDATE
-        | tool_names::TOOL_PEER_DISCOVER
-        | tool_names::TOOL_SEARCH_RG
-        | tool_names::TOOL_WEB_FETCH
-        | tool_names::TOOL_GIT
-        | tool_names::TOOL_CODE_AST_SEARCH => ToolPermissionClass::Read,
-        tool_names::TOOL_CODE_AST_REPLACE_PREVIEW
-        | tool_names::TOOL_WORKFLOW_TODOS
-        | tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
-        | tool_names::TOOL_AGENT_EXPLORE
-        | tool_names::TOOL_AGENT_ORACLE
-        | tool_names::TOOL_AGENT_DESIGNER
-        | tool_names::TOOL_AGENT_LIBRARIAN
-        | tool_names::TOOL_AGENT_JOBS
-        | tool_names::TOOL_AGENT_STATUS
-        | tool_names::TOOL_AGENT_WAIT
-        | tool_names::TOOL_AGENT_CANCEL
-        | tool_names::TOOL_AGENT_SEND
-        | tool_names::TOOL_PEER_SEND => ToolPermissionClass::Preview,
-        tool_names::TOOL_AGENT_FIXER
-        | tool_names::TOOL_AGENT_GENERAL
-        | tool_names::TOOL_FS_WRITE
-        | tool_names::TOOL_FS_APPEND
-        | tool_names::TOOL_FS_MKDIR
-        | tool_names::TOOL_EDIT_APPLY_PATCH => ToolPermissionClass::Write,
-        tool_names::TOOL_SHELL_EXEC => ToolPermissionClass::Command,
-        _ => ToolPermissionClass::Unknown,
-    }
+    crate::tool::tool_class(tool)
+        .map(|class| class.permission)
+        .unwrap_or(ToolPermissionClass::Unknown)
 }
 
 #[cfg(test)]
