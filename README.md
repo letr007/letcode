@@ -111,7 +111,7 @@ Building from source requires the Rust toolchain. Some built-in tools also invok
 
 | Program | Used by | Requirement |
 | --- | --- | --- |
-| [`git`](https://git-scm.com/) | `git__status`, `git__diff`, `git__log`, and TUI branch indicator | Recommended; only Git tools and branch indicators are affected when missing |
+| [`git`](https://git-scm.com/) | `git` tool and TUI branch indicator | Recommended; only the Git tool and branch indicator are affected when missing |
 | [`rg`](https://github.com/BurntSushi/ripgrep) | `search__rg` fast text search | Recommended; search tools are unavailable when missing |
 | [`ast-grep`](https://ast-grep.github.io/) | `code__ast_search` and `code__ast_replace_preview` AST analysis | Optional; only AST tools are unavailable when missing |
 

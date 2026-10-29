@@ -111,7 +111,7 @@ TUI 界面支持 English（`en`）与简体中文（`zh-CN`）。进入界面后
 
 | 程序 | 使用位置 | 是否必需 |
 | --- | --- | --- |
-| [`git`](https://git-scm.com/) | `git__status`、`git__diff`、`git__log` 与分支状态显示 | 推荐安装。缺少时仅 Git 工具与分支状态受限 |
+| [`git`](https://git-scm.com/) | `git` 工具与分支状态显示 | 推荐安装。缺少时仅 Git 工具与分支状态受限 |
 | [`rg`](https://github.com/BurntSushi/ripgrep) | `search__rg` 快速文本搜索 | 推荐安装。缺少时文本搜索工具不可用 |
 | [`ast-grep`](https://ast-grep.github.io/) | `code__ast_search` 与 `code__ast_replace_preview` 语法树分析 | 可选。缺少时仅语法树分析工具不可用 |
 
