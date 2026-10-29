@@ -25,7 +25,11 @@ fn path_rejects_traversal_and_absolute_paths() {
 
     let mut args = Vec::new();
     push_path(&mut args, Some("src/main.rs")).unwrap();
-    assert_eq!(args, ["--", "src/main.rs"]);
+    let normalized = std::path::Path::new("src")
+        .join("main.rs")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(args, ["--".to_string(), normalized]);
 }
 
 #[tokio::test]
