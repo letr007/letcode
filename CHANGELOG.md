@@ -5,6 +5,24 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [0.27.0] - 2026-10-30
+
+### Added
+
+- `search__rg` 新增 `context` 与 `mode` 参数，可选上下文行与 matches/files/count 三种结果形式。
+- `git` 工具新增 `show`、`blame`、`branch` 以及按 ref 查询。
+
+### Changed
+
+- 只读 Git 工具合并为单个 `git` 工具，用 `action` 参数区分查询类型。
+- `context__search` 与 `context__expand` 归为只读工具，不再请求审批。
+- footer 的上下文占用与输出速率改为带图标显示。
+
+### Fixed
+
+- 修复 MCP 连接在协议协商前发送版本头导致的握手失败。
+- 修复错误提前到达时回合状态不一致的问题。
+
 ## [0.26.3] - 2026-10-24
 
 ### Fixed
