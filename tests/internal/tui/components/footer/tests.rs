@@ -141,7 +141,7 @@ fn footer_appends_output_token_rate_after_context_status() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert!(rendered.contains("~70% · ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"), "{rendered}");
+    assert!(rendered.contains("~70% · 󰓅 ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"), "{rendered}");
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn footer_shows_output_token_rate_before_provider_usage_arrives() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert!(rendered.contains(" · ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"), "{rendered}");
+    assert!(rendered.contains(" · 󰓅 ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ 60t/s"), "{rendered}");
 }
 
 #[test]

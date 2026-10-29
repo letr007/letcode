@@ -86,6 +86,7 @@ fn footer_hint_spans(state: &TuiState, theme: Theme, max_width: usize) -> Vec<Sp
             if !spans.is_empty() {
                 spans.push(Span::styled(" · ", footer_dim_style(theme)));
             }
+            spans.push(Span::styled("󰓅 ", footer_dim_style(theme)));
             spans.extend(output_rate_graph_spans(graph, theme));
             spans.push(Span::styled(" ", footer_dim_style(theme)));
             let rate = graph.latest_sample().flatten().unwrap_or(0);
@@ -287,7 +288,8 @@ fn token_budget_spans_with_cache_usage(
         ],
     );
 
-    let mut spans = Vec::with_capacity(8);
+    let mut spans = Vec::with_capacity(10);
+    spans.push(Span::styled("󱘲 ", footer_dim_style(theme)));
     spans.extend(token_budget_bar_spans(
         BAR_WIDTH,
         [
