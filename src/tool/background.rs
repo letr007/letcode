@@ -217,6 +217,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+fn live_count(registry: &Registry, session_id: Option<&str>) -> usize {
+    registry
+        .tasks
+        .values()
+        .filter(|task| !task.state.is_terminal() && task.session_id.as_deref() == session_id)
+        .count()
+}
+
 pub(super) fn allocate_id() -> String {
     let mut registry = lock(registry());
     registry.next_id += 1;
@@ -236,12 +244,7 @@ pub(super) fn register(
 ) -> bool {
     let notifier = {
         let mut registry = lock(registry());
-        let live = registry
-            .tasks
-            .values()
-            .filter(|task| !task.state.is_terminal() && task.session_id.as_deref() == session_id)
-            .count();
-        if live >= MAX_BACKGROUND_TASKS {
+        if live_count(&registry, session_id) >= MAX_BACKGROUND_TASKS {
             return false;
         }
         let Some(cancel) = cancel.take() else {
@@ -305,13 +308,7 @@ pub(crate) fn complete(
 }
 
 pub(super) fn has_capacity(session_id: Option<&str>) -> bool {
-    let registry = lock(registry());
-    registry
-        .tasks
-        .values()
-        .filter(|task| !task.state.is_terminal() && task.session_id.as_deref() == session_id)
-        .count()
-        < MAX_BACKGROUND_TASKS
+    live_count(&lock(registry()), session_id) < MAX_BACKGROUND_TASKS
 }
 
 fn mark_observed(task_id: &str) {
@@ -440,16 +437,4 @@ pub(crate) fn end_session(session_id: &str) {
             }
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn live_tasks(session_id: &str) -> Vec<(String, TaskState)> {
-    let registry = lock(registry());
-    registry
-        .tasks
-        .iter()
-        .filter(|(_, task)| task.session_id.as_deref() == Some(session_id))
-        .filter(|(_, task)| !task.state.is_terminal())
-        .map(|(id, task)| (id.clone(), task.state.clone()))
-        .collect()
 }
