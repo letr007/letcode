@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 
 use crate::process_tree::ManagedChild;
 
-use super::args::{optional_bool, required_string};
+use super::args::{optional_bool, optional_usize, required_string};
 use super::background::{self, OutputSink, TERMINAL_PREVIEW_BYTES};
 use super::delegation::optional_u64;
 use super::fold_artifact::{
@@ -247,8 +247,7 @@ struct ProcessExit {
     killed: Option<String>,
 }
 
-/// Keeps a foreground command tied to this call. Aborting the call drops the
-/// guard and aborts the driver, which terminates the process group.
+// Dropping the guard aborts the driver, which terminates the process group.
 struct ForegroundGuard {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -296,6 +295,9 @@ async fn run_shell(
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let started = Instant::now();
 
+    let mut cancel_tx = Some(cancel_tx);
+    let promoted = background && promote(&task_id, session_id, command, &sink, &mut cancel_tx);
+
     let mut run = ForegroundGuard {
         handle: Some(tokio::spawn(drive_process(
             task_id.clone(),
@@ -310,11 +312,10 @@ async fn run_shell(
         ))),
     };
 
-    let mut cancel_tx = Some(cancel_tx);
     let mut stdout_acc = StreamAccumulator::new();
     let mut stderr_acc = StreamAccumulator::new();
 
-    if background && promote(&task_id, session_id, command, &sink, &mut cancel_tx) {
+    if promoted {
         run.disarm();
         return Ok(background_result(&task_id, command, shell, &sink));
     }
@@ -458,7 +459,7 @@ fn promote(
     sink: &Arc<Mutex<OutputSink>>,
     cancel_tx: &mut Option<oneshot::Sender<()>>,
 ) -> bool {
-    if cancel_tx.is_none() {
+    if cancel_tx.is_none() || !background::has_capacity(session_id) {
         return false;
     }
     let log = {
@@ -598,7 +599,7 @@ impl ToolHandler for ShellOutputTool {
 
     async fn execute(&self, args: Value) -> Result<Value> {
         let task_id = required_string(&args, "task_id")?;
-        let offset = optional_u64(&args, "offset")?.unwrap_or(0);
+        let offset = optional_usize(&args, "offset").unwrap_or(0) as u64;
         let chunk = background::read_output(task_id, offset, MAX_OUTPUT_CHUNK_BYTES)?;
         let (exit_code, reason) = match &chunk.state {
             background::TaskState::Exited { code } => (*code, None),

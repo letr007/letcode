@@ -1737,6 +1737,9 @@ async fn run_engine_loop(
                     if outcome.session_id.as_deref() != Some(current_session_id.as_str()) {
                         continue;
                     }
+                    if crate::tool::background::take_observed(&outcome.task_id) {
+                        continue;
+                    }
                     if background_deliveries
                         .entry(outcome.task_id.clone())
                         .or_default()

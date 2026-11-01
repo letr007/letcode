@@ -102,7 +102,6 @@ impl OutputSink {
         }
     }
 
-    /// Move buffered output into the log file ahead of any future write.
     pub(super) fn persist(&mut self) -> Result<()> {
         if self.file.is_some() {
             return Ok(());
@@ -131,7 +130,6 @@ impl OutputSink {
         Ok(())
     }
 
-    /// Tail of the retained window, used for the terminal event preview.
     pub(super) fn tail(&mut self, max_bytes: usize) -> String {
         if self.file.is_some() {
             let path = lock(&self.state).path.clone();
@@ -200,6 +198,7 @@ struct TaskRecord {
     state: TaskState,
     log: Option<Arc<Mutex<LogState>>>,
     cancel: Option<oneshot::Sender<()>>,
+    observed: bool,
 }
 
 #[derive(Default)]
@@ -228,9 +227,6 @@ pub(crate) fn set_notifier(notifier: Notifier) {
     lock(registry()).notifier = Some(notifier);
 }
 
-/// Promote a running command to background. Returns false when the session
-/// already holds `MAX_BACKGROUND_TASKS` live tasks; the caller then keeps the
-/// command in the foreground path.
 pub(super) fn register(
     task_id: &str,
     session_id: Option<&str>,
@@ -259,6 +255,7 @@ pub(super) fn register(
                 state: TaskState::Running,
                 log: Some(log),
                 cancel: Some(cancel),
+                observed: false,
             },
         );
         registry.notifier.clone()
@@ -273,8 +270,6 @@ pub(super) fn register(
     true
 }
 
-/// Record a terminal state. Returns the outcome only for registered tasks;
-/// foreground commands that never became background report nothing.
 pub(crate) fn complete(
     task_id: &str,
     state: TaskState,
@@ -309,6 +304,30 @@ pub(crate) fn complete(
     Some(outcome)
 }
 
+pub(super) fn has_capacity(session_id: Option<&str>) -> bool {
+    let registry = lock(registry());
+    registry
+        .tasks
+        .values()
+        .filter(|task| !task.state.is_terminal() && task.session_id.as_deref() == session_id)
+        .count()
+        < MAX_BACKGROUND_TASKS
+}
+
+fn mark_observed(task_id: &str) {
+    if let Some(task) = lock(registry()).tasks.get_mut(task_id) {
+        task.observed = true;
+    }
+}
+
+pub(crate) fn take_observed(task_id: &str) -> bool {
+    let mut registry = lock(registry());
+    let Some(task) = registry.tasks.get_mut(task_id) else {
+        return false;
+    };
+    std::mem::replace(&mut task.observed, false)
+}
+
 pub(super) fn cancel(task_id: &str) -> bool {
     let mut registry = lock(registry());
     let Some(task) = registry.tasks.get_mut(task_id) else {
@@ -341,6 +360,9 @@ pub(super) fn read_output(task_id: &str, offset: u64, max_bytes: usize) -> Resul
         };
         (task.state.clone(), task.log.clone())
     };
+    if state.is_terminal() {
+        mark_observed(task_id);
+    }
     let Some(log) = log else {
         return Ok(OutputChunk {
             state,
@@ -391,7 +413,6 @@ pub(super) fn read_output(task_id: &str, offset: u64, max_bytes: usize) -> Resul
     })
 }
 
-/// Terminate every live task for a session and drop its records and logs.
 pub(crate) fn end_session(session_id: &str) {
     let mut removed = Vec::new();
     {
@@ -421,7 +442,6 @@ pub(crate) fn end_session(session_id: &str) {
     }
 }
 
-/// Test-only view of live task ids for a session.
 #[cfg(test)]
 pub(crate) fn live_tasks(session_id: &str) -> Vec<(String, TaskState)> {
     let registry = lock(registry());

@@ -227,6 +227,14 @@ pub(crate) fn handle_active_turn_command(
         return;
     }
 
+    if matches!(
+        command,
+        SessionEngineCommand::BackgroundShellCompleted { .. }
+    ) {
+        enqueue_deferred_command(parked_commands, command);
+        return;
+    }
+
     // Reading a transcript does not touch the agent, but history navigation
     // rewrites it, so it waits for the turn in every phase that parks commands.
     match &command {
