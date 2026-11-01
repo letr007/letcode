@@ -175,25 +175,22 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
 
     if !state.background_shells.is_empty() {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            state.t("sidebar.tasks"),
-            Style::default()
-                .fg(theme.approval)
-                .bg(theme.element_bg)
-                .add_modifier(Modifier::BOLD),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                state.t("sidebar.tasks"),
+                Style::default()
+                    .fg(theme.approval)
+                    .bg(theme.element_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", state.background_shells.len()), label_style),
+        ]));
         let content_width = inner.width.saturating_sub(2) as usize;
-        for task in state.background_shells.iter().take(5) {
+        for task in state.background_shells.iter() {
             let elapsed = format_elapsed(task.started.elapsed());
             lines.push(Line::from(Span::styled(
                 truncate_middle(&format!("● {elapsed}  {}", task.command), content_width),
                 value_style,
-            )));
-        }
-        if state.background_shells.len() > 5 {
-            lines.push(Line::from(Span::styled(
-                format!("+{}", state.background_shells.len() - 5),
-                label_style,
             )));
         }
     }
