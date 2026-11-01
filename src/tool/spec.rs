@@ -102,7 +102,7 @@ pub(crate) fn tool_class(name: &str) -> Option<ToolClass> {
             explorer_allowed: false,
             effect: Effect::Write,
         },
-        tool_names::TOOL_SHELL_EXEC | tool_names::TOOL_SHELL_CANCEL => ToolClass {
+        tool_names::TOOL_SHELL_EXEC => ToolClass {
             permission: Permission::Command,
             explorer_allowed: false,
             effect: Effect::Command,
@@ -111,6 +111,11 @@ pub(crate) fn tool_class(name: &str) -> Option<ToolClass> {
             permission: Permission::Read,
             explorer_allowed: false,
             effect: Effect::Read,
+        },
+        tool_names::TOOL_SHELL_CANCEL => ToolClass {
+            permission: Permission::Read,
+            explorer_allowed: false,
+            effect: Effect::Command,
         },
         _ => return None,
     };
