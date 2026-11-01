@@ -1513,6 +1513,28 @@ impl TuiRuntime {
                 self.state
                     .update_background_subagent_result(parent_tool_call_id.as_deref(), result);
             }
+            SessionTransportEvent::BackgroundShellStarted {
+                task_id,
+                session_id,
+                command,
+            } => {
+                if session_id.is_none() || session_id.as_deref() == self.state.session_id.as_deref()
+                {
+                    self.state
+                        .add_background_shell(task_id.clone(), command.clone());
+                }
+                suppress_session_event = true;
+            }
+            SessionTransportEvent::BackgroundShellCompleted {
+                task_id,
+                session_id,
+            } => {
+                if session_id.is_none() || session_id.as_deref() == self.state.session_id.as_deref()
+                {
+                    self.state.remove_background_shell(task_id);
+                }
+                suppress_session_event = true;
+            }
             SessionTransportEvent::SettingChangeFailed { command } => {
                 self.clear_failed_pending_setting(command);
                 suppress_session_event = true;
@@ -1626,6 +1648,7 @@ impl TuiRuntime {
                 runtime_context,
                 expert_models,
             } => {
+                self.state.background_shells.clear();
                 let _message_count = messages.len();
                 if let Err(error) = self
                     .state
@@ -1802,6 +1825,7 @@ impl TuiRuntime {
                 runtime_context,
                 expert_models,
             } => {
+                self.state.background_shells.clear();
                 self.output_rate_samples.clear();
                 self.state.clear_all_output_token_rates();
                 if let Err(error) = self

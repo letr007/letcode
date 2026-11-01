@@ -242,15 +242,33 @@ impl SessionEngine {
             api_key_configured,
         };
         let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         crate::tool::background::set_notifier(Arc::new({
             let control_tx = control_tx.clone();
-            move |outcome| {
-                let _ = control_tx.send(SessionEngineControl::Command(
-                    SessionEngineCommand::BackgroundShellCompleted { outcome },
-                ));
+            let event_tx = event_tx.clone();
+            move |event| match event {
+                crate::tool::background::BackgroundEvent::Started {
+                    task_id,
+                    session_id,
+                    command,
+                } => {
+                    let _ = event_tx.send(SessionTransportEvent::BackgroundShellStarted {
+                        task_id,
+                        session_id,
+                        command,
+                    });
+                }
+                crate::tool::background::BackgroundEvent::Completed(outcome) => {
+                    let _ = event_tx.send(SessionTransportEvent::BackgroundShellCompleted {
+                        task_id: outcome.task_id.clone(),
+                        session_id: outcome.session_id.clone(),
+                    });
+                    let _ = control_tx.send(SessionEngineControl::Command(
+                        SessionEngineCommand::BackgroundShellCompleted { outcome },
+                    ));
+                }
             }
         }));
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let title_event_tx = event_tx.clone();
         let ingress = SessionEngineIngress {
             control_tx: control_tx.clone(),

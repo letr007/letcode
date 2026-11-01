@@ -173,6 +173,31 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         }
     }
 
+    if !state.background_shells.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            state.t("sidebar.tasks"),
+            Style::default()
+                .fg(theme.approval)
+                .bg(theme.element_bg)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let content_width = inner.width.saturating_sub(2) as usize;
+        for task in state.background_shells.iter().take(5) {
+            let elapsed = format_elapsed(task.started.elapsed());
+            lines.push(Line::from(Span::styled(
+                truncate_middle(&format!("● {elapsed}  {}", task.command), content_width),
+                value_style,
+            )));
+        }
+        if state.background_shells.len() > 5 {
+            lines.push(Line::from(Span::styled(
+                format!("+{}", state.background_shells.len() - 5),
+                label_style,
+            )));
+        }
+    }
+
     let footer_height = u16::from(inner.height > 1);
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -938,6 +963,17 @@ fn compact_count(value: u64) -> String {
         format!("{:.1}k", value as f64 / 1_000.0)
     } else {
         value.to_string()
+    }
+}
+
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3_600)
     }
 }
 

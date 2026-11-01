@@ -144,6 +144,7 @@ mcp_loading = "发现中"
 mcp_unavailable = "不可用"
 mcp_server_online = "{count} 个工具"
 todos = "待办"
+tasks = "任务"
 toggle_hint = "Ctrl-X B  切换"
 
 [dashboard]

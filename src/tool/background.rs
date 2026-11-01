@@ -49,7 +49,16 @@ pub(crate) struct TaskOutcome {
     pub preview: String,
 }
 
-pub(crate) type Notifier = Arc<dyn Fn(TaskOutcome) + Send + Sync>;
+pub(crate) enum BackgroundEvent {
+    Started {
+        task_id: String,
+        session_id: Option<String>,
+        command: String,
+    },
+    Completed(TaskOutcome),
+}
+
+pub(crate) type Notifier = Arc<dyn Fn(BackgroundEvent) + Send + Sync>;
 
 #[derive(Debug, Default)]
 pub(super) struct LogState {
@@ -229,28 +238,38 @@ pub(super) fn register(
     log: Arc<Mutex<LogState>>,
     cancel: &mut Option<oneshot::Sender<()>>,
 ) -> bool {
-    let mut registry = lock(registry());
-    let live = registry
-        .tasks
-        .values()
-        .filter(|task| !task.state.is_terminal() && task.session_id.as_deref() == session_id)
-        .count();
-    if live >= MAX_BACKGROUND_TASKS {
-        return false;
-    }
-    let Some(cancel) = cancel.take() else {
-        return false;
+    let notifier = {
+        let mut registry = lock(registry());
+        let live = registry
+            .tasks
+            .values()
+            .filter(|task| !task.state.is_terminal() && task.session_id.as_deref() == session_id)
+            .count();
+        if live >= MAX_BACKGROUND_TASKS {
+            return false;
+        }
+        let Some(cancel) = cancel.take() else {
+            return false;
+        };
+        registry.tasks.insert(
+            task_id.to_string(),
+            TaskRecord {
+                session_id: session_id.map(str::to_string),
+                command: command.to_string(),
+                state: TaskState::Running,
+                log: Some(log),
+                cancel: Some(cancel),
+            },
+        );
+        registry.notifier.clone()
     };
-    registry.tasks.insert(
-        task_id.to_string(),
-        TaskRecord {
+    if let Some(notifier) = notifier {
+        notifier(BackgroundEvent::Started {
+            task_id: task_id.to_string(),
             session_id: session_id.map(str::to_string),
             command: command.to_string(),
-            state: TaskState::Running,
-            log: Some(log),
-            cancel: Some(cancel),
-        },
-    );
+        });
+    }
     true
 }
 
@@ -285,7 +304,7 @@ pub(crate) fn complete(
         (registry.notifier.clone(), outcome)
     };
     if let Some(notifier) = notifier {
-        notifier(outcome.clone());
+        notifier(BackgroundEvent::Completed(outcome.clone()));
     }
     Some(outcome)
 }

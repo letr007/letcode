@@ -145,6 +145,7 @@ mcp_loading = "Discovering"
 mcp_unavailable = "Unavailable"
 mcp_server_online = "{count} tools"
 todos = "Todos"
+tasks = "Tasks"
 toggle_hint = "Ctrl-X B  toggle"
 
 [dashboard]

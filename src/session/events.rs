@@ -194,6 +194,15 @@ pub(crate) enum SessionTransportEvent {
         parent_tool_call_id: Option<String>,
         result: crate::subagent::SubagentRunSummary,
     },
+    BackgroundShellStarted {
+        task_id: String,
+        session_id: Option<String>,
+        command: String,
+    },
+    BackgroundShellCompleted {
+        task_id: String,
+        session_id: Option<String>,
+    },
     ModelCatalogUpdated(ModelCatalogUpdatedEvent),
     SettingChangeFailed {
         command: crate::session::SessionCommand,
@@ -360,6 +369,8 @@ impl SessionTransportEvent {
             | Self::ReasoningEffortChanged { .. }
             | Self::FakeClientChanged { .. }
             | Self::BackgroundSubagentCompleted { .. }
+            | Self::BackgroundShellStarted { .. }
+            | Self::BackgroundShellCompleted { .. }
             | Self::ModelCatalogUpdated(_)
             | Self::SettingChangeFailed { .. }
             | Self::QueuedPromptAccepted { .. }
@@ -565,6 +576,8 @@ pub(super) fn wrap_child_session_transport_event(
         | SessionTransportEvent::PermissionModeChanged { .. }
         | SessionTransportEvent::ReasoningEffortChanged { .. }
         | SessionTransportEvent::BackgroundSubagentCompleted { .. }
+        | SessionTransportEvent::BackgroundShellStarted { .. }
+        | SessionTransportEvent::BackgroundShellCompleted { .. }
         | SessionTransportEvent::SettingChangeFailed { .. } => event,
         SessionTransportEvent::PermissionResolved(event) => {
             SessionTransportEvent::ChildSessionEvent {

@@ -1284,6 +1284,13 @@ impl DialogState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundShellTask {
+    pub task_id: String,
+    pub command: String,
+    pub started: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
     pub input_buffer: String,
     pub input_cursor: usize,
@@ -1329,6 +1336,7 @@ pub struct TuiState {
     pub permission_mode_label: String,
     pub pending_composer_settings: PendingComposerSettings,
     pub session_id: Option<String>,
+    pub background_shells: Vec<BackgroundShellTask>,
     pub historian_status: Option<(String, bool, bool)>,
     pub historian_report_options: super::components::historian_report::ReportOptions,
     pub git_branch: Option<String>,
@@ -1400,6 +1408,7 @@ impl Default for TuiState {
             input_buffer: String::new(),
             input_cursor: 0,
             composer_tokens: Vec::new(),
+            background_shells: Vec::new(),
             timeline: Timeline::default(),
             context: ContextPaneState::default(),
             child_timeline: None,
@@ -3676,6 +3685,26 @@ impl TuiState {
             self.pending_permission = None;
         }
         self.phase = AppPhase::Running;
+    }
+
+    pub fn add_background_shell(&mut self, task_id: String, command: String) {
+        if self
+            .background_shells
+            .iter()
+            .any(|task| task.task_id == task_id)
+        {
+            return;
+        }
+        self.background_shells.push(BackgroundShellTask {
+            task_id,
+            command,
+            started: std::time::Instant::now(),
+        });
+    }
+
+    pub fn remove_background_shell(&mut self, task_id: &str) {
+        self.background_shells
+            .retain(|task| task.task_id != task_id);
     }
 
     pub fn update_background_subagent_result(
