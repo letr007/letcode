@@ -314,6 +314,7 @@ struct SubagentToolBinding {
     agent_name: String,
     task: String,
     background: bool,
+    finished: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1140,6 +1141,7 @@ impl Timeline {
                 agent_name,
                 task,
                 background,
+                finished: false,
             });
         }
         if let Some(index) = self.find_tool_index(&event.call_id) {
@@ -1247,6 +1249,7 @@ impl Timeline {
                         agent_name: result.agent_name.clone(),
                         task,
                         background: false,
+                        finished: false,
                     },
                 );
             }
@@ -1315,6 +1318,7 @@ impl Timeline {
                     agent_name,
                     task,
                     background,
+                    finished: false,
                 },
             );
         }
@@ -2002,6 +2006,7 @@ impl Timeline {
                     agent_name: result.agent_name.clone(),
                     task: tool.summary.clone(),
                     background: true,
+                    finished: false,
                 },
             );
             self.subagent_run_by_child
@@ -2055,6 +2060,9 @@ impl Timeline {
             "waiting": false,
         }))
         .ok();
+        if let Some(binding) = self.subagent_tools_by_run.get_mut(&result.run_id) {
+            binding.finished = true;
+        }
         self.bump_revision(index);
         true
     }
@@ -2072,16 +2080,13 @@ impl Timeline {
         let mut active = self
             .subagent_tools_by_run
             .values()
+            .filter(|binding| !binding.finished)
             .filter_map(|binding| {
                 let index = self.find_tool_index(&binding.call_id)?;
                 let TimelineItem::Tool(tool) = self.items.get(index)? else {
                     return None;
                 };
-                matches!(
-                    tool.status,
-                    ToolExecutionStatus::Running | ToolExecutionStatus::Pending
-                )
-                .then(|| {
+                (tool.status != ToolExecutionStatus::Cancelled).then(|| {
                     (
                         index,
                         ActiveSubagent {
