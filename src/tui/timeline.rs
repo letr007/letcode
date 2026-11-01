@@ -317,6 +317,12 @@ struct SubagentToolBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSubagent {
+    pub agent_name: String,
+    pub task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SettledSubagentWait {
     call_id: String,
     child_session_id: String,
@@ -2060,6 +2066,34 @@ impl Timeline {
             }
             _ => false,
         })
+    }
+
+    pub fn active_subagents(&self) -> Vec<ActiveSubagent> {
+        let mut active = self
+            .subagent_tools_by_run
+            .values()
+            .filter_map(|binding| {
+                let index = self.find_tool_index(&binding.call_id)?;
+                let TimelineItem::Tool(tool) = self.items.get(index)? else {
+                    return None;
+                };
+                matches!(
+                    tool.status,
+                    ToolExecutionStatus::Running | ToolExecutionStatus::Pending
+                )
+                .then(|| {
+                    (
+                        index,
+                        ActiveSubagent {
+                            agent_name: binding.agent_name.clone(),
+                            task: binding.task.clone(),
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        active.sort_by_key(|(index, _)| *index);
+        active.into_iter().map(|(_, subagent)| subagent).collect()
     }
 
     fn find_tool_index(&self, call_id: &str) -> Option<usize> {

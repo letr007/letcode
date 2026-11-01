@@ -173,7 +173,9 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         }
     }
 
-    if !state.background_shells.is_empty() {
+    let active_subagents = state.timeline.active_subagents();
+    let task_count = active_subagents.len() + state.background_shells.len();
+    if task_count > 0 {
         lines.push(Line::default());
         lines.push(Line::from(vec![
             Span::styled(
@@ -183,9 +185,18 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
                     .bg(theme.element_bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  {}", state.background_shells.len()), label_style),
+            Span::styled(format!("  {task_count}"), label_style),
         ]));
         let content_width = inner.width.saturating_sub(2) as usize;
+        for subagent in active_subagents.iter() {
+            lines.push(Line::from(Span::styled(
+                truncate_middle(
+                    &format!("◇ {}  {}", subagent.agent_name, subagent.task),
+                    content_width,
+                ),
+                value_style,
+            )));
+        }
         for task in state.background_shells.iter() {
             let elapsed = format_elapsed(task.started.elapsed());
             lines.push(Line::from(Span::styled(
