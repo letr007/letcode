@@ -33,6 +33,7 @@ pub enum ToolParallelism {
 
 mod apply_patch;
 mod args;
+pub(crate) mod background;
 mod code_analysis;
 mod command;
 mod config_validate;
@@ -336,6 +337,7 @@ pub struct ToolExecutionContext {
     pub(crate) history_cursor: Option<crate::context_history::HistoryCursor>,
     pub allow_outside_workspace: bool,
     pub(crate) allow_tool_result_images: bool,
+    pub session_id: Option<String>,
     pub question_handler: Option<QuestionCallback>,
     prepared_writable_leaf: Option<PreparedWritableLeaf>,
     prepared_apply_patch: Option<PreparedApplyPatch>,
@@ -374,6 +376,7 @@ impl ToolExecutionContext {
             allow_outside_workspace: true,
             allow_tool_result_images: false,
             history_cursor: None,
+            session_id: None,
             question_handler: None,
             prepared_writable_leaf: None,
             prepared_apply_patch: None,

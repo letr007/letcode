@@ -86,10 +86,10 @@ fn executable_not_found_only_accepts_direct_spawn_error() {
 
 #[test]
 fn command_timeout_uses_default_and_accepts_explicit_value() {
-    assert_eq!(super::command_timeout_secs(&json!({})).unwrap(), 300);
+    assert_eq!(super::command_timeout_secs(&json!({})).unwrap(), 120);
     assert_eq!(
         super::command_timeout_secs(&json!({"timeout_secs": null})).unwrap(),
-        300
+        120
     );
     assert_eq!(
         super::command_timeout_secs(&json!({"timeout_secs": 900})).unwrap(),
@@ -118,13 +118,13 @@ mod integration_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn streaming_shell_command_honors_explicit_timeout() {
+    async fn streaming_shell_command_moves_to_background_on_timeout() {
         use crate::tool::ToolHandler;
 
         let mut emit = |_stream, _chunk| Ok(());
         let result = RunCommandTool
             .execute_streaming(
-                json!({"command": "sleep 2", "timeout_secs": 1}),
+                json!({"command": "sleep 30", "timeout_secs": 1}),
                 ToolExecutionContext::default(),
                 &mut emit,
             )
@@ -132,14 +132,18 @@ mod integration_tests {
             .expect("shell tool result");
 
         assert!(result.ok);
+        let data = result.data.expect("shell data");
         assert_eq!(
-            result
-                .data
-                .as_ref()
-                .and_then(|data| data.get("error"))
-                .and_then(serde_json::Value::as_str),
-            Some("command timed out after 1s")
+            data.get("state").and_then(serde_json::Value::as_str),
+            Some("background")
         );
+        let task_id = data
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task id")
+            .to_string();
+        assert!(task_id.starts_with("bg-"));
+        crate::tool::background::cancel(&task_id);
     }
 
     #[cfg(unix)]
@@ -152,7 +156,7 @@ mod integration_tests {
         let script = delayed_side_effect_command(&ready, &release, &marker);
         let task = tokio::spawn(async move {
             let mut emit = |_stream, _chunk| Ok(());
-            run_workspace_shell_command_streaming(&script, 30, &mut emit).await
+            run_shell(&script, 30, false, None, &mut emit).await
         });
         wait_for_file(&ready).await;
         task.abort();

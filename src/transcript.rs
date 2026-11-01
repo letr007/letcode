@@ -54,6 +54,7 @@ pub enum InternalContinuationSource {
     StreamRecovery,
     LogicalCheckpoint,
     SubagentCompletion,
+    ShellCompletion,
     /// Workflow state restated to the model after a compaction retired the
     /// conversation that introduced it.
     CompactionReminder,

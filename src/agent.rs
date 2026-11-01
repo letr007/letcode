@@ -3078,6 +3078,7 @@ impl Agent {
             .resolved_model_route
             .as_deref()
             .is_some_and(|route| route.capabilities.tool_result_images);
+        context.session_id = self.runtime_snapshot.session_id.clone();
         context.history_cursor = self.runtime_snapshot.session_id.as_ref().map(|session_id| {
             crate::context_history::HistoryCursor {
                 session_id: session_id.clone(),

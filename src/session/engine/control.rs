@@ -18,6 +18,9 @@ pub(crate) enum SessionEngineCommand {
         parent_tool_call_id: Option<String>,
         result: Result<crate::subagent::SubagentRunSummary, String>,
     },
+    BackgroundShellCompleted {
+        outcome: crate::tool::background::TaskOutcome,
+    },
     SwarmMessageReady {
         root_session_id: String,
         generation: u64,
@@ -135,6 +138,7 @@ pub(crate) fn session_engine_command_as_session_command(
             anchor_child_session_id: anchor_child_session_id.clone(),
         }),
         SessionEngineCommand::BackgroundSubagentCompleted { .. }
+        | SessionEngineCommand::BackgroundShellCompleted { .. }
         | SessionEngineCommand::ContinueSession => None,
         SessionEngineCommand::Compact => Some(crate::session::SessionCommand::Compact),
         SessionEngineCommand::SetModel(model) => {
@@ -319,6 +323,7 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         | SessionEngineCommand::CancelPrompt(_)
         | SessionEngineCommand::PeerMessage(_)
         | SessionEngineCommand::BackgroundSubagentCompleted { .. }
+        | SessionEngineCommand::BackgroundShellCompleted { .. }
         | SessionEngineCommand::SwarmMessageReady { .. }
         | SessionEngineCommand::ContinueSession
         | SessionEngineCommand::Compact

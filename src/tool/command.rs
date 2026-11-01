@@ -5,30 +5,36 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
 use crate::process_tree::ManagedChild;
 
-use super::args::required_string;
+use super::args::{optional_bool, required_string};
+use super::background::{self, OutputSink, TERMINAL_PREVIEW_BYTES};
 use super::delegation::optional_u64;
 use super::fold_artifact::{
     COMMAND_ARTIFACT_DIR, FOLD_PREVIEW_CHARS, FOLD_THRESHOLD_BYTES, fold_preview, write_artifact,
 };
 use super::{
-    COMMAND_TIMEOUT_SECS, ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream,
-    ToolRegistry, workspace_root,
+    ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream, ToolRegistry,
+    ToolResult, workspace_root,
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_COMMAND_TIMEOUT_SECS: u64 = 3_600;
+const SHELL_TIMEOUT_SECS: u64 = 120;
+const MAX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
 pub(super) fn register(registry: &mut ToolRegistry) {
     registry.register(RunCommandTool);
+    registry.register(ShellOutputTool);
+    registry.register(ShellCancelTool);
 }
 
 struct RunCommandTool;
@@ -55,10 +61,14 @@ impl ToolHandler for RunCommandTool {
                     "type": ["integer", "null"],
                     "minimum": 1,
                     "maximum": MAX_COMMAND_TIMEOUT_SECS,
-                    "description": "Command timeout in seconds. Defaults to 300, maximum 3600"
+                    "description": "How long to wait in the foreground, in seconds. Defaults to 120, maximum 3600. When the command is still running at the deadline it moves to the background and this call returns immediately with a task_id; the command keeps running."
+                },
+                "background": {
+                    "type": ["boolean", "null"],
+                    "description": "Skip foreground waiting and move the command to the background immediately. Use for builds, installs, and other long jobs you do not need to block on."
                 }
             },
-            "required": ["command", "timeout_secs"],
+            "required": ["command", "timeout_secs", "background"],
             "additionalProperties": false
         })
     }
@@ -70,19 +80,25 @@ impl ToolHandler for RunCommandTool {
     async fn execute_streaming(
         &self,
         args: Value,
-        _context: ToolExecutionContext,
+        context: ToolExecutionContext,
         emit: ToolOutputEmitter<'_>,
     ) -> Result<super::ToolResult> {
         let command = required_string(&args, "command")?;
         let timeout_secs = command_timeout_secs(&args)?;
-        run_workspace_shell_command_streaming(command, timeout_secs, emit)
-            .await
-            .map(|data| super::ToolResult::ok(self.name(), data))
+        let background = optional_bool(&args, "background").unwrap_or(false);
+        run_shell(
+            command,
+            timeout_secs,
+            background,
+            context.session_id.as_deref(),
+            emit,
+        )
+        .await
     }
 }
 
 fn command_timeout_secs(args: &Value) -> Result<u64> {
-    let timeout_secs = optional_u64(args, "timeout_secs")?.unwrap_or(COMMAND_TIMEOUT_SECS);
+    let timeout_secs = optional_u64(args, "timeout_secs")?.unwrap_or(SHELL_TIMEOUT_SECS);
     if timeout_secs > MAX_COMMAND_TIMEOUT_SECS {
         return Err(anyhow!(
             "field 'timeout_secs' must be at most {MAX_COMMAND_TIMEOUT_SECS}"
@@ -226,11 +242,42 @@ async fn run_workspace_shell_command(command: &str, timeout_secs: u64) -> Result
     Ok(data)
 }
 
-async fn run_workspace_shell_command_streaming(
+struct ProcessExit {
+    status: Option<std::process::ExitStatus>,
+    killed: Option<String>,
+}
+
+/// Keeps a foreground command tied to this call. Aborting the call drops the
+/// guard and aborts the driver, which terminates the process group.
+struct ForegroundGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ForegroundGuard {
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for ForegroundGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn lock_sink(sink: &Arc<Mutex<OutputSink>>) -> MutexGuard<'_, OutputSink> {
+    sink.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+async fn run_shell(
     command: &str,
     timeout_secs: u64,
+    background: bool,
+    session_id: Option<&str>,
     emit: ToolOutputEmitter<'_>,
-) -> Result<Value> {
+) -> Result<ToolResult> {
     let root = workspace_root()?;
     let (shell, mut child) = spawn_workspace_shell(command, &root)
         .with_context(|| format!("failed to spawn shell command: {command}"))?;
@@ -242,59 +289,261 @@ async fn run_workspace_shell_command_streaming(
         .take_stderr()
         .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    tokio::spawn(read_command_stream(
-        ToolOutputStream::Stdout,
-        stdout,
-        tx.clone(),
-    ));
-    tokio::spawn(read_command_stream(ToolOutputStream::Stderr, stderr, tx));
+    let task_id = background::allocate_id();
+    let sink = Arc::new(Mutex::new(OutputSink::new(task_id.clone())));
+    let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+    let (done_tx, mut done_rx) = oneshot::channel();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let started = Instant::now();
 
-    let mut stdout = StreamAccumulator::new();
-    let mut stderr = StreamAccumulator::new();
-    let timeout_sleep = sleep(Duration::from_secs(timeout_secs));
-    tokio::pin!(timeout_sleep);
-    let mut timed_out = false;
-    let mut status = None;
+    let mut run = ForegroundGuard {
+        handle: Some(tokio::spawn(drive_process(
+            task_id.clone(),
+            child,
+            stdout,
+            stderr,
+            Arc::clone(&sink),
+            delta_tx,
+            done_tx,
+            cancel_rx,
+            started,
+        ))),
+    };
+
+    let mut cancel_tx = Some(cancel_tx);
+    let mut stdout_acc = StreamAccumulator::new();
+    let mut stderr_acc = StreamAccumulator::new();
+
+    if background && promote(&task_id, session_id, command, &sink, &mut cancel_tx) {
+        run.disarm();
+        return Ok(background_result(&task_id, command, shell, &sink));
+    }
+
+    let deadline = sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(deadline);
 
     loop {
         tokio::select! {
-            Some((stream, chunk)) = rx.recv() => {
-                match stream { ToolOutputStream::Stdout => stdout.push(&chunk), ToolOutputStream::Stderr => stderr.push(&chunk) }
+            Some((stream, chunk)) = delta_rx.recv() => {
+                match stream {
+                    ToolOutputStream::Stdout => stdout_acc.push(&chunk),
+                    ToolOutputStream::Stderr => stderr_acc.push(&chunk),
+                }
                 emit(stream, chunk)?;
             }
-            result = child.wait() => { status = Some(result?); break; }
-            _ = &mut timeout_sleep => { timed_out = true; break; }
+            result = &mut done_rx => {
+                let exit = result.ok();
+                drain_delta(&mut delta_rx, &mut stdout_acc, &mut stderr_acc);
+                return Ok(exited_result(command, shell, exit, &stdout_acc, &stderr_acc));
+            }
+            _ = &mut deadline => {
+                if promote(&task_id, session_id, command, &sink, &mut cancel_tx) {
+                    run.disarm();
+                    return Ok(background_result(&task_id, command, shell, &sink));
+                }
+                if let Some(tx) = cancel_tx.take() {
+                    let _ = tx.send(());
+                }
+                return Ok(killed_result(
+                    command,
+                    shell,
+                    "background_capacity_exceeded",
+                    &stdout_acc,
+                    &stderr_acc,
+                ));
+            }
         }
     }
-    let status = if timed_out {
-        child.terminate_and_wait().await?
+}
+
+async fn drive_process(
+    task_id: String,
+    mut child: ManagedChild,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    sink: Arc<Mutex<OutputSink>>,
+    delta_tx: mpsc::UnboundedSender<(ToolOutputStream, String)>,
+    done_tx: oneshot::Sender<ProcessExit>,
+    cancel_rx: oneshot::Receiver<()>,
+    started: Instant,
+) {
+    let stdout_task = tokio::spawn(read_command_stream(
+        ToolOutputStream::Stdout,
+        stdout,
+        Arc::clone(&sink),
+        delta_tx.clone(),
+    ));
+    let stderr_task = tokio::spawn(read_command_stream(
+        ToolOutputStream::Stderr,
+        stderr,
+        Arc::clone(&sink),
+        delta_tx.clone(),
+    ));
+    drop(delta_tx);
+
+    let mut cancelled = false;
+    let waited = tokio::select! {
+        status = child.wait() => Some(status),
+        _ = cancel_rx => {
+            cancelled = true;
+            None
+        }
+    };
+    let exit = if cancelled {
+        ProcessExit {
+            status: child.terminate_and_wait().await.ok(),
+            killed: Some("cancelled".to_string()),
+        }
     } else {
-        status.ok_or_else(|| anyhow!("command exited without status"))?
+        match waited {
+            Some(Ok(status)) => ProcessExit {
+                status: Some(status),
+                killed: None,
+            },
+            _ => ProcessExit {
+                status: None,
+                killed: Some("wait_failed".to_string()),
+            },
+        }
     };
     child.disarm();
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
 
-    while let Some((stream, chunk)) = rx.recv().await {
+    let (preview, total, path) = {
+        let mut guard = lock_sink(&sink);
+        (
+            guard.tail(TERMINAL_PREVIEW_BYTES),
+            guard.total_bytes(),
+            guard.output_path(),
+        )
+    };
+    let state = match (exit.killed.as_deref(), exit.status) {
+        (Some(reason), _) => background::TaskState::Killed {
+            reason: reason.to_string(),
+        },
+        (None, Some(status)) => background::TaskState::Exited {
+            code: status.code(),
+        },
+        (None, None) => background::TaskState::Killed {
+            reason: "unknown".to_string(),
+        },
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    if background::complete(&task_id, state, duration_ms, total, path.clone(), preview).is_none()
+        && let Some(path) = path
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = done_tx.send(exit);
+}
+
+fn drain_delta(
+    rx: &mut mpsc::UnboundedReceiver<(ToolOutputStream, String)>,
+    stdout: &mut StreamAccumulator,
+    stderr: &mut StreamAccumulator,
+) {
+    while let Ok((stream, chunk)) = rx.try_recv() {
         match stream {
             ToolOutputStream::Stdout => stdout.push(&chunk),
             ToolOutputStream::Stderr => stderr.push(&chunk),
         }
-        emit(stream, chunk)?;
     }
+}
 
-    let mut data = json!({ "command": command, "shell": shell, "status": status.code(), "success": status.success() && !timed_out });
+fn promote(
+    task_id: &str,
+    session_id: Option<&str>,
+    command: &str,
+    sink: &Arc<Mutex<OutputSink>>,
+    cancel_tx: &mut Option<oneshot::Sender<()>>,
+) -> bool {
+    if cancel_tx.is_none() {
+        return false;
+    }
+    let log = {
+        let mut guard = lock_sink(sink);
+        if guard.persist().is_err() {
+            return false;
+        }
+        guard.state()
+    };
+    background::register(task_id, session_id, command, log, cancel_tx)
+}
+
+fn background_result(
+    task_id: &str,
+    command: &str,
+    shell: &str,
+    sink: &Arc<Mutex<OutputSink>>,
+) -> ToolResult {
+    let (path, preview, total) = {
+        let mut guard = lock_sink(sink);
+        let _ = guard.persist();
+        (
+            guard.output_path(),
+            guard.tail(FOLD_PREVIEW_CHARS),
+            guard.total_bytes(),
+        )
+    };
+    ToolResult::ok(
+        "shell__exec",
+        json!({
+            "command": command,
+            "shell": shell,
+            "state": "background",
+            "task_id": task_id,
+            "output_path": path.map(|path| path.to_string_lossy().to_string()),
+            "output_bytes": total,
+            "preview": preview,
+        }),
+    )
+}
+
+fn exited_result(
+    command: &str,
+    shell: &str,
+    exit: Option<ProcessExit>,
+    stdout: &StreamAccumulator,
+    stderr: &StreamAccumulator,
+) -> ToolResult {
+    let status = exit.as_ref().and_then(|exit| exit.status);
+    let mut data = json!({
+        "command": command,
+        "shell": shell,
+        "state": "exited",
+        "status": status.and_then(|status| status.code()),
+        "success": status.is_some_and(|status| status.success()),
+    });
     let fields = data.as_object_mut().expect("command output object");
     add_stream_fields(fields, "stdout", &stdout.output);
     add_stream_fields(fields, "stderr", &stderr.output);
-    if timed_out {
-        data["error"] = Value::String(format!("command timed out after {timeout_secs}s"));
-    }
-    Ok(data)
+    ToolResult::ok("shell__exec", data)
+}
+
+fn killed_result(
+    command: &str,
+    shell: &str,
+    reason: &str,
+    stdout: &StreamAccumulator,
+    stderr: &StreamAccumulator,
+) -> ToolResult {
+    let mut data = json!({
+        "command": command,
+        "shell": shell,
+        "state": "killed",
+        "reason": reason,
+    });
+    let fields = data.as_object_mut().expect("command output object");
+    add_stream_fields(fields, "stdout", &stdout.output);
+    add_stream_fields(fields, "stderr", &stderr.output);
+    ToolResult::ok("shell__exec", data)
 }
 
 async fn read_command_stream<R>(
     stream: ToolOutputStream,
     mut reader: R,
+    sink: Arc<Mutex<OutputSink>>,
     tx: mpsc::UnboundedSender<(ToolOutputStream, String)>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
@@ -304,16 +553,102 @@ async fn read_command_stream<R>(
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
+                lock_sink(&sink).push(&buffer[..read]);
                 let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
-                if tx.send((stream, chunk)).is_err() {
-                    break;
-                }
+                let _ = tx.send((stream, chunk));
             }
             Err(error) => {
                 warn!(stream = stream.as_str(), error = %error, "failed to read command output stream");
                 break;
             }
         }
+    }
+}
+
+struct ShellOutputTool;
+
+#[async_trait]
+impl ToolHandler for ShellOutputTool {
+    fn name(&self) -> &'static str {
+        "shell__output"
+    }
+
+    fn description(&self) -> &'static str {
+        "Read output from a background shell task starting at a byte offset. Returns the task state, the retained window start, the next offset, and the output text."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Background task id returned by shell__exec."
+                },
+                "offset": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Byte offset to resume from. Omit to continue from the start of the retained window."
+                }
+            },
+            "required": ["task_id", "offset"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let task_id = required_string(&args, "task_id")?;
+        let offset = optional_u64(&args, "offset")?.unwrap_or(0);
+        let chunk = background::read_output(task_id, offset, MAX_OUTPUT_CHUNK_BYTES)?;
+        let (exit_code, reason) = match &chunk.state {
+            background::TaskState::Exited { code } => (*code, None),
+            background::TaskState::Killed { reason } => (None, Some(reason.clone())),
+            background::TaskState::Running => (None, None),
+        };
+        Ok(json!({
+            "task_id": task_id,
+            "state": chunk.state.as_str(),
+            "exit_code": exit_code,
+            "reason": reason,
+            "window_start": chunk.window_start,
+            "next_offset": chunk.next_offset,
+            "total_bytes": chunk.total_bytes,
+            "output_path": chunk.output_path,
+            "text": chunk.text,
+        }))
+    }
+}
+
+struct ShellCancelTool;
+
+#[async_trait]
+impl ToolHandler for ShellCancelTool {
+    fn name(&self) -> &'static str {
+        "shell__cancel"
+    }
+
+    fn description(&self) -> &'static str {
+        "Terminate a running background shell task."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Background task id returned by shell__exec."
+                }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let task_id = required_string(&args, "task_id")?;
+        let cancelled = background::cancel(task_id);
+        Ok(json!({ "task_id": task_id, "cancelled": cancelled }))
     }
 }
 

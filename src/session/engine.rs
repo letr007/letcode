@@ -242,6 +242,14 @@ impl SessionEngine {
             api_key_configured,
         };
         let (control_tx, control_rx) = mpsc::unbounded_channel();
+        crate::tool::background::set_notifier(Arc::new({
+            let control_tx = control_tx.clone();
+            move |outcome| {
+                let _ = control_tx.send(SessionEngineControl::Command(
+                    SessionEngineCommand::BackgroundShellCompleted { outcome },
+                ));
+            }
+        }));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let title_event_tx = event_tx.clone();
         let ingress = SessionEngineIngress {
@@ -1703,6 +1711,47 @@ async fn run_engine_loop(
                     continue;
                 }
 
+                if let SessionEngineCommand::BackgroundShellCompleted { outcome } = command {
+                    let current_session_id = transcript
+                        .lock()
+                        .map(|recorder| recorder.session_id().to_string())
+                        .unwrap_or_default();
+                    if outcome.session_id.as_deref() != Some(current_session_id.as_str()) {
+                        continue;
+                    }
+                    if background_deliveries
+                        .entry(outcome.task_id.clone())
+                        .or_default()
+                        .mark_notified()
+                    {
+                        let prompt = format_background_shell_completion(&outcome);
+                        if let Err(error) = agent
+                            .begin_internal_continuation_turn()
+                            .and_then(|()| {
+                                transcript
+                                    .lock()
+                                    .map_err(|_| anyhow!("transcript recorder poisoned"))
+                                    .and_then(|mut recorder| {
+                                        recorder.record_internal_continuation(
+                                            prompt.clone(),
+                                            crate::transcript::InternalContinuationSource::ShellCompletion,
+                                        )
+                                    })
+                                    .and_then(|()| agent.append_internal_continuation(prompt))
+                            })
+                        {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!(
+                                    "failed to record background shell completion: {error}"
+                                )),
+                            ));
+                            continue;
+                        }
+                        deferred_commands.push_front(SessionEngineCommand::ContinueSession);
+                    }
+                    continue;
+                }
+
                 if let SessionEngineCommand::BackgroundSubagentCompleted {
                     generation,
                     parent_session_id,
@@ -1931,6 +1980,9 @@ async fn run_engine_loop(
                     SessionEngineCommand::BackgroundSubagentCompleted { .. } => {
                         unreachable!("background completion was handled above")
                     }
+                    SessionEngineCommand::BackgroundShellCompleted { .. } => {
+                        unreachable!("background shell completion was handled above")
+                    }
                     SessionEngineCommand::ShowHistoryTree
                     | SessionEngineCommand::Undo
                     | SessionEngineCommand::Redo
@@ -2139,6 +2191,12 @@ async fn run_engine_loop(
                             .latest_permission_mode
                             .is_some();
                         let token_usage = {
+                            if let Ok(old_session_id) = transcript
+                                .lock()
+                                .map(|recorder| recorder.session_id().to_string())
+                            {
+                                crate::tool::background::end_session(&old_session_id);
+                            }
                             subagent_runtime.close_swarm_sessions();
                             if !subagent_runtime.wait_until_idle().await {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(
@@ -2290,6 +2348,12 @@ async fn run_engine_loop(
                                 .map(|(name, route)| (name.clone(), route.display_name()))
                                 .collect(),
                         };
+                        if let Ok(old_session_id) = transcript
+                            .lock()
+                            .map(|recorder| recorder.session_id().to_string())
+                        {
+                            crate::tool::background::end_session(&old_session_id);
+                        }
                         subagent_runtime.close_swarm_sessions();
                         if !subagent_runtime.wait_until_idle().await {
                             let _ = session_transport_tx.send(SessionTransportEvent::Error(
@@ -3067,6 +3131,31 @@ pub(crate) fn observe_background_subagent_completion(
         });
     }
     true
+}
+
+pub(crate) fn format_background_shell_completion(
+    outcome: &crate::tool::background::TaskOutcome,
+) -> String {
+    use crate::tool::background::TaskState;
+    let state = match &outcome.state {
+        TaskState::Running => "running".to_string(),
+        TaskState::Exited { code } => format!(
+            "exited (code {})",
+            code.map(|code| code.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        TaskState::Killed { reason } => format!("killed ({reason})"),
+    };
+    format!(
+        "A background shell command reached a terminal state.\n\ntask_id: {}\ncommand: {}\nstate: {}\nduration_ms: {}\noutput_bytes: {}\noutput_path: {}\n\n{}\n\nContinue the user's task using this result. Do not repeat work already completed.",
+        outcome.task_id,
+        outcome.command,
+        state,
+        outcome.duration_ms,
+        outcome.output_bytes,
+        outcome.output_path.as_deref().unwrap_or("none"),
+        outcome.preview,
+    )
 }
 
 pub(crate) fn format_background_subagent_completion(
