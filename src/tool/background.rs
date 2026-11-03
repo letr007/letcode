@@ -334,6 +334,7 @@ pub(super) fn cancel(task_id: &str) -> bool {
         return false;
     }
     if let Some(cancel) = task.cancel.take() {
+        task.observed = true;
         let _ = cancel.send(());
         return true;
     }
