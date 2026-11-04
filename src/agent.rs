@@ -720,6 +720,8 @@ pub struct Agent {
     permission_session: Arc<Mutex<PermissionSessionState>>,
     /// Run-local directory authorization for delegated children.
     subagent_path_scope: Option<Arc<SubagentPathScope>>,
+    // Only the main session engine delivers background shell completions.
+    can_background_shell: bool,
     compaction_config: CompactionConfig,
     retry_config: RetryConfig,
     tool_timeout_secs: Option<u64>,
@@ -1024,6 +1026,7 @@ impl AgentFactory {
             compaction_config: parent.compaction_config.clone(),
             retry_config,
             tool_timeout_secs: parent.tool_timeout_secs,
+            can_background_shell: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: parent.max_iterations,
@@ -1527,6 +1530,7 @@ impl Agent {
             compaction_config: CompactionConfig::default(),
             retry_config: RetryConfig::default(),
             tool_timeout_secs: Some(60),
+            can_background_shell: true,
             fake_client: None,
             fake_installation_id: crate::fake::synthetic_installation_id(),
             fake_config: crate::config::FakeConfig::default(),
@@ -3078,6 +3082,7 @@ impl Agent {
             .resolved_model_route
             .as_deref()
             .is_some_and(|route| route.capabilities.tool_result_images);
+        context.can_background_shell = self.can_background_shell;
         context.session_id = self.runtime_snapshot.session_id.clone();
         context.history_cursor = self.runtime_snapshot.session_id.as_ref().map(|session_id| {
             crate::context_history::HistoryCursor {
@@ -3121,6 +3126,7 @@ impl Agent {
             compaction_config: CompactionConfig::default(),
             retry_config: self.retry_config.clone(),
             tool_timeout_secs: self.tool_timeout_secs,
+            can_background_shell: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             // One normal helper iteration plus semantic recovery retries.

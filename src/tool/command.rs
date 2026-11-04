@@ -61,11 +61,11 @@ impl ToolHandler for RunCommandTool {
                     "type": ["integer", "null"],
                     "minimum": 1,
                     "maximum": MAX_COMMAND_TIMEOUT_SECS,
-                    "description": "How long to wait in the foreground, in seconds. Defaults to 120, maximum 3600. When the command is still running at the deadline it moves to the background and this call returns immediately with a task_id; the command keeps running."
+                    "description": "How long to wait in the foreground, in seconds. Defaults to 120, maximum 3600. At the deadline the main session moves the command to the background and returns a task_id; without background delivery the command is terminated."
                 },
                 "background": {
                     "type": ["boolean", "null"],
-                    "description": "Skip foreground waiting and move the command to the background immediately. Use for builds, installs, and other long jobs you do not need to block on."
+                    "description": "Skip foreground waiting and move the command to the background immediately. Use for builds, installs, and other long jobs you do not need to block on. Available in the main session; subagent runs cannot receive background completions."
                 }
             },
             "required": ["command", "timeout_secs", "background"],
@@ -86,10 +86,17 @@ impl ToolHandler for RunCommandTool {
         let command = required_string(&args, "command")?;
         let timeout_secs = command_timeout_secs(&args)?;
         let background = optional_bool(&args, "background").unwrap_or(false);
+        let can_background = context.can_background_shell && context.session_id.is_some();
+        if background && !can_background {
+            return Err(anyhow!(
+                "background shell requires a session that receives completions"
+            ));
+        }
         run_shell(
             command,
             timeout_secs,
             background,
+            can_background,
             context.session_id.as_deref(),
             emit,
         )
@@ -274,6 +281,7 @@ async fn run_shell(
     command: &str,
     timeout_secs: u64,
     background: bool,
+    can_background: bool,
     session_id: Option<&str>,
     emit: ToolOutputEmitter<'_>,
 ) -> Result<ToolResult> {
@@ -296,7 +304,9 @@ async fn run_shell(
     let started = Instant::now();
 
     let mut cancel_tx = Some(cancel_tx);
-    let promoted = background && promote(&task_id, session_id, command, &sink, &mut cancel_tx);
+    let promoted = background
+        && can_background
+        && promote(&task_id, session_id, command, &sink, &mut cancel_tx);
 
     let mut run = ForegroundGuard {
         handle: Some(tokio::spawn(drive_process(
@@ -338,17 +348,24 @@ async fn run_shell(
                 return Ok(exited_result(command, shell, exit, &stdout_acc, &stderr_acc));
             }
             _ = &mut deadline => {
-                if promote(&task_id, session_id, command, &sink, &mut cancel_tx) {
+                if can_background
+                    && promote(&task_id, session_id, command, &sink, &mut cancel_tx)
+                {
                     run.disarm();
                     return Ok(background_result(&task_id, command, shell, &sink));
                 }
                 if let Some(tx) = cancel_tx.take() {
                     let _ = tx.send(());
                 }
+                let reason = if can_background {
+                    "background_capacity_exceeded"
+                } else {
+                    "background_unavailable"
+                };
                 return Ok(killed_result(
                     command,
                     shell,
-                    "background_capacity_exceeded",
+                    reason,
                     &stdout_acc,
                     &stderr_acc,
                 ));

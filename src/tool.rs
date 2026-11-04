@@ -337,6 +337,7 @@ pub struct ToolExecutionContext {
     pub(crate) history_cursor: Option<crate::context_history::HistoryCursor>,
     pub allow_outside_workspace: bool,
     pub(crate) allow_tool_result_images: bool,
+    pub(crate) can_background_shell: bool,
     pub session_id: Option<String>,
     pub question_handler: Option<QuestionCallback>,
     prepared_writable_leaf: Option<PreparedWritableLeaf>,
@@ -375,6 +376,7 @@ impl ToolExecutionContext {
         Self {
             allow_outside_workspace: true,
             allow_tool_result_images: false,
+            can_background_shell: false,
             history_cursor: None,
             session_id: None,
             question_handler: None,

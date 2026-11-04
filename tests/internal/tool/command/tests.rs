@@ -116,16 +116,74 @@ fn command_timeout_rejects_invalid_boundaries() {
 mod integration_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn streaming_shell_command_backgrounds_with_a_delivery_session() {
+        use crate::tool::ToolHandler;
+
+        let mut emit = |_stream, _chunk| Ok(());
+        let context = ToolExecutionContext {
+            can_background_shell: true,
+            session_id: Some("background-test".into()),
+            ..ToolExecutionContext::default()
+        };
+        let result = RunCommandTool
+            .execute_streaming(
+                json!({"command": "echo hi", "background": true}),
+                context,
+                &mut emit,
+            )
+            .await
+            .expect("shell tool result");
+
+        assert!(result.ok);
+        let data = result.data.expect("shell data");
+        assert_eq!(
+            data.get("state").and_then(serde_json::Value::as_str),
+            Some("background")
+        );
+        let task_id = data
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task id");
+        crate::tool::background::cancel(task_id);
+    }
+
+    #[tokio::test]
+    async fn streaming_shell_command_rejects_background_in_subagent_session() {
+        use crate::tool::ToolHandler;
+
+        let mut emit = |_stream, _chunk| Ok(());
+        let context = ToolExecutionContext {
+            session_id: Some("child-session".into()),
+            ..ToolExecutionContext::default()
+        };
+        let error = RunCommandTool
+            .execute_streaming(
+                json!({"command": "echo hi", "background": true}),
+                context,
+                &mut emit,
+            )
+            .await
+            .expect_err("background must require a session that receives completions");
+
+        assert!(error.to_string().contains("background"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn streaming_shell_command_moves_to_background_on_timeout() {
         use crate::tool::ToolHandler;
 
         let mut emit = |_stream, _chunk| Ok(());
+        let context = ToolExecutionContext {
+            can_background_shell: true,
+            session_id: Some("background-test".into()),
+            ..ToolExecutionContext::default()
+        };
         let result = RunCommandTool
             .execute_streaming(
                 json!({"command": "sleep 30", "timeout_secs": 1}),
-                ToolExecutionContext::default(),
+                context,
                 &mut emit,
             )
             .await
@@ -148,6 +206,37 @@ mod integration_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn streaming_shell_command_kills_on_timeout_without_background_capability() {
+        use crate::tool::ToolHandler;
+
+        let mut emit = |_stream, _chunk| Ok(());
+        let context = ToolExecutionContext {
+            session_id: Some("child-session".into()),
+            ..ToolExecutionContext::default()
+        };
+        let result = RunCommandTool
+            .execute_streaming(
+                json!({"command": "sleep 30", "timeout_secs": 1}),
+                context,
+                &mut emit,
+            )
+            .await
+            .expect("shell tool result");
+
+        assert!(result.ok);
+        let data = result.data.expect("shell data");
+        assert_eq!(
+            data.get("state").and_then(serde_json::Value::as_str),
+            Some("killed")
+        );
+        assert_eq!(
+            data.get("reason").and_then(serde_json::Value::as_str),
+            Some("background_unavailable")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn dropping_streaming_shell_command_kills_process_group() {
         let dir = process_fixture_dir("streaming-drop");
         let ready = dir.join("ready");
@@ -156,7 +245,7 @@ mod integration_tests {
         let script = delayed_side_effect_command(&ready, &release, &marker);
         let task = tokio::spawn(async move {
             let mut emit = |_stream, _chunk| Ok(());
-            run_shell(&script, 30, false, None, &mut emit).await
+            run_shell(&script, 30, false, false, None, &mut emit).await
         });
         wait_for_file(&ready).await;
         task.abort();
