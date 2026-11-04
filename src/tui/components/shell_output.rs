@@ -246,6 +246,17 @@ pub(super) fn shell_card_title(tool: &ToolView, command: Option<&str>) -> String
         .unwrap_or_else(|| "Runs command".to_string())
 }
 
+pub(super) fn shell_card_title_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(theme.accent)
+        .bg(theme.card_bg())
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(super) fn shell_card_command_style(theme: Theme) -> Style {
+    Style::default().fg(theme.text).bg(theme.card_bg())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,15 +286,4 @@ mod tests {
             "[Console]::OutputEncoding.WebName; chcp"
         );
     }
-}
-
-pub(super) fn shell_card_title_style(theme: Theme) -> Style {
-    Style::default()
-        .fg(theme.accent)
-        .bg(theme.card_bg())
-        .add_modifier(Modifier::BOLD)
-}
-
-pub(super) fn shell_card_command_style(theme: Theme) -> Style {
-    Style::default().fg(theme.text).bg(theme.card_bg())
 }

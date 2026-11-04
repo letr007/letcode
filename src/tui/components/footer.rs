@@ -333,7 +333,9 @@ fn output_rate_graph_spans(graph: &OutputRateGraph, theme: Theme) -> Vec<Span<'s
     let style = Style::default().fg(theme.accent).bg(theme.root_bg);
     graph
         .levels(OUTPUT_RATE_GRAPH_COLUMNS)
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Span::styled(output_rate_graph_glyph(pair[0], pair[1]).to_string(), style))
         .collect()
 }

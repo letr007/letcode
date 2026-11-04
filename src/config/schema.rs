@@ -28,10 +28,9 @@ pub fn field_schema(path: &[&str]) -> Option<(String, String)> {
             .and_then(|properties| properties.get(segment))
         {
             (child, false)
-        } else if let Some(child) = resolved.get("additionalProperties") {
-            (child, true)
         } else {
-            return None;
+            let child = resolved.get("additionalProperties")?;
+            (child, true)
         };
         key_path.push(if dynamic {
             "*".to_string()
