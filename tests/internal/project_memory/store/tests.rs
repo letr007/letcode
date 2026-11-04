@@ -483,8 +483,11 @@ fn repeated_failures_back_off_then_stop_until_the_frontier_moves() {
             )
             .unwrap();
         assert_eq!(count, source.failure_count + 1);
-        assert!(retry_at >= before.saturating_add(60_000));
-        assert!(retry_at > previous_retry);
+        let expected_delay = SOURCE_RETRY_DELAYS_MS[usize::try_from(source.failure_count)
+            .unwrap_or(SOURCE_RETRY_DELAYS_MS.len() - 1)
+            .min(SOURCE_RETRY_DELAYS_MS.len() - 1)];
+        assert!(retry_at >= before.saturating_add(expected_delay));
+        assert!(retry_at >= previous_retry);
         previous_retry = retry_at;
         store
             .connect()
