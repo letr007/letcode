@@ -5,6 +5,26 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [0.28.0] - 2026-11-04
+
+### Added
+
+- `shell__exec` 新增 `background` 参数，超时的命令转入后台继续运行，完成时自动回到会话。
+- 新增 `shell__output` 与 `shell__cancel`，读取后台输出与终止后台任务。
+- 侧栏新增任务区，列出运行中的后台命令与子代理。
+- `shell__exec` 与委派工具新增 `title`，面板与卡片显示标题。
+
+### Changed
+
+- `shell__cancel` 归为只读工具，非安全模式下不再请求审批。
+- 切换或结束会话时清理该会话的后台任务。
+
+### Fixed
+
+- 修复后台任务完成事件在子代理中丢弃，以及取消后仍注入报告并开启空回合。
+- 修复后台任务终态重复注入与已读结果再次注入。
+- 修复 `fs__read` 未校验图片内容与扩展名类型一致。
+
 ## [0.27.0] - 2026-10-30
 
 ### Added
