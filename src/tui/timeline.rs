@@ -22,6 +22,20 @@ use std::{
     time::Instant,
 };
 
+fn title_from_arguments(arguments: &serde_json::Value) -> Option<String> {
+    arguments
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+}
+
+fn argument_title(arguments: Option<&str>) -> Option<String> {
+    let arguments: serde_json::Value = serde_json::from_str(arguments?).ok()?;
+    title_from_arguments(&arguments)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
     User(MessageView),
@@ -313,6 +327,7 @@ struct SubagentToolBinding {
     child_session_id: String,
     agent_name: String,
     task: String,
+    title: Option<String>,
     background: bool,
     finished: bool,
 }
@@ -321,6 +336,7 @@ struct SubagentToolBinding {
 pub struct ActiveSubagent {
     pub agent_name: String,
     pub task: String,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1127,6 +1143,7 @@ impl Timeline {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| event.summary.clone());
+            let title = arguments.as_ref().and_then(title_from_arguments);
             let background = arguments
                 .as_ref()
                 .and_then(|args| args.get("background"))
@@ -1140,6 +1157,7 @@ impl Timeline {
                 child_session_id: String::new(),
                 agent_name,
                 task,
+                title,
                 background,
                 finished: false,
             });
@@ -1238,6 +1256,13 @@ impl Timeline {
                         _ => None,
                     })
                     .unwrap_or_else(|| event.summary.clone());
+                let title = self
+                    .find_tool_index(&event.call_id)
+                    .and_then(|index| self.items.get(index))
+                    .and_then(|item| match item {
+                        TimelineItem::Tool(tool) => argument_title(tool.arguments.as_deref()),
+                        _ => None,
+                    });
                 self.subagent_run_by_child
                     .insert(result.child_session_id.clone(), result.run_id.clone());
                 self.subagent_tools_by_run.insert(
@@ -1248,6 +1273,7 @@ impl Timeline {
                         child_session_id: result.child_session_id.clone(),
                         agent_name: result.agent_name.clone(),
                         task,
+                        title,
                         background: false,
                         finished: false,
                     },
@@ -1307,6 +1333,13 @@ impl Timeline {
                     _ => None,
                 })
                 .unwrap_or_else(|| "subagent running".into());
+            let title = self
+                .find_tool_index(&call_id)
+                .and_then(|index| self.items.get(index))
+                .and_then(|item| match item {
+                    TimelineItem::Tool(tool) => argument_title(tool.arguments.as_deref()),
+                    _ => None,
+                });
             self.subagent_run_by_child
                 .insert(child_session_id.clone(), run_id.clone());
             self.subagent_tools_by_run.insert(
@@ -1317,6 +1350,7 @@ impl Timeline {
                     child_session_id,
                     agent_name,
                     task,
+                    title,
                     background,
                     finished: false,
                 },
@@ -2005,6 +2039,7 @@ impl Timeline {
                     child_session_id: result.child_session_id.clone(),
                     agent_name: result.agent_name.clone(),
                     task: tool.summary.clone(),
+                    title: argument_title(tool.arguments.as_deref()),
                     background: true,
                     finished: false,
                 },
@@ -2092,6 +2127,7 @@ impl Timeline {
                         ActiveSubagent {
                             agent_name: binding.agent_name.clone(),
                             task: binding.task.clone(),
+                            title: binding.title.clone(),
                         },
                     )
                 })

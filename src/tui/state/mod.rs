@@ -1287,6 +1287,7 @@ impl DialogState {
 pub struct BackgroundShellTask {
     pub task_id: String,
     pub command: String,
+    pub title: Option<String>,
     pub started: std::time::Instant,
 }
 
@@ -3687,7 +3688,12 @@ impl TuiState {
         self.phase = AppPhase::Running;
     }
 
-    pub fn add_background_shell(&mut self, task_id: String, command: String) {
+    pub fn add_background_shell(
+        &mut self,
+        task_id: String,
+        command: String,
+        title: Option<String>,
+    ) {
         if self
             .background_shells
             .iter()
@@ -3698,6 +3704,7 @@ impl TuiState {
         self.background_shells.push(BackgroundShellTask {
             task_id,
             command,
+            title,
             started: std::time::Instant::now(),
         });
     }

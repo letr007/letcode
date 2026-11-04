@@ -227,28 +227,53 @@ pub(super) fn shell_command(tool: &ToolView) -> Option<String> {
 }
 
 pub(super) fn shell_card_title(tool: &ToolView, command: Option<&str>) -> String {
-    let summary = tool.summary.trim();
-    if summary.is_empty() || summary.starts_with("exit ") || summary.starts_with("run ") {
-        command
-            .map(sentence_case_command_goal)
-            .unwrap_or_else(|| "Runs command".to_string())
-    } else {
-        summary.to_string()
+    if let Some(title) = tool_arguments(tool)
+        .as_ref()
+        .and_then(|args| value_str(Some(args), "title"))
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        return title.to_string();
     }
+    command
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let summary = tool.summary.trim();
+            (!summary.is_empty()).then(|| summary.to_string())
+        })
+        .unwrap_or_else(|| "Runs command".to_string())
 }
 
-pub(super) fn sentence_case_command_goal(command: &str) -> String {
-    let command = command.trim();
-    if command.is_empty() {
-        return "Runs command".to_string();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell_tool(arguments: &str) -> ToolView {
+        ToolView {
+            call_id: "call-1".into(),
+            name: "shell__exec".into(),
+            summary: "shell__exec fallback".into(),
+            arguments: Some(arguments.into()),
+            output: None,
+            status: ToolExecutionStatus::Succeeded,
+        }
     }
-    let first = command.split_whitespace().next().unwrap_or("command");
-    match first {
-        "cargo" if command.contains("test") => "Runs test suite".to_string(),
-        "cargo" if command.contains("fmt") => "Formats code".to_string(),
-        "git" if command.contains("status") => "Shows working tree status".to_string(),
-        "git" if command.contains("diff") => "Shows current diff".to_string(),
-        _ => format!("Runs {first}"),
+
+    #[test]
+    fn shell_card_header_prefers_the_command_title() {
+        let tool = shell_tool(r#"{"command":"cargo test","title":"运行测试"}"#);
+        assert_eq!(shell_card_title(&tool, Some("cargo test")), "运行测试");
+    }
+
+    #[test]
+    fn shell_card_header_keeps_the_raw_command_without_a_title() {
+        let tool = shell_tool(r#"{"command":"[Console]::OutputEncoding.WebName; chcp"}"#);
+        assert_eq!(
+            shell_card_title(&tool, Some("[Console]::OutputEncoding.WebName; chcp")),
+            "[Console]::OutputEncoding.WebName; chcp"
+        );
     }
 }
 

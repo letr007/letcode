@@ -530,6 +530,33 @@ fn cancelled_tool_ignores_late_finished_event() {
 }
 
 #[test]
+fn active_subagents_carry_the_delegation_title() {
+    let mut timeline = Timeline::new();
+    timeline.push_tool_started(ToolStartedEvent {
+        call_id: "explorer-call".into(),
+        name: "agent__explore".into(),
+        summary: "explore".into(),
+        arguments: Some(
+            json!({
+                "task": "inspect the background task lifecycle",
+                "title": "调查后台任务生命周期"
+            })
+            .to_string(),
+        ),
+    });
+    assert!(timeline.register_subagent_started(
+        "run-1",
+        "child-1",
+        "explorer",
+        "inspect the background task lifecycle"
+    ));
+
+    let active = timeline.active_subagents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].title.as_deref(), Some("调查后台任务生命周期"));
+}
+
+#[test]
 fn child_live_summaries_remain_bound_to_their_parent_tool_cards() {
     let mut timeline = Timeline::new();
     timeline.push_tool_started(ToolStartedEvent::new(

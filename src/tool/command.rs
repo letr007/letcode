@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 
 use crate::process_tree::ManagedChild;
 
-use super::args::{optional_bool, optional_usize, required_string};
+use super::args::{optional_bool, optional_string, optional_usize, required_string};
 use super::background::{self, OutputSink, TERMINAL_PREVIEW_BYTES};
 use super::delegation::optional_u64;
 use super::fold_artifact::{
@@ -57,6 +57,11 @@ impl ToolHandler for RunCommandTool {
                     "type": "string",
                     "description": "Shell command to run. On Windows prefers pwsh.exe, then powershell.exe, then cmd.exe; uses /bin/sh elsewhere, e.g. cargo check"
                 },
+                "title": {
+                    "type": ["string", "null"],
+                    "maxLength": 80,
+                    "description": "Short user-facing title for this command, in the user's language. Describe the purpose, not the command line; omit paths and secrets. Used by task panels and tool cards."
+                },
                 "timeout_secs": {
                     "type": ["integer", "null"],
                     "minimum": 1,
@@ -68,7 +73,9 @@ impl ToolHandler for RunCommandTool {
                     "description": "Skip foreground waiting and move the command to the background immediately. Use for builds, installs, and other long jobs you do not need to block on. Available in the main session; subagent runs cannot receive background completions."
                 }
             },
-            "required": ["command", "timeout_secs", "background"],
+            // OpenAI strict tool schemas require every properties key to appear in
+            // required (optional fields use type unions that include null).
+            "required": ["command", "title", "timeout_secs", "background"],
             "additionalProperties": false
         })
     }
@@ -86,6 +93,7 @@ impl ToolHandler for RunCommandTool {
         let command = required_string(&args, "command")?;
         let timeout_secs = command_timeout_secs(&args)?;
         let background = optional_bool(&args, "background").unwrap_or(false);
+        let title = command_title(&args);
         let can_background = context.can_background_shell && context.session_id.is_some();
         if background && !can_background {
             return Err(anyhow!(
@@ -97,11 +105,19 @@ impl ToolHandler for RunCommandTool {
             timeout_secs,
             background,
             can_background,
+            title.as_deref(),
             context.session_id.as_deref(),
             emit,
         )
         .await
     }
+}
+
+fn command_title(args: &Value) -> Option<String> {
+    optional_string(args, "title")
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
 }
 
 fn command_timeout_secs(args: &Value) -> Result<u64> {
@@ -282,6 +298,7 @@ async fn run_shell(
     timeout_secs: u64,
     background: bool,
     can_background: bool,
+    title: Option<&str>,
     session_id: Option<&str>,
     emit: ToolOutputEmitter<'_>,
 ) -> Result<ToolResult> {
@@ -306,7 +323,7 @@ async fn run_shell(
     let mut cancel_tx = Some(cancel_tx);
     let promoted = background
         && can_background
-        && promote(&task_id, session_id, command, &sink, &mut cancel_tx);
+        && promote(&task_id, session_id, command, title, &sink, &mut cancel_tx);
 
     let mut run = ForegroundGuard {
         handle: Some(tokio::spawn(drive_process(
@@ -349,7 +366,7 @@ async fn run_shell(
             }
             _ = &mut deadline => {
                 if can_background
-                    && promote(&task_id, session_id, command, &sink, &mut cancel_tx)
+                    && promote(&task_id, session_id, command, title, &sink, &mut cancel_tx)
                 {
                     run.disarm();
                     return Ok(background_result(&task_id, command, shell, &sink));
@@ -473,6 +490,7 @@ fn promote(
     task_id: &str,
     session_id: Option<&str>,
     command: &str,
+    title: Option<&str>,
     sink: &Arc<Mutex<OutputSink>>,
     cancel_tx: &mut Option<oneshot::Sender<()>>,
 ) -> bool {
@@ -486,7 +504,7 @@ fn promote(
         }
         guard.state()
     };
-    background::register(task_id, session_id, command, log, cancel_tx)
+    background::register(task_id, session_id, command, title, log, cancel_tx)
 }
 
 fn background_result(

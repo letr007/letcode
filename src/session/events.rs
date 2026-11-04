@@ -198,6 +198,7 @@ pub(crate) enum SessionTransportEvent {
         task_id: String,
         session_id: Option<String>,
         command: String,
+        title: Option<String>,
     },
     BackgroundShellCompleted {
         task_id: String,

@@ -54,6 +54,7 @@ pub(crate) enum BackgroundEvent {
         task_id: String,
         session_id: Option<String>,
         command: String,
+        title: Option<String>,
     },
     Completed(TaskOutcome),
 }
@@ -239,6 +240,7 @@ pub(super) fn register(
     task_id: &str,
     session_id: Option<&str>,
     command: &str,
+    title: Option<&str>,
     log: Arc<Mutex<LogState>>,
     cancel: &mut Option<oneshot::Sender<()>>,
 ) -> bool {
@@ -268,6 +270,7 @@ pub(super) fn register(
             task_id: task_id.to_string(),
             session_id: session_id.map(str::to_string),
             command: command.to_string(),
+            title: title.map(str::to_string),
         });
     }
     true

@@ -245,7 +245,7 @@ mod integration_tests {
         let script = delayed_side_effect_command(&ready, &release, &marker);
         let task = tokio::spawn(async move {
             let mut emit = |_stream, _chunk| Ok(());
-            run_shell(&script, 30, false, false, None, &mut emit).await
+            run_shell(&script, 30, false, false, None, None, &mut emit).await
         });
         wait_for_file(&ready).await;
         task.abort();

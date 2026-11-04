@@ -251,11 +251,13 @@ impl SessionEngine {
                     task_id,
                     session_id,
                     command,
+                    title,
                 } => {
                     let _ = event_tx.send(SessionTransportEvent::BackgroundShellStarted {
                         task_id,
                         session_id,
                         command,
+                        title,
                     });
                 }
                 crate::tool::background::BackgroundEvent::Completed(outcome) => {

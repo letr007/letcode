@@ -189,9 +189,10 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         ]));
         let content_width = inner.width.saturating_sub(2) as usize;
         for subagent in active_subagents.iter() {
+            let label = subagent.title.as_deref().unwrap_or(&subagent.task);
             lines.push(Line::from(Span::styled(
                 truncate_middle(
-                    &format!("◇ {}  {}", subagent.agent_name, subagent.task),
+                    &format!("◇ {}  {label}", subagent.agent_name),
                     content_width,
                 ),
                 value_style,
@@ -199,8 +200,9 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
         }
         for task in state.background_shells.iter() {
             let elapsed = format_elapsed(task.started.elapsed());
+            let label = task.title.as_deref().unwrap_or(&task.command);
             lines.push(Line::from(Span::styled(
-                truncate_middle(&format!("● {elapsed}  {}", task.command), content_width),
+                truncate_middle(&format!("● {elapsed}  {label}"), content_width),
                 value_style,
             )));
         }

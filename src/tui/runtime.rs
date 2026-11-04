@@ -1517,11 +1517,15 @@ impl TuiRuntime {
                 task_id,
                 session_id,
                 command,
+                title,
             } => {
                 if session_id.is_none() || session_id.as_deref() == self.state.session_id.as_deref()
                 {
-                    self.state
-                        .add_background_shell(task_id.clone(), command.clone());
+                    self.state.add_background_shell(
+                        task_id.clone(),
+                        command.clone(),
+                        title.clone(),
+                    );
                 }
                 suppress_session_event = true;
             }

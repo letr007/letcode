@@ -1,6 +1,14 @@
 use serde_json::Value;
 
 pub fn format_tool_call(name: &str, args: &Value) -> String {
+    if let Some(title) = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        return format!("{name} {}", truncate_label(title, 80));
+    }
     match name {
         "fs__list" | "fs__read" | "fs__write" | "fs__append" | "fs__mkdir" => args
             .get("path")
@@ -101,4 +109,36 @@ pub fn truncate_label(text: &str, max_chars: usize) -> String {
         truncated.push('…');
     }
     truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_title_replaces_the_raw_command_label() {
+        assert_eq!(
+            format_tool_call(
+                "shell__exec",
+                &json!({"command": "cargo install-local --locked", "title": "安装本地构建"})
+            ),
+            "shell__exec 安装本地构建"
+        );
+    }
+
+    #[test]
+    fn missing_or_blank_title_keeps_the_raw_command_label() {
+        assert_eq!(
+            format_tool_call("shell__exec", &json!({"command": "cargo check"})),
+            "shell__exec cargo check"
+        );
+        assert_eq!(
+            format_tool_call(
+                "shell__exec",
+                &json!({"command": "cargo check", "title": "  "})
+            ),
+            "shell__exec cargo check"
+        );
+    }
 }

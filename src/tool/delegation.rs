@@ -606,6 +606,11 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
                 "type": ["string", "null"],
                 "description": "完整委派目标与必要步骤；优先于 task，两者不会合并。未提供时使用 task"
             },
+            "title": {
+                "type": ["string", "null"],
+                "maxLength": 80,
+                "description": "用用户语言给出 4–12 个字的委派标题，描述目的而不是复述任务；用于任务面板。为空时面板显示任务原文"
+            },
             "success_criteria": {
                 "type": ["array", "null"],
                 "items": {"type": "string"},
@@ -644,6 +649,7 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
         "required": [
             "task",
             "objective",
+            "title",
             "success_criteria",
             "allowed_paths",
             "forbidden_paths",
