@@ -1732,21 +1732,11 @@ async fn run_engine_loop(
                 }
 
                 if let SessionEngineCommand::BackgroundShellCompleted { outcome } = command {
-                    let current_session_id = transcript
-                        .lock()
-                        .map(|recorder| recorder.session_id().to_string())
-                        .unwrap_or_default();
-                    if outcome.session_id.as_deref() != Some(current_session_id.as_str()) {
-                        continue;
-                    }
-                    if crate::tool::background::take_observed(&outcome.task_id) {
-                        continue;
-                    }
-                    if background_deliveries
-                        .entry(outcome.task_id.clone())
-                        .or_default()
-                        .mark_notified()
-                    {
+                    if observe_background_shell_completion(
+                        &transcript,
+                        &mut background_deliveries,
+                        &outcome,
+                    ) {
                         let prompt = format_background_shell_completion(&outcome);
                         if let Err(error) = agent
                             .begin_internal_continuation_turn()
@@ -2750,6 +2740,43 @@ async fn run_engine_loop(
                                         }
                                     }
                                 }
+                                Some(SessionEngineCommand::BackgroundShellCompleted { outcome }) => {
+                                    if !observe_background_shell_completion(
+                                        &transcript,
+                                        &mut background_deliveries,
+                                        &outcome,
+                                    ) {
+                                        continue;
+                                    }
+                                    match transcript
+                                        .lock()
+                                        .map_err(|_| anyhow!("transcript recorder poisoned"))
+                                        .and_then(|mut recorder| {
+                                            recorder.record_internal_continuation(
+                                                format_background_shell_completion(&outcome),
+                                                crate::transcript::InternalContinuationSource::ShellCompletion,
+                                            )
+                                        })
+                                        .and_then(|()| {
+                                            turn_continuation_queue
+                                                .lock()
+                                                .map_err(|_| anyhow!("turn continuation queue poisoned"))
+                                                .map(|mut queue| {
+                                                    queue.push(crate::agent::PendingTurnContinuation {
+                                                        result: None,
+                                                    })
+                                                })
+                                        }) {
+                                        Ok(()) => {}
+                                        Err(error) => {
+                                            let _ = session_transport_tx.send(
+                                                SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                                    "failed to queue background shell completion: {error}"
+                                                ))),
+                                            );
+                                        }
+                                    }
+                                }
                                 Some(command) => {
                                     handle_active_turn_command(
                                         command,
@@ -3154,6 +3181,28 @@ pub(crate) fn observe_background_subagent_completion(
         });
     }
     true
+}
+
+/// Claim a terminal background shell task once; returns whether it is deliverable.
+pub(crate) fn observe_background_shell_completion(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    background_deliveries: &mut HashMap<String, BackgroundDelivery>,
+    outcome: &crate::tool::background::TaskOutcome,
+) -> bool {
+    let current_session_id = transcript
+        .lock()
+        .map(|recorder| recorder.session_id().to_string())
+        .unwrap_or_default();
+    if outcome.session_id.as_deref() != Some(current_session_id.as_str()) {
+        return false;
+    }
+    if crate::tool::background::take_observed(&outcome.task_id) {
+        return false;
+    }
+    background_deliveries
+        .entry(outcome.task_id.clone())
+        .or_default()
+        .mark_notified()
 }
 
 pub(crate) fn format_background_shell_completion(

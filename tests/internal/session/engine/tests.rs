@@ -2889,6 +2889,220 @@ max_output_tokens = 4096
     }
 
     #[tokio::test]
+    async fn a_background_shell_result_arriving_during_an_active_turn_continues_the_turn() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let stub = tokio::spawn(serve_responses_stub(listener));
+
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("letcode.toml");
+            let sessions_dir = directory.path().join("sessions");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+active_provider = "test"
+
+[global]
+sessions_dir = "{}"
+
+[providers.test]
+protocol = "responses"
+default_model = "model"
+[providers.test.auth]
+type = "bearer"
+credential = "test-key"
+[providers.test.endpoints]
+base_url = "http://{address}"
+[providers.test.models.model]
+# Retains the pre-recorded history, so historian work stays out of the turn.
+context_window = 128000
+effective_input_limit_tokens = 64000
+[providers.test.models.model.capabilities]
+tools = true
+[providers.test.models.model.capabilities.generation]
+max_output_tokens = true
+[providers.test.models.model.generation]
+max_output_tokens = 4096
+"#,
+                    toml_path(&sessions_dir)
+                ),
+            )
+            .unwrap();
+            let config = AppConfig::load_from_path(&config_path).expect("config");
+
+            let mut recorder = TranscriptRecorder::create(&sessions_dir).unwrap();
+            recorder.record_session_started("test/model").unwrap();
+            recorder.record_user_message("earlier prompt").unwrap();
+            recorder.record_assistant_message("earlier answer").unwrap();
+            let session_id = recorder.session_id().to_string();
+            let transcript = Arc::new(StdMutex::new(recorder));
+
+            let route = ModelRoute::new("test", "model");
+            let primary_factory =
+                Arc::new(ConfiguredPrimaryRouteFactory::new_with_runtime_catalog(
+                    config.providers.clone(),
+                    config.global.retry.clone(),
+                    config.runtime_catalog.clone(),
+                ));
+            let mut agent = Agent::new("model", None, None);
+            agent.apply_prepared_route(primary_factory.prepare_route(route).unwrap());
+            agent.set_primary_route_factory(primary_factory);
+            agent
+                .try_register_tool(HoldingTool {
+                    release: Some(Arc::clone(&release)),
+                })
+                .expect("register the holding tool");
+            crate::configure_agent_runtime_snapshot_provider(&mut agent, &transcript);
+
+            let settings =
+                crate::session_engine_config(&config, Default::default(), String::new(), None);
+            let (mut engine, _) =
+                SessionEngine::start(agent, transcript.clone(), "model".into(), settings).unwrap();
+            let ingress = engine.take_ingress();
+            let mut events = engine.take_event_egress().into_receiver();
+
+            let mut errors = Vec::new();
+            ingress
+                .submit(SessionCommand::SubmitPrompt(
+                    crate::user_content::UserMessageSubmission::new(
+                        "prompt-1",
+                        crate::user_content::UserMessageContent::new("first prompt", Vec::new()),
+                    ),
+                ))
+                .unwrap();
+
+            // The held tool call keeps the turn running for the rest of the test.
+            let barrier = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut barrier_error = None;
+            loop {
+                match open_tool_call_batch_recorded(&transcript) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => barrier_error = Some(error.to_string()),
+                }
+                if tokio::time::Instant::now() >= barrier {
+                    panic!(
+                        "the stub tool call never reached the transcript: {barrier_error:?}; errors: {errors:?}"
+                    );
+                }
+                while let Ok(event) = events.try_recv() {
+                    if let SessionTransportEvent::Error(error) = event {
+                        errors.push(observed_error(&error));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            ingress
+                .submit_transitional(SessionEngineCommand::BackgroundShellCompleted {
+                    outcome: crate::tool::background::TaskOutcome {
+                        task_id: "bg-1".into(),
+                        session_id: Some(session_id.clone()),
+                        command: "sleep 1".into(),
+                        state: crate::tool::background::TaskState::Exited { code: Some(0) },
+                        duration_ms: 1_000,
+                        output_bytes: 12,
+                        output_path: None,
+                        preview: "shell output".into(),
+                    },
+                })
+                .unwrap();
+
+            let mut continued = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                let records = read_records(transcript.lock().unwrap().path()).unwrap();
+                continued = records.iter().any(|record| {
+                    matches!(
+                        &record.event,
+                        TranscriptEvent::InternalContinuation {
+                            source: crate::transcript::InternalContinuationSource::ShellCompletion,
+                            ..
+                        }
+                    )
+                });
+                if continued {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                continued,
+                "the shell completion must continue the active turn instead of waiting for it to end"
+            );
+
+            release.notify_one();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut records = Vec::new();
+            loop {
+                while let Ok(event) = events.try_recv() {
+                    if let SessionTransportEvent::Error(error) = event {
+                        errors.push(observed_error(&error));
+                    }
+                }
+                records = read_records(transcript.lock().unwrap().path()).unwrap();
+                let answered = records
+                    .iter()
+                    .any(|record| matches!(&record.event, TranscriptEvent::ToolCallFinished { .. }));
+                let expected_answer = records.iter().any(|record| {
+                    matches!(&record.event, TranscriptEvent::AssistantTurn(turn) if turn.text.as_deref() == Some(STUB_ANSWER))
+                });
+                if (answered && expected_answer)
+                    || errors
+                        .iter()
+                        .any(|error| error.contains("orphan tool output"))
+                {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("the released tool call never continued the turn: {errors:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| error.contains("orphan tool output")),
+                "{errors:?}"
+            );
+            let history =
+                crate::transcript::transcript_projection::restore_session_history_projection(&records);
+            crate::protocol_frames::validate_history_items_complete(&history, None)
+                .expect("the recorded turn stays projectable");
+            let output = history
+                .iter()
+                .position(|item| {
+                    matches!(
+                        item,
+                        crate::request_builder::HistoryItem::ToolOutput { call_id, .. }
+                            if call_id == "call-1"
+                    )
+                })
+                .expect("tool output");
+            let notice = history
+                .iter()
+                .position(|item| {
+                    matches!(
+                        item,
+                        crate::request_builder::HistoryItem::InternalContinuation { .. }
+                    )
+                })
+                .expect("shell completion notice");
+            assert!(output < notice, "{history:?}");
+
+            ingress.shutdown().unwrap();
+            engine.join().await.unwrap();
+            stub.abort();
+        })
+        .await
+        .expect("background shell completion during an active turn timed out");
+    }
+
+    #[tokio::test]
     async fn local_and_peer_inputs_wait_for_the_active_turn_and_keep_fifo_order() {
         for peer_first in [false, true] {
             check_queued_inputs(peer_first, None).await;
