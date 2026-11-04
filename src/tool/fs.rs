@@ -397,6 +397,16 @@ async fn read_file(args: Value, context: ToolExecutionContext) -> Result<ToolRes
     ))
 }
 
+fn image_bytes_match_mime(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
 pub(crate) fn supported_image_mime(path: &Path) -> Option<&'static str> {
     match path
         .extension()
@@ -426,6 +436,9 @@ async fn read_image_file(
     let bytes = fs::read(path)
         .await
         .with_context(|| format!("failed to read image {}", path.display()))?;
+    if !image_bytes_match_mime(mime, &bytes) {
+        bail!("image bytes do not match {mime}: {}", path.display());
+    }
     let display_path = display_workspace_relative(path)?;
     let label = path
         .file_name()

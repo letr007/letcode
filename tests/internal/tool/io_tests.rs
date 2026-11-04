@@ -176,6 +176,45 @@ mod reads {
             let _ = std::fs::remove_file(path);
         }
 
+        #[tokio::test]
+        async fn fs_read_rejects_image_bytes_with_mismatched_signature() {
+            let path = std::env::temp_dir().join(format!(
+                "letcode-read-broken-image-{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            ));
+            std::fs::write(&path, b"\xEF\xBF\xBDPNG\r\n\x1a\r\n")
+                .expect("write broken png fixture");
+
+            let output = ToolRegistry::default_tools()
+                .call_with_context(
+                    "fs__read",
+                    json!({
+                        "path": path.to_string_lossy(),
+                        "offset": 1,
+                        "limit": 10,
+                    }),
+                    {
+                        let mut context = ToolExecutionContext::outside_workspace_granted();
+                        context.allow_tool_result_images = true;
+                        context
+                    },
+                )
+                .await;
+
+            assert!(!output.ok);
+            assert!(output.images.is_empty());
+            assert!(
+                output.error.as_ref().is_some_and(|error| error
+                    .message
+                    .contains("image bytes do not match image/png"))
+            );
+
+            let _ = std::fs::remove_file(path);
+        }
+
         #[cfg(unix)]
         #[tokio::test]
         async fn writable_leaf_symlinks_require_grants_and_preserve_the_resolved_leaf_identity() {
