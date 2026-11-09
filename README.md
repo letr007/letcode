@@ -16,7 +16,7 @@
   <a href="README.zh-CN.md">中文</a> | English
 </p>
 
-![letcode TUI](docs/letcode.png)
+<a href="docs/letcode-demo.mp4"><img src="docs/letcode-demo.gif" alt="letcode demo"></a>
 
 letcode is a terminal coding Agent built for developer productivity. Powered by Ratatui, it offers an interactive terminal user interface (TUI), a line-based REPL CLI, automated single-shot batch processing, and a built-in standard Agent Client Protocol (ACP) server.
 

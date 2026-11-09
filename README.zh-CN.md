@@ -16,7 +16,7 @@
   中文 | <a href="README.md">English</a>
 </p>
 
-![letcode TUI](docs/letcode.png)
+<a href="docs/letcode-demo.mp4"><img src="docs/letcode-demo.gif" alt="letcode 演示视频"></a>
 
 letcode 是面向生产力打造的终端编程 Agent。它基于 Ratatui 构建了交互式终端界面（TUI），提供行命令式 REPL、自动化单次批处理调用，并内置标准 Agent Client Protocol（ACP）协议服务端。
 
