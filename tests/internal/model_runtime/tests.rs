@@ -698,7 +698,7 @@ mod integration_tests {
             BTreeMap::new(),
             BTreeMap::from([(
                 "user-agent".to_string(),
-                "codex_cli_rs/9.9.9 (Plan9; vax) vt100/1".to_string(),
+                "codex_cli_rs/9.9.9 (Plan9; vax) vt100/1 (codex_cli_rs; 9.9.9)".to_string(),
             )]),
         ];
         for headers in &sent {
@@ -724,7 +724,9 @@ mod integration_tests {
             seen[0]
         );
         assert!(
-            seen[1].contains("user-agent: codex_cli_rs/9.9.9 (plan9; vax) vt100/1"),
+            seen[1].contains(
+                "user-agent: codex_cli_rs/9.9.9 (plan9; vax) vt100/1 (codex_cli_rs; 9.9.9)"
+            ),
             "{}",
             seen[1]
         );

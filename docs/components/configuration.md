@@ -410,15 +410,15 @@ reasoning_effort = "medium"
 timezone = "Asia/Shanghai"
 
 [fake.codex]
-version = "0.153.4"
+version = "0.167.2"
 originator = "Codex Desktop"
 sandbox = "none"
 sandbox_mode = "danger-full-access"
 shell = "zsh"
 
 [fake.claude]
-version = "2.1.285"
-package_version = "0.74.0"
+version = "2.1.322"
+package_version = "0.128.0"
 timeout = "600"
 ```
 

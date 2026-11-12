@@ -222,7 +222,7 @@ namespace = "my-cache"
 # timezone = "Asia/Shanghai"             # IANA 名
 # date = "2026-09-12"                    # 省略则按本机时钟在该时区换算
 # [fake.codex]                           # Codex Responses 剖面
-# version = "0.153.4"
+# version = "0.167.2"
 # originator = "Codex Desktop"
 # os = "Mac OS 26.4.1"
 # arch = "aarch64"
@@ -242,9 +242,9 @@ namespace = "my-cache"
 # [fake.codex.extra]                     # 自由键值，上限 16 项
 # custom_flag = "1"
 # [fake.claude]                          # Claude Code Messages 剖面
-# version = "2.1.69"
-# package_version = "0.74.0"
-# runtime_version = "v22.16.0"
+# version = "2.1.322"
+# package_version = "0.128.0"
+# runtime_version = "v26.12.1"
 # timeout = "600"
 # os = "MacOS"
 # arch = "arm64"

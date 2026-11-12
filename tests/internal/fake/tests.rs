@@ -126,7 +126,10 @@ fn declared_values_win_over_derived_defaults() {
         .find(|(name, _)| name == "user-agent")
         .map(|(_, value)| value.as_str())
         .expect("user agent header");
-    assert_eq!(user_agent, "codex_cli_rs/9.9.9 (Plan9; vax) vt100/1");
+    assert_eq!(
+        user_agent,
+        "codex_cli_rs/9.9.9 (Plan9; vax) vt100/1 (codex_cli_rs; 9.9.9)"
+    );
     assert_eq!(context.current_date.as_deref(), Some("1999-01-01"));
     assert_eq!(context.timezone, "Asia/Shanghai");
 

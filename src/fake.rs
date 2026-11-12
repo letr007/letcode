@@ -166,7 +166,7 @@ pub const ENVIRONMENT_CONTEXT_MARKER: &str = "<environment_context>";
 
 /// Codex-typical values for attributes letcode has no equivalent for.
 mod defaults {
-    pub(super) const VERSION: &str = "0.149.1";
+    pub(super) const VERSION: &str = "0.167.2";
     pub(super) const ORIGINATOR: &str = "codex_exec";
     pub(super) const TERMINAL: &str = "ghostty/1.3.1";
     pub(super) const BETA_FEATURES: &[&str] = &["remote_compaction_v2"];
@@ -284,8 +284,14 @@ impl CodexRequestContext {
             (
                 "user-agent".into(),
                 format!(
-                    "{}/{} ({}; {}) {}",
-                    self.originator, self.version, self.os, self.arch, self.terminal
+                    "{}/{} ({}; {}) {} ({}; {})",
+                    self.originator,
+                    self.version,
+                    self.os,
+                    self.arch,
+                    self.terminal,
+                    self.originator,
+                    self.version
                 ),
             ),
             ("session-id".into(), self.session_id.clone()),
@@ -420,10 +426,10 @@ pub struct ClaudeRequestContext {
 /// Claude Code-typical values for attributes letcode has no equivalent for.
 mod claude_defaults {
     /// These values describe one published client, so they move together.
-    pub(super) const VERSION: &str = "2.1.285";
+    pub(super) const VERSION: &str = "2.1.322";
     pub(super) const BUILD: &str = "6bf";
-    pub(super) const PACKAGE_VERSION: &str = "0.127.0";
-    pub(super) const RUNTIME_VERSION: &str = "v26.3.0";
+    pub(super) const PACKAGE_VERSION: &str = "0.128.0";
+    pub(super) const RUNTIME_VERSION: &str = "v26.12.1";
     pub(super) const TIMEOUT: &str = "600";
     pub(super) const ENTRYPOINT: &str = "cli";
     pub(super) const APP: &str = "cli";
@@ -440,15 +446,9 @@ mod claude_defaults {
     pub(super) const BETAS: &[&str] = &[
         "claude-code-20250219",
         "interleaved-thinking-2025-05-14",
-        "thinking-token-count-2026-05-13",
         "context-management-2025-06-27",
-        "prompt-caching-scope-2026-01-05",
-        "mid-conversation-system-2026-04-07",
-        "per-turn-control-2026-07-01",
-        "mid-conversation-tool-changes-2026-07-01",
-        "effort-2025-11-24",
-        "dangerous-tool-use-2026-09-03",
-        "afk-mode-2026-01-31",
+        "thinking-token-count-2026-05-13",
+        "advanced-tool-use-2025-11-20",
     ];
 }
 
@@ -600,7 +600,11 @@ fn default_betas(permissions: PermissionMode) -> Vec<String> {
     let bypassed = permissions == PermissionMode::Yolo;
     claude_defaults::BETAS
         .iter()
-        .filter(|beta| !(bypassed && claude_defaults::AUTO_MODE_BETAS.contains(*beta)))
+        .chain(
+            claude_defaults::AUTO_MODE_BETAS
+                .iter()
+                .filter(|_| !bypassed),
+        )
         .map(|beta| (*beta).to_string())
         .collect()
 }
