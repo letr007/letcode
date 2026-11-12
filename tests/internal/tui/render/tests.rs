@@ -974,6 +974,33 @@ fn group_16_context_picker_renders_only_canonical_surviving_detail() {
 }
 
 #[test]
+fn config_tabs_keep_positions_when_the_selection_changes() {
+    use crate::tui::state::{ConfigTab, DialogItem, DialogKind, DialogState};
+
+    let mut rows = Vec::new();
+    for tab in ConfigTab::ALL {
+        let mut state = TuiState::default();
+        state.set_language(Some(crate::tui::i18n::Language::En));
+        let mut dialog = DialogState::new(
+            DialogKind::ConfigEditor,
+            "Configuration",
+            None,
+            vec![DialogItem::new("active_provider", "Active provider", None)],
+        );
+        dialog.config_tab = tab;
+        state.open_dialog(dialog);
+        let screen = config_screen_rows(&mut state, 100, 24);
+        rows.push(
+            screen
+                .into_iter()
+                .find(|row| row.contains("Overview") && row.contains("Advanced"))
+                .expect("tab row"),
+        );
+    }
+
+    assert!(rows.windows(2).all(|pair| pair[0] == pair[1]), "{rows:?}");
+}
+
 fn config_editor_renders_grouped_fields_and_footer() {
     let mut state = TuiState::default();
     let items = vec![

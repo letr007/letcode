@@ -1281,20 +1281,25 @@ fn render_config_tabs(
     state: &TuiState,
     dialog: &DialogState,
 ) {
+    let labels = ConfigTab::ALL.map(|tab| state.t(tab.label_key()));
+    let slot_width = labels
+        .iter()
+        .map(|label| display_width(label))
+        .max()
+        .unwrap_or(0)
+        + 2;
     let mut spans = Vec::new();
-    for tab in ConfigTab::ALL {
-        if !spans.is_empty() {
-            spans.push(Span::styled("   ", muted_style(theme)));
-        }
-        let label = state.t(tab.label_key());
-        if tab == dialog.config_tab {
-            spans.push(Span::styled(
-                format!(" {label} "),
-                selected_item_style(theme),
-            ));
+    for (tab, label) in ConfigTab::ALL.into_iter().zip(labels) {
+        let padding = slot_width.saturating_sub(display_width(&label));
+        let left = padding / 2;
+        let right = padding - left;
+        let text = format!("{}{}{}", " ".repeat(left), label, " ".repeat(right));
+        let style = if tab == dialog.config_tab {
+            selected_item_style(theme)
         } else {
-            spans.push(Span::styled(label, muted_style(theme)));
-        }
+            muted_style(theme)
+        };
+        spans.push(Span::styled(text, style));
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(theme.elevated_style()),

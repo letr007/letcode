@@ -378,6 +378,16 @@ impl ConfigTab {
         }
     }
 
+    pub fn index(self) -> usize {
+        match self {
+            Self::Overview => 0,
+            Self::Providers => 1,
+            Self::Agents => 2,
+            Self::Mcp => 3,
+            Self::Advanced => 4,
+        }
+    }
+
     pub fn root_path(self) -> &'static [&'static str] {
         match self {
             Self::Overview | Self::Advanced => &[],
@@ -639,6 +649,8 @@ pub struct DialogState {
     pub expert_primary_selected_agent: Option<String>,
     pub config_fields: Vec<ConfigFieldRef>,
     pub config_tab: ConfigTab,
+    pub config_tab_paths: [Vec<String>; 5],
+    pub config_tab_selected: [usize; 5],
     pub config_searching: bool,
     pub config_path: Vec<String>,
     pub config_selected: Vec<usize>,
@@ -1206,6 +1218,8 @@ impl DialogState {
             expert_primary_selected_agent: None,
             config_fields: Vec::new(),
             config_tab: ConfigTab::default(),
+            config_tab_paths: std::array::from_fn(|_| Vec::new()),
+            config_tab_selected: [0; 5],
             config_searching: false,
             config_path: Vec::new(),
             config_selected: Vec::new(),

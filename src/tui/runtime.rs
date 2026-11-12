@@ -3900,15 +3900,13 @@ impl TuiRuntime {
         query: &str,
     ) -> (Vec<DialogItem>, Vec<ConfigFieldRef>) {
         let needle = query.to_lowercase();
-        let modified_only = needle == "@modified";
         let baseline = self.config_baseline_document();
         let mut items = Vec::new();
         let mut fields = Vec::new();
         for entry in crate::config::config_entries_in(document) {
             let modified = Self::config_field_modified(document, baseline.as_ref(), &entry.path);
             if !Self::config_entry_visible(document, &entry.path)
-                || (modified_only && !modified)
-                || (!modified_only && !entry.path.join(".").to_lowercase().contains(&needle))
+                || !entry.path.join(".").to_lowercase().contains(&needle)
             {
                 continue;
             }
@@ -4820,14 +4818,26 @@ impl TuiRuntime {
 
     fn enter_config_table(&mut self, path: Vec<String>) {
         if let Some(dialog) = self.state.dialog_mut() {
-            if let Some(tab) = ConfigTab::for_path(&path) {
+            let target = ConfigTab::for_path(&path);
+            let switching = target.is_some_and(|tab| tab != dialog.config_tab);
+            let old_index = dialog.config_tab.index();
+            dialog.config_tab_paths[old_index] = dialog.config_path.clone();
+            dialog.config_tab_selected[old_index] = dialog.selected;
+            if switching {
+                dialog.config_selected.clear();
+            } else {
+                dialog.config_selected.push(dialog.selected);
+            }
+            if let Some(tab) = target {
                 dialog.config_tab = tab;
             }
-            dialog.config_selected.push(dialog.selected);
             dialog.config_path = path;
             dialog.selected = 0;
             dialog.query.clear();
             dialog.config_searching = false;
+            let index = dialog.config_tab.index();
+            dialog.config_tab_paths[index] = dialog.config_path.clone();
+            dialog.config_tab_selected[index] = 0;
         }
         self.refresh_config_dialog();
         self.sync_config_dialog_description();
@@ -4839,9 +4849,14 @@ impl TuiRuntime {
         };
         let tab_root = Self::config_tab_path(dialog.config_tab);
         if dialog.config_tab != ConfigTab::Overview && dialog.config_path == tab_root {
+            let old_index = dialog.config_tab.index();
+            dialog.config_tab_paths[old_index] = dialog.config_path.clone();
+            dialog.config_tab_selected[old_index] = dialog.selected;
             dialog.config_tab = ConfigTab::Overview;
-            dialog.config_path.clear();
-            dialog.selected = dialog.config_selected.pop().unwrap_or(0);
+            let index = dialog.config_tab.index();
+            dialog.config_path = dialog.config_tab_paths[index].clone();
+            dialog.selected = dialog.config_tab_selected[index];
+            dialog.config_selected.clear();
             dialog.query.clear();
             dialog.config_searching = false;
             self.refresh_config_dialog();
@@ -4856,23 +4871,44 @@ impl TuiRuntime {
             dialog.config_path = tab_root;
         }
         dialog.selected = dialog.config_selected.pop().unwrap_or(0);
+        let index = dialog.config_tab.index();
+        dialog.config_tab_paths[index] = dialog.config_path.clone();
+        dialog.config_tab_selected[index] = dialog.selected;
         self.refresh_config_dialog();
         self.sync_config_dialog_description();
         true
     }
 
     fn select_config_tab(&mut self, tab: ConfigTab) {
+        if self
+            .state
+            .dialog()
+            .is_some_and(|dialog| dialog.config_tab == tab)
+        {
+            return;
+        }
         if let Some(dialog) = self.state.dialog_mut() {
+            let old_index = dialog.config_tab.index();
+            dialog.config_tab_paths[old_index] = dialog.config_path.clone();
+            dialog.config_tab_selected[old_index] = dialog.selected;
+            let index = tab.index();
             dialog.config_tab = tab;
-            dialog.config_path = Self::config_tab_path(tab);
+            let mut path = dialog.config_tab_paths[index].clone();
+            if path.is_empty() && !tab.root_path().is_empty() {
+                path = Self::config_tab_path(tab);
+            }
+            dialog.config_path = path;
+            dialog.selected = dialog.config_tab_selected[index];
             dialog.config_selected.clear();
-            dialog.selected = 0;
             dialog.query.clear();
             dialog.config_searching = false;
             dialog.config_expanded = None;
             dialog.config_detail_items.clear();
             dialog.config_detail_selected = 0;
             dialog.config_detail_target = None;
+            let index = dialog.config_tab.index();
+            dialog.config_tab_paths[index] = dialog.config_path.clone();
+            dialog.config_tab_selected[index] = dialog.selected;
         }
         self.refresh_config_dialog();
         self.sync_config_dialog_description();

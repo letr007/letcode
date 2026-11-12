@@ -6349,6 +6349,37 @@ fn config_editor_lists_every_provider_and_masks_credentials() {
 }
 
 #[test]
+fn config_editor_tabs_keep_each_tab_position() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    runtime
+        .handle_input_action(InputAction::ConfigNextTab)
+        .expect("switch to providers");
+    enter_config_table(&mut runtime, "alpha");
+    assert_eq!(
+        runtime.state().dialog().expect("dialog").config_path,
+        ["providers", "alpha"]
+    );
+
+    runtime
+        .handle_input_action(InputAction::ConfigNextTab)
+        .expect("switch to agents");
+    runtime
+        .handle_input_action(InputAction::ConfigPrevTab)
+        .expect("switch back to providers");
+
+    let dialog = runtime.state().dialog().expect("dialog");
+    assert_eq!(dialog.config_tab, ConfigTab::Providers);
+    assert_eq!(dialog.config_path, ["providers", "alpha"]);
+}
+
+#[test]
 fn config_editor_tabs_cycle_and_reset_uses_the_schema_default() {
     let mut runtime =
         runtime_with_config("active_provider = \"openai\"\n\n[global]\ntool_timeout_secs = 30\n");
