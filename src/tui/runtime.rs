@@ -3849,14 +3849,27 @@ impl TuiRuntime {
                 continue;
             }
             let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            let field = if Self::config_field_values(document, &path).is_some() {
+                if crate::config::field_is_array(&path_refs) {
+                    ConfigFieldRef::List(path.clone())
+                } else {
+                    ConfigFieldRef::Choice(path.clone())
+                }
+            } else {
+                ConfigFieldRef::NewField(path.clone())
+            };
+            let affordance = match field {
+                ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => "▸",
+                _ => "＋",
+            };
             let mut row = DialogItem::new(path.join("/"), name, None)
                 .with_description(Self::config_description(&self.state, &path_refs))
-                .with_right_detail("＋");
+                .with_right_detail(affordance);
             if let Some(section) = &section {
                 row = row.with_section(section.clone());
             }
             items.push(row);
-            fields.push(ConfigFieldRef::NewField(path));
+            fields.push(field);
         }
         let level_refs: Vec<&str> = level.iter().map(String::as_str).collect();
         if level.is_empty() {
@@ -4216,66 +4229,324 @@ impl TuiRuntime {
         }
     }
 
-    /// Fields whose siblings make them inapplicable stay out of the panel.
+    /// Fields whose siblings make them inapplicable stay out of the panel unless they
+    /// already hold a value; keeping those visible avoids trapping invalid configuration.
     fn config_entry_visible(document: &toml_edit::DocumentMut, path: &[String]) -> bool {
         if path.len() == 1 && path[0] == "fast_mode" {
             return false;
         }
+        Self::config_field_applicable(document, path) || Self::config_path_present(document, path)
+    }
+
+    fn config_field_applicable(document: &toml_edit::DocumentMut, path: &[String]) -> bool {
+        if path.len() == 2 && path[0] == "subagents" {
+            let swarm_only = matches!(
+                path[1].as_str(),
+                "max_depth"
+                    | "max_concurrent"
+                    | "max_descendants"
+                    | "max_pending_messages"
+                    | "max_message_bytes"
+                    | "run_timeout_secs"
+            );
+            if swarm_only {
+                return Self::config_text(document, &["subagents", "mode"]).as_deref()
+                    == Some("swarm");
+            }
+        }
+        if path.len() == 3
+            && path[0] == "global"
+            && path[1] == "session_archive"
+            && path[2] == "older_than_days"
+        {
+            return Self::config_bool(document, &["global", "session_archive", "enabled"])
+                .unwrap_or(true);
+        }
+        if path.len() == 3 && path[0] == "global" && path[1] == "retry" {
+            return Self::config_retry_field_applicable(document, None, &path[2]);
+        }
+        if path.len() == 4 && path[0] == "providers" && path[2] == "retry" {
+            return Self::config_retry_field_applicable(document, Some(&path[1]), &path[3]);
+        }
+        if path.len() == 4 && path[0] == "providers" && path[2] == "auth" {
+            let kind = Self::config_text(document, &["providers", &path[1], "auth", "type"]);
+            return match path[3].as_str() {
+                "name" => matches!(kind.as_deref(), Some("header" | "query")),
+                "credential" | "credential_env" => kind.as_deref() != Some("none"),
+                _ => true,
+            };
+        }
         if path.len() == 3 && path[0] == "mcp" {
-            let kind = crate::config::config_value_in(document, &["mcp", path[1].as_str(), "type"])
-                .map(|(_, value)| value);
+            let kind = Self::config_text(document, &["mcp", &path[1], "type"]);
             match path[2].as_str() {
                 "command" | "environment" | "env" => return kind.as_deref() != Some("remote"),
                 "url" | "headers" | "oauth" => return kind.as_deref() == Some("remote"),
                 _ => {}
             }
         }
-        if path.len() == 6
-            && path[0] == "providers"
-            && path[2] == "models"
-            && path[4] == "generation"
-        {
-            let flag = crate::config::config_value_in(
-                document,
-                &[
-                    "providers",
-                    path[1].as_str(),
-                    "models",
-                    path[3].as_str(),
-                    "capabilities",
-                    "generation",
-                    path[5].as_str(),
-                ],
-            )
-            .map(|(_, value)| value == "true")
-            .unwrap_or(false);
-            return flag;
-        }
-        if path.len() == 5
-            && path[0] == "providers"
-            && path[2] == "models"
-            && path[4] == "protocol_settings"
-        {
-            let protocol = crate::config::config_value_in(
-                document,
-                &[
-                    "providers",
-                    path[1].as_str(),
-                    "models",
-                    path[3].as_str(),
-                    "protocol",
-                ],
-            )
-            .or_else(|| {
-                crate::config::config_value_in(
+        if let Some((provider, model)) = Self::config_model_scope(path) {
+            if path.len() == 7 && path[4] == "capabilities" && path[5] == "generation" {
+                return Self::config_generation_capability_applicable(
+                    document, provider, model, &path[6],
+                );
+            }
+            if path.len() == 6 && path[4] == "capabilities" {
+                return Self::config_capability_applicable(document, provider, model, &path[5]);
+            }
+            if path.len() == 6 && path[4] == "generation" {
+                return Self::config_generation_field_applicable(
+                    document, provider, model, &path[5],
+                );
+            }
+            if path.len() == 5 && path[4] == "generation" {
+                return Self::config_generation_field_applicable(
                     document,
-                    &["providers", path[1].as_str(), "protocol"],
+                    provider,
+                    model,
+                    "temperature",
+                ) || [
+                    "top_p",
+                    "max_output_tokens",
+                    "stop_sequences",
+                    "reasoning_effort",
+                    "reasoning_efforts",
+                    "reasoning_summary",
+                    "text_verbosity",
+                    "parallel_tool_calls",
+                    "async_tools",
+                ]
+                .iter()
+                .any(|field| {
+                    Self::config_generation_field_applicable(document, provider, model, field)
+                });
+            }
+            if path.len() == 6 && path[4] == "transport" && path[5] == "websocket" {
+                let protocol = Self::config_model_protocol(document, provider, model);
+                return Self::config_protocol_allows(protocol.as_deref(), &["responses"]);
+            }
+            if path.len() == 5 && path[4] == "transport" {
+                let protocol = Self::config_model_protocol(document, provider, model);
+                return Self::config_protocol_allows(protocol.as_deref(), &["responses"]);
+            }
+            if path.len() == 6 && path[4] == "cache" {
+                let cache_enabled = Self::config_bool(
+                    document,
+                    &["providers", provider, "models", model, "cache", "enabled"],
                 )
-            })
-            .map(|(_, value)| value);
-            return protocol.as_deref() == Some("anthropic");
+                .unwrap_or(false);
+                return match path[5].as_str() {
+                    "namespace" => cache_enabled,
+                    "retention" => {
+                        let protocol = Self::config_model_protocol(document, provider, model);
+                        cache_enabled
+                            && Self::config_protocol_allows(protocol.as_deref(), &["responses"])
+                    }
+                    _ => true,
+                };
+            }
+            if path.len() == 5 && path[4] == "protocol_settings" {
+                let protocol = Self::config_model_protocol(document, provider, model);
+                return protocol.as_deref() == Some("anthropic");
+            }
         }
         true
+    }
+
+    fn config_path_present(document: &toml_edit::DocumentMut, path: &[String]) -> bool {
+        let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        crate::config::config_value_in(document, &refs).is_some()
+            || crate::config::config_array_in(document, &refs).is_some()
+            || Self::config_table(document, path).is_some()
+    }
+
+    fn config_bool(document: &toml_edit::DocumentMut, path: &[&str]) -> Option<bool> {
+        crate::config::config_value_in(document, path).and_then(|value| {
+            (value.0 == crate::config::ConfigEntryKind::Bool).then_some(value.1 == "true")
+        })
+    }
+
+    fn config_text(document: &toml_edit::DocumentMut, path: &[&str]) -> Option<String> {
+        crate::config::config_value_in(document, path).map(|value| value.1)
+    }
+
+    fn config_model_scope(path: &[String]) -> Option<(&str, &str)> {
+        (path.len() >= 5 && path[0] == "providers" && path[2] == "models")
+            .then(|| (path[1].as_str(), path[3].as_str()))
+    }
+
+    fn config_model_protocol(
+        document: &toml_edit::DocumentMut,
+        provider: &str,
+        model: &str,
+    ) -> Option<String> {
+        Self::config_text(
+            document,
+            &["providers", provider, "models", model, "protocol"],
+        )
+        .or_else(|| Self::config_text(document, &["providers", provider, "protocol"]))
+    }
+
+    fn config_protocol_allows(protocol: Option<&str>, allowed: &[&str]) -> bool {
+        protocol.is_none_or(|protocol| allowed.contains(&protocol))
+    }
+
+    fn config_retry_field_applicable(
+        document: &toml_edit::DocumentMut,
+        provider: Option<&str>,
+        field: &str,
+    ) -> bool {
+        let global_enabled =
+            Self::config_bool(document, &["global", "retry", "enabled"]).unwrap_or(true);
+        let global_backoff =
+            Self::config_bool(document, &["global", "retry", "exponential_backoff"])
+                .unwrap_or(true);
+        let (enabled, backoff) = if let Some(provider) = provider {
+            (
+                Self::config_bool(document, &["providers", provider, "retry", "enabled"])
+                    .unwrap_or(global_enabled),
+                Self::config_bool(
+                    document,
+                    &["providers", provider, "retry", "exponential_backoff"],
+                )
+                .unwrap_or(global_backoff),
+            )
+        } else {
+            (global_enabled, global_backoff)
+        };
+        match field {
+            "enabled" => true,
+            "backoff_multiplier" => enabled && backoff,
+            _ => enabled,
+        }
+    }
+
+    fn config_capability_applicable(
+        document: &toml_edit::DocumentMut,
+        provider: &str,
+        model: &str,
+        field: &str,
+    ) -> bool {
+        let tools = Self::config_bool(
+            document,
+            &[
+                "providers",
+                provider,
+                "models",
+                model,
+                "capabilities",
+                "tools",
+            ],
+        )
+        .unwrap_or(false);
+        match field {
+            "parallel_tool_calls" | "tool_result_images" => tools,
+            _ => true,
+        }
+    }
+
+    fn config_generation_capability_applicable(
+        document: &toml_edit::DocumentMut,
+        provider: &str,
+        model: &str,
+        field: &str,
+    ) -> bool {
+        let caps = |name: &str| {
+            Self::config_bool(
+                document,
+                &["providers", provider, "models", model, "capabilities", name],
+            )
+            .unwrap_or(false)
+        };
+        let protocol = Self::config_model_protocol(document, provider, model);
+        match field {
+            "reasoning" => caps("reasoning"),
+            "parallel_tool_calls" => caps("parallel_tool_calls"),
+            "reasoning_summary" => {
+                caps("reasoning")
+                    && Self::config_protocol_allows(protocol.as_deref(), &["responses"])
+            }
+            "stop_sequences" => Self::config_protocol_allows(
+                protocol.as_deref(),
+                &["completions", "anthropic", "jev"],
+            ),
+            "text_verbosity" => {
+                Self::config_protocol_allows(protocol.as_deref(), &["responses", "completions"])
+            }
+            _ => true,
+        }
+    }
+
+    fn config_generation_field_applicable(
+        document: &toml_edit::DocumentMut,
+        provider: &str,
+        model: &str,
+        field: &str,
+    ) -> bool {
+        let caps = |name: &str| {
+            Self::config_bool(
+                document,
+                &["providers", provider, "models", model, "capabilities", name],
+            )
+            .unwrap_or(false)
+        };
+        let generation = |name: &str| {
+            Self::config_bool(
+                document,
+                &[
+                    "providers",
+                    provider,
+                    "models",
+                    model,
+                    "capabilities",
+                    "generation",
+                    name,
+                ],
+            )
+            .unwrap_or(false)
+        };
+        let protocol = Self::config_model_protocol(document, provider, model);
+        match field {
+            "temperature" => generation("temperature"),
+            "top_p" => generation("top_p"),
+            "max_output_tokens" => generation("max_output_tokens"),
+            "stop_sequences" => {
+                generation("stop_sequences")
+                    && Self::config_protocol_allows(
+                        protocol.as_deref(),
+                        &["completions", "anthropic", "jev"],
+                    )
+            }
+            "reasoning_effort" | "reasoning_efforts" => {
+                caps("reasoning") && generation("reasoning")
+            }
+            "reasoning_summary" => {
+                caps("reasoning")
+                    && generation("reasoning_summary")
+                    && Self::config_protocol_allows(protocol.as_deref(), &["responses"])
+            }
+            "text_verbosity" => {
+                generation("text_verbosity")
+                    && Self::config_protocol_allows(
+                        protocol.as_deref(),
+                        &["responses", "completions"],
+                    )
+            }
+            "parallel_tool_calls" => {
+                caps("parallel_tool_calls") && generation("parallel_tool_calls")
+            }
+            "async_tools" => {
+                let strategy = Self::config_text(
+                    document,
+                    &["providers", provider, "models", model, "strategy"],
+                );
+                caps("tools")
+                    && strategy
+                        .as_deref()
+                        .is_none_or(|strategy| strategy == "astra")
+                    && Self::config_protocol_allows(protocol.as_deref(), &["responses"])
+            }
+            _ => true,
+        }
     }
 
     fn config_field_values(

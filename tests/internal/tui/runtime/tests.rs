@@ -6599,6 +6599,113 @@ fn config_editor_hides_fields_that_do_not_apply() {
 }
 
 #[test]
+fn config_editor_opens_choices_for_unset_enum_fields() {
+    let mut runtime = runtime_with_config("[permissions]\n");
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "permissions");
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let index = dialog
+        .items
+        .iter()
+        .position(|item| item.label == "mode")
+        .expect("mode field");
+    assert_eq!(dialog.items[index].right_detail.as_deref(), Some("▸"));
+    assert!(
+        matches!(
+            dialog.config_fields.get(index),
+            Some(ConfigFieldRef::Choice(path)) if path == &["permissions", "mode"]
+        ),
+        "unset enum fields open a choice list"
+    );
+}
+
+#[test]
+fn config_editor_hides_swarm_fields_in_expert_mode() {
+    for (mode, visible) in [("expert", false), ("swarm", true)] {
+        let mut runtime = runtime_with_config(&format!("[subagents]\nmode = \"{mode}\"\n"));
+        runtime.state_mut().set_input("/config");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("config command is accepted");
+        for _ in 0..4 {
+            runtime
+                .handle_input_action(InputAction::ConfigNextTab)
+                .expect("switch to advanced settings");
+        }
+        enter_config_table(&mut runtime, "subagents");
+        let labels = runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"mode"), "{labels:?}");
+        assert_eq!(labels.contains(&"max_depth"), visible, "{labels:?}");
+    }
+}
+
+#[test]
+fn config_editor_hides_auth_fields_for_none() {
+    let mut runtime = runtime_with_config(
+        "[providers.alpha]\nprotocol = \"responses\"\n\n[providers.alpha.auth]\ntype = \"none\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "providers");
+    enter_config_table(&mut runtime, "alpha");
+    enter_config_table(&mut runtime, "auth");
+    let labels = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"type"), "{labels:?}");
+    assert!(!labels.contains(&"name"), "{labels:?}");
+    assert!(!labels.contains(&"credential"), "{labels:?}");
+    assert!(!labels.contains(&"credential_env"), "{labels:?}");
+}
+
+#[test]
+fn config_editor_links_reasoning_generation_to_both_capabilities() {
+    let mut runtime = runtime_with_config(
+        "[providers.alpha]\nprotocol = \"responses\"\n\n[providers.alpha.models.m]\n\n[providers.alpha.models.m.capabilities]\nreasoning = true\n\n[providers.alpha.models.m.capabilities.generation]\nreasoning = true\n\n[providers.alpha.models.m.generation]\nreasoning_effort = \"medium\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "providers");
+    enter_config_table(&mut runtime, "alpha");
+    enter_config_table(&mut runtime, "models");
+    enter_config_table(&mut runtime, "m");
+    enter_config_table(&mut runtime, "generation");
+    let labels = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"reasoning_effort"), "{labels:?}");
+    assert!(!labels.contains(&"temperature"), "{labels:?}");
+    assert!(!labels.contains(&"stop_sequences"), "{labels:?}");
+}
+
+#[test]
 fn config_editor_only_offers_entries_where_the_schema_allows_them() {
     let mut runtime = runtime_with_config(
         "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n",

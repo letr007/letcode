@@ -47,6 +47,20 @@ pub fn field_schema(path: &[&str]) -> Option<(String, String)> {
     Some((description, key_path.join("/")))
 }
 
+pub fn field_is_array(path: &[&str]) -> bool {
+    let Some(root) = schema() else {
+        return false;
+    };
+    let mut node = root;
+    for segment in path {
+        let Some(child) = child_node(root, node, segment) else {
+            return false;
+        };
+        node = deref(root, child);
+    }
+    node.get("type").and_then(Value::as_str) == Some("array") || node.get("items").is_some()
+}
+
 pub fn field_enum(path: &[&str]) -> Option<Vec<String>> {
     let root = schema()?;
     let mut node = root;

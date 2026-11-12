@@ -126,8 +126,8 @@ pub(crate) use persistence::{acquire_config_lock, replace_file, resolve_config_t
 #[cfg(test)]
 pub use schema::schema_keys;
 pub use schema::{
-    default_display, default_value, entry_tables, field_enum, field_schema, schema_properties,
-    table_accepts_entries,
+    default_display, default_value, entry_tables, field_enum, field_is_array, field_schema,
+    schema_properties, table_accepts_entries,
 };
 pub(crate) use schema_gen::{SCHEMA_FILE, generate_schema};
 
