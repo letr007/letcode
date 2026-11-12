@@ -41,6 +41,15 @@ fn parses_language_aliases_and_values() {
 }
 
 #[test]
+fn parses_rename_title() {
+    assert_eq!(parse_command("/rename"), Ok(CommandIntent::Rename(None)));
+    assert_eq!(
+        parse_command("/rename Fix the parser"),
+        Ok(CommandIntent::Rename(Some("Fix the parser".into())))
+    );
+}
+
+#[test]
 fn parses_config_command() {
     assert_eq!(parse_command("/config"), Ok(CommandIntent::ConfigShow));
     assert_eq!(

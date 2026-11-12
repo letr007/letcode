@@ -6162,6 +6162,70 @@ fn config_command_opens_the_config_editor() {
 }
 
 #[test]
+fn rename_command_opens_prefilled_dialog_and_submits_title() {
+    let mut runtime = runtime();
+    runtime.session_title = Some("Old title".into());
+    runtime.state_mut().set_input("/rename");
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("rename command opens the dialog"),
+        None
+    );
+    let dialog = runtime.state().dialog().expect("rename dialog");
+    assert_eq!(dialog.kind, DialogKind::SessionRename);
+    assert_eq!(dialog.query, "Old title");
+
+    let len = runtime
+        .state()
+        .dialog()
+        .expect("rename dialog")
+        .query
+        .chars()
+        .count();
+    for _ in 0..len {
+        runtime
+            .handle_input_action(InputAction::DialogBackspace)
+            .expect("clear the prefill");
+    }
+    for ch in "New title".chars() {
+        runtime
+            .handle_input_action(InputAction::DialogInsert(ch))
+            .expect("type the new title");
+    }
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("submit the title"),
+        Some(RuntimeCommand::RenameSession("New title".into()))
+    );
+    assert!(!runtime.state().dialog_is_open());
+}
+
+#[test]
+fn rename_dialog_rejects_an_empty_title() {
+    let mut runtime = runtime();
+    runtime.state_mut().set_input("/rename");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("rename command opens the dialog");
+
+    assert_eq!(
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("empty title is refused"),
+        None
+    );
+    assert!(runtime.state().dialog_is_open());
+    assert_eq!(
+        runtime.state().toast().map(|toast| toast.message.as_str()),
+        Some(runtime.state().t("dialog.rename_empty").as_str())
+    );
+}
+
+#[test]
 fn config_editor_lists_grouped_fields() {
     let mut runtime = runtime_with_config(
         "active_provider = \"openai\"\n\n[providers.openai]\ndefault_model = \"gpt-5.5\"\n\n[permissions]\nmode = \"default\"\n",

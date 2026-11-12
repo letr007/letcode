@@ -365,6 +365,7 @@ pub enum DialogKind {
     FakePicker,
     LanguagePicker,
     SessionPicker,
+    SessionRename,
     ChildPicker,
     SessionDeleteConfirm,
     HistoryTree,
@@ -384,6 +385,7 @@ impl DialogKind {
             Self::ModelPicker
                 | Self::ExpertModelPicker(_)
                 | Self::SessionPicker
+                | Self::SessionRename
                 | Self::ChildPicker
                 | Self::HistoryTree
                 | Self::ContextPicker

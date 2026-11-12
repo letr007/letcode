@@ -48,6 +48,7 @@ pub enum SessionCommand {
     SetReasoningEffort(ModelReasoningEffort),
     SetFakeClient(Option<crate::fake::FakeClient>),
     ResumeSession(String),
+    RenameSession(String),
     NewSession,
     ToggleMcpServer(String),
     Interrupt,
@@ -70,7 +71,8 @@ impl SessionCommand {
             Self::SetPermissionMode(_)
             | Self::ToggleFastMode
             | Self::SetReasoningEffort(_)
-            | Self::SetFakeClient(_) => (true, ActiveTurnCommandDisposition::Defer),
+            | Self::SetFakeClient(_)
+            | Self::RenameSession(_) => (true, ActiveTurnCommandDisposition::Defer),
             Self::SetModel(_) | Self::SetExpertAllowedModels { .. } | Self::ToggleMcpServer(_) => {
                 (false, ActiveTurnCommandDisposition::Defer)
             }
@@ -128,6 +130,8 @@ impl SessionCommand {
                 Some(Self::SetFakeClient(client))
             }
             CommandIntent::Resume(id) => Some(Self::ResumeSession(id)),
+            CommandIntent::Rename(Some(title)) => Some(Self::RenameSession(title)),
+            CommandIntent::Rename(None) => None,
             CommandIntent::NewSession => Some(Self::NewSession),
             CommandIntent::Help
             | CommandIntent::Exit

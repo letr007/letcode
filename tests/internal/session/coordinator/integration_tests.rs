@@ -21,6 +21,46 @@ fn test_agent() -> Agent {
 }
 
 #[test]
+fn rename_records_title_and_announces_it() {
+    let transcript = temp_transcript();
+    let mut agent = test_agent();
+    let session_id = transcript
+        .lock()
+        .expect("recorder")
+        .session_id()
+        .to_string();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    assert_eq!(
+        SessionCoordinator::dispatch_idle_command(
+            SessionCommand::RenameSession("Renamed session".into()),
+            &mut agent,
+            &transcript,
+            &tx,
+            None,
+            &ChildLiveText::default(),
+        )
+        .expect("rename dispatch"),
+        IdleDispatch::Handled
+    );
+
+    let records = {
+        let recorder = transcript.lock().expect("recorder");
+        crate::transcript::read_records(recorder.path()).expect("read records")
+    };
+    assert!(matches!(
+        records.last().map(|record| &record.event),
+        Some(crate::transcript::TranscriptEvent::SessionTitle { title }) if title == "Renamed session"
+    ));
+    assert!(matches!(
+        rx.try_recv().expect("title event"),
+        SessionTransportEvent::SessionTitleUpdated { session_id: id, title }
+            if id == session_id && title == "Renamed session"
+    ));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn fast_mode_toggle_changes_memory_without_config_write() {
     let transcript = temp_transcript();
     let mut agent = test_agent();

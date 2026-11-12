@@ -48,6 +48,7 @@ pub(crate) enum SessionEngineCommand {
     SetReasoningEffort(crate::request_builder::ModelReasoningEffort),
     SetFakeClient(Option<crate::fake::FakeClient>),
     ResumeSession(String),
+    RenameSession(String),
     NewSession,
     ToggleMcpServer(String),
     #[cfg(test)]
@@ -87,6 +88,7 @@ impl SessionEngineCommand {
             SessionCommand::SetReasoningEffort(effort) => Self::SetReasoningEffort(effort),
             SessionCommand::SetFakeClient(client) => Self::SetFakeClient(client),
             SessionCommand::ResumeSession(session_id) => Self::ResumeSession(session_id),
+            SessionCommand::RenameSession(title) => Self::RenameSession(title),
             SessionCommand::NewSession => Self::NewSession,
             SessionCommand::ToggleMcpServer(server_name) => Self::ToggleMcpServer(server_name),
             SessionCommand::Interrupt => unreachable!("interrupt has its own ingress intent"),
@@ -154,6 +156,9 @@ pub(crate) fn session_engine_command_as_session_command(
         SessionEngineCommand::ResumeSession(session_id) => Some(
             crate::session::SessionCommand::ResumeSession(session_id.clone()),
         ),
+        SessionEngineCommand::RenameSession(title) => {
+            Some(crate::session::SessionCommand::RenameSession(title.clone()))
+        }
         SessionEngineCommand::NewSession => Some(crate::session::SessionCommand::NewSession),
         SessionEngineCommand::ToggleMcpServer(server_name) => Some(
             crate::session::SessionCommand::ToggleMcpServer(server_name.clone()),
@@ -335,6 +340,7 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         | SessionEngineCommand::ViewParent
         | SessionEngineCommand::ToggleFastMode
         | SessionEngineCommand::ResumeSession(_)
+        | SessionEngineCommand::RenameSession(_)
         | SessionEngineCommand::NewSession
         | SessionEngineCommand::ToggleMcpServer(_) => None,
         #[cfg(test)]

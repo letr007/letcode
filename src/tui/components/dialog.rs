@@ -28,6 +28,11 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
         return;
     };
 
+    if dialog.kind == DialogKind::SessionRename {
+        render_rename_dialog(frame, state, area, theme, &dialog);
+        return;
+    }
+
     if matches!(
         dialog.kind,
         DialogKind::ModelPicker
@@ -117,6 +122,60 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
         inner,
     );
 
+    picker::render_three_sided_frame(frame, dialog_area, theme);
+}
+
+fn render_rename_dialog(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    theme: Theme,
+    dialog: &DialogState,
+) {
+    let width = 60.min(area.width.saturating_sub(2)).max(1);
+    let height = 9.min(area.height.saturating_sub(2)).max(1);
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(Block::default().style(theme.elevated_style()), dialog_area);
+
+    let inner = dialog_area.inner(Margin::new(3, 2));
+    if inner.is_empty() {
+        return;
+    }
+
+    let query = if dialog.query.is_empty() {
+        Line::from(Span::styled(
+            state.t("dialog.rename_placeholder"),
+            muted_style(theme),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(dialog.query.clone(), item_style(theme)),
+            Span::styled("▌", accent_style(theme)),
+        ])
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            dialog.title.clone(),
+            dialog_title_style(theme),
+        )),
+        Line::default(),
+        query,
+        Line::default(),
+        Line::from(vec![
+            Span::styled("Enter", accent_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.confirm")), muted_style(theme)),
+            Span::styled("  ·  ", muted_style(theme)),
+            Span::styled("Esc", accent_style(theme)),
+            Span::styled(format!(" {}", state.t("ui.cancel")), muted_style(theme)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     picker::render_three_sided_frame(frame, dialog_area, theme);
 }
 

@@ -2757,6 +2757,7 @@ impl TuiRuntime {
             | crate::session::SessionCommand::ViewChild { .. }
             | crate::session::SessionCommand::ViewParent
             | crate::session::SessionCommand::ResumeSession(_)
+            | crate::session::SessionCommand::RenameSession(_)
             | crate::session::SessionCommand::NewSession
             | crate::session::SessionCommand::CancelQueuedPrompt(_)
             | crate::session::SessionCommand::Interrupt => {}
@@ -2803,6 +2804,7 @@ impl TuiRuntime {
             | crate::session::SessionCommand::ViewChild { .. }
             | crate::session::SessionCommand::ViewParent
             | crate::session::SessionCommand::ResumeSession(_)
+            | crate::session::SessionCommand::RenameSession(_)
             | crate::session::SessionCommand::NewSession
             | crate::session::SessionCommand::CancelQueuedPrompt(_)
             | crate::session::SessionCommand::Interrupt => {}
@@ -2935,6 +2937,7 @@ impl TuiRuntime {
                 | CommandIntent::TranscriptScrollbarSet(_)
                 | CommandIntent::PanelSet(_)
                 | CommandIntent::Theme(_)
+                | CommandIntent::Rename(_)
                 | CommandIntent::Fake(_))
         );
         if active_session_turn {
@@ -3163,6 +3166,7 @@ impl TuiRuntime {
             }
             CommandIntent::PanelSet(mode) => Ok(Some(self.handle_panel_command(mode))),
             CommandIntent::ResumeShow => self.show_resume_dialog(),
+            CommandIntent::Rename(None) => self.show_rename_dialog(),
             CommandIntent::ContextBrowse => self.show_context_dialog(),
             CommandIntent::McpBrowse => self.show_mcp_dialog(),
             CommandIntent::SkillBrowse => self.show_skill_dialog(),
@@ -3176,6 +3180,7 @@ impl TuiRuntime {
             | CommandIntent::Undo
             | CommandIntent::Redo
             | CommandIntent::Resume(_)
+            | CommandIntent::Rename(Some(_))
             | CommandIntent::NewSession
             | CommandIntent::Child(_) => unreachable!(
                 "backend-owned CommandIntent must map through SessionCommand::from_command_intent"
@@ -3230,6 +3235,9 @@ impl TuiRuntime {
                     RuntimeCommand::ResumeSession(session_id),
                 )))
             }
+            SessionCommand::RenameSession(title) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::RenameSession(title),
+            ))),
             SessionCommand::NewSession => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession)))
             }
@@ -4928,6 +4936,18 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    fn show_rename_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let mut dialog = DialogState::new(
+            DialogKind::SessionRename,
+            self.state.t("dialog.rename_title"),
+            None,
+            Vec::new(),
+        );
+        dialog.query = self.session_title.clone().unwrap_or_default();
+        self.state.open_dialog(dialog);
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
     fn show_session_delete_confirm(&mut self) -> Result<Option<RuntimeCommand>> {
         let Some((session_id, label)) = self.state.dialog().and_then(|dialog| {
             if dialog.kind != DialogKind::SessionPicker {
@@ -5337,6 +5357,23 @@ impl TuiRuntime {
     }
 
     fn handle_dialog_accept(&mut self) -> Result<Option<RuntimeCommand>> {
+        if let Some(dialog) = self.state.dialog()
+            && dialog.kind == DialogKind::SessionRename
+        {
+            let title = dialog
+                .query
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if title.is_empty() {
+                self.state
+                    .show_toast(self.state.t("dialog.rename_empty"), ToastKind::Info);
+                return Ok(None);
+            }
+            self.state.close_dialog();
+            return Ok(Some(RuntimeCommand::RenameSession(title)));
+        }
+
         let Some((kind, selected)) = self.state.dialog().and_then(|dialog| {
             dialog
                 .selected_item()
@@ -5453,6 +5490,9 @@ impl TuiRuntime {
             DialogKind::SessionPicker => {
                 self.state.close_dialog();
                 Ok(Some(RuntimeCommand::ResumeSession(selected.id)))
+            }
+            DialogKind::SessionRename => {
+                unreachable!("session rename is handled before selection")
             }
             DialogKind::SessionDeleteConfirm => {
                 self.state.close_dialog();

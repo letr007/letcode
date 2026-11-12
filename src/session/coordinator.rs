@@ -241,6 +241,27 @@ impl SessionCoordinator {
                 }
                 Ok(IdleDispatch::Handled)
             }
+            SessionCommand::RenameSession(title) => {
+                let (session_id, recorded) = {
+                    let mut recorder = transcript
+                        .lock()
+                        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+                    let session_id = recorder.session_id().to_string();
+                    (session_id, recorder.record_session_title(title.clone()))
+                };
+                match recorded {
+                    Ok(()) => {
+                        let _ = event_tx
+                            .send(SessionTransportEvent::SessionTitleUpdated { session_id, title });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                            format!("failed to rename session: {error}"),
+                        )));
+                    }
+                }
+                Ok(IdleDispatch::Handled)
+            }
             SessionCommand::SetReasoningEffort(effort) => {
                 if let Err(error) = apply_reasoning_effort(agent, transcript, effort.clone()) {
                     let message = error.to_string();
@@ -795,7 +816,8 @@ impl SessionCoordinator {
             | SessionCommand::SetReasoningEffort(_)
             | SessionCommand::SetFakeClient(_)
             | SessionCommand::ViewParent
-            | SessionCommand::ViewChild { .. } => CommandOwnership::IdleCoordinator,
+            | SessionCommand::ViewChild { .. }
+            | SessionCommand::RenameSession(_) => CommandOwnership::IdleCoordinator,
             SessionCommand::SubmitPrompt(_)
             | SessionCommand::CancelQueuedPrompt(_)
             | SessionCommand::Compact

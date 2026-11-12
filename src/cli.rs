@@ -1025,6 +1025,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::ConfigShow => ReplCommand::Unsupported(
             "CLI does not support /config; use the TUI to edit configuration.".into(),
         ),
+        CommandIntent::Rename(_) => ReplCommand::Unsupported(
+            "CLI does not support /rename; use the TUI to rename the session.".into(),
+        ),
         CommandIntent::Language(_) => ReplCommand::Unsupported(
             "Unsupported: /language and /lang are available only in the TUI.".into(),
         ),
@@ -1067,6 +1070,9 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
         ),
         SessionCommand::Compact => ReplCommand::Compact,
         SessionCommand::ResumeSession(session_id) => ReplCommand::Resume(session_id),
+        SessionCommand::RenameSession(_) => ReplCommand::Unsupported(
+            "CLI does not support /rename; use the TUI to rename the session.".into(),
+        ),
         SessionCommand::NewSession => ReplCommand::NewSession,
         SessionCommand::ShowHistoryTree => ReplCommand::ShowHistoryTree,
         SessionCommand::Undo | SessionCommand::Redo | SessionCommand::NavigateHistory { .. } => {

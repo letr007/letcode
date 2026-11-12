@@ -171,6 +171,7 @@ pub enum CommandIntent {
     Redo,
     ResumeShow,
     Resume(String),
+    Rename(Option<String>),
     NewSession,
     ContextBrowse,
     McpBrowse,
@@ -465,6 +466,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/rename",
+        insert_text: "/rename ",
+        description_key: "command.rename",
+        usage: "/rename [title]",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/new",
         insert_text: "/new",
         description_key: "command.new",
@@ -569,6 +579,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/undo" => expect_no_extra_args(&parts, "/undo", CommandIntent::Undo),
         "/redo" => expect_no_extra_args(&parts, "/redo", CommandIntent::Redo),
         "/resume" => parse_resume(&parts),
+        "/rename" => parse_rename(&parts),
         "/new" => expect_no_extra_args(&parts, "/new", CommandIntent::NewSession),
         "/context" => expect_no_extra_args(&parts, "/context", CommandIntent::ContextBrowse),
         "/mcp" => expect_no_extra_args(&parts, "/mcp", CommandIntent::McpBrowse),
@@ -769,6 +780,14 @@ fn parse_resume(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
         ["/resume"] => Ok(CommandIntent::ResumeShow),
         ["/resume", session_id] => Ok(CommandIntent::Resume((*session_id).to_string())),
         ["/resume", ..] => Err(CommandParseError::new("Usage: /resume <session_id>")),
+        _ => unreachable!(),
+    }
+}
+
+fn parse_rename(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/rename"] => Ok(CommandIntent::Rename(None)),
+        ["/rename", title @ ..] => Ok(CommandIntent::Rename(Some(title.join(" ")))),
         _ => unreachable!(),
     }
 }

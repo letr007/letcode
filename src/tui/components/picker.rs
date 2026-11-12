@@ -504,6 +504,9 @@ fn render_picker_body(
                     DialogKind::SessionDeleteConfirm => {
                         unreachable!("session delete confirmation uses the plain dialog")
                     }
+                    DialogKind::SessionRename => {
+                        unreachable!("session rename dialog has no items")
+                    }
                     DialogKind::ConfigEditor => render_config_row(
                         frame,
                         row,

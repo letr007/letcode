@@ -2006,6 +2006,7 @@ async fn run_engine_loop(
                     | SessionEngineCommand::ToggleFastMode
                     | SessionEngineCommand::SetReasoningEffort(_)
                     | SessionEngineCommand::SetFakeClient(_)
+                    | SessionEngineCommand::RenameSession(_)
                     | SessionEngineCommand::ViewChild { .. }
                     | SessionEngineCommand::ViewParent => {
                         // Idle commands are handled above via SessionCoordinator.
