@@ -1295,7 +1295,10 @@ fn render_config_tabs(
         let right = padding - left;
         let text = format!("{}{}{}", " ".repeat(left), label, " ".repeat(right));
         let style = if tab == dialog.config_tab {
-            selected_item_style(theme)
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.element_bg)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             muted_style(theme)
         };
