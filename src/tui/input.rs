@@ -43,6 +43,11 @@ pub enum InputAction {
     ConfigCollapse,
     ConfigListAppend,
     ConfigListRemove,
+    ConfigNextTab,
+    ConfigPrevTab,
+    ConfigStartSearch,
+    ConfigCancelSearch,
+    ConfigReset,
     SlashPanelNext,
     SlashPanelPrev,
     SlashPanelAccept,
@@ -169,11 +174,23 @@ fn config_editor_key_action(state: &TuiState, key: KeyEvent) -> InputAction {
             _ => InputAction::NoOp,
         };
     }
+    let searching = state
+        .dialog()
+        .is_some_and(|dialog| dialog.config_searching || !dialog.query.is_empty());
     match key.code {
         KeyCode::Up => InputAction::DialogPrev,
         KeyCode::Down => InputAction::DialogNext,
         KeyCode::Right | KeyCode::Enter => InputAction::DialogAccept,
+        KeyCode::Tab => InputAction::ConfigNextTab,
+        KeyCode::BackTab => InputAction::ConfigPrevTab,
+        KeyCode::Esc if searching => InputAction::ConfigCancelSearch,
         KeyCode::Esc => InputAction::DialogCancel,
+        KeyCode::Char('/') if !searching && !has_non_shift_modifiers(key.modifiers) => {
+            InputAction::ConfigStartSearch
+        }
+        KeyCode::Char('r') if !searching && !has_non_shift_modifiers(key.modifiers) => {
+            InputAction::ConfigReset
+        }
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             InputAction::ConfigSave
         }

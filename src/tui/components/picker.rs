@@ -11,8 +11,8 @@ use crate::tui::{
     components::tool_card::truncate_display_width,
     measure::{display_width, wrap_text_to_width},
     state::{
-        ConfigEditState, ConfigFieldRef, DialogItem, DialogKind, DialogState, SessionPickerScope,
-        TuiState,
+        ConfigEditState, ConfigFieldRef, ConfigTab, DialogItem, DialogKind, DialogState,
+        SessionPickerScope, TuiState,
     },
     theme::Theme,
 };
@@ -164,7 +164,12 @@ fn render_config_editor(
     let title = if confirming {
         state.t("config.unsaved")
     } else {
-        dialog.title.clone()
+        let breadcrumb = config_breadcrumb(state, dialog);
+        if breadcrumb.is_empty() {
+            dialog.title.clone()
+        } else {
+            format!("{}  ›  {breadcrumb}", dialog.title)
+        }
     };
     render_header(
         frame,
@@ -174,9 +179,24 @@ fn render_config_editor(
     );
     let footer_y = inner.bottom().saturating_sub(1);
     let gap = u16::from(inner.height >= 12);
-    let mut y = inner.y.saturating_add(1).saturating_add(gap);
+    let mut y = inner.y.saturating_add(1);
+    if !confirming {
+        render_config_tabs(
+            frame,
+            Rect::new(inner.x, y, inner.width, 1),
+            theme,
+            state,
+            dialog,
+        );
+        y = y.saturating_add(1).saturating_add(gap);
+    } else {
+        y = y.saturating_add(gap);
+    }
     let expanded = dialog.config_expanded.is_some();
-    let search = !confirming && !expanded && state.config_edit.is_none();
+    let search = !confirming
+        && !expanded
+        && state.config_edit.is_none()
+        && (dialog.config_searching || !dialog.query.is_empty());
     let body_rows = if confirming {
         3
     } else if expanded {
@@ -356,7 +376,7 @@ fn render_search(
     dialog: &DialogState,
 ) {
     let text = if dialog.query.is_empty() {
-        Span::styled(state.t("ui.search"), muted_style(theme))
+        Span::styled(state.t("config.search_hint"), muted_style(theme))
     } else {
         Span::styled(dialog.query.clone(), item_style(theme))
     };
@@ -640,9 +660,12 @@ fn render_config_footer(frame: &mut Frame<'_>, area: Rect, theme: Theme, state: 
             ("Ctrl-S", state.t("ui.save")),
             (
                 "Esc",
-                state.t(if expanded {
+                state.t(if dialog.config_searching || !dialog.query.is_empty() {
+                    "ui.cancel"
+                } else if expanded {
                     "ui.collapse"
-                } else if dialog.config_path.is_empty() {
+                } else if dialog.config_path.is_empty() && dialog.config_tab == ConfigTab::Overview
+                {
                     "ui.close"
                 } else {
                     "ui.back"
@@ -661,6 +684,11 @@ fn render_config_footer(frame: &mut Frame<'_>, area: Rect, theme: Theme, state: 
     if !confirming && !editing && list_content {
         hints.push(("a", state.t("ui.add")));
         hints.push(("d", state.t("ui.remove")));
+    }
+    if !confirming && !editing && !expanded && !dialog.config_searching && dialog.query.is_empty() {
+        hints.push(("/", state.t("ui.search")));
+        hints.push(("Tab", state.t("ui.switch_tab")));
+        hints.push(("r", state.t("ui.reset")));
     }
     if !editing {
         hints.push(("↑/↓", state.t("ui.navigate")));
@@ -1222,6 +1250,58 @@ fn config_edit_text(edit: &ConfigEditState, width: usize) -> String {
     text
 }
 
+fn config_breadcrumb(state: &TuiState, dialog: &DialogState) -> String {
+    if dialog.config_searching || !dialog.query.is_empty() {
+        let search = state.t("ui.search");
+        if dialog.query.is_empty() {
+            return search;
+        }
+        return format!("{search} {}", dialog.query);
+    }
+    let root = dialog.config_tab.root_path();
+    let matches_root = dialog.config_path.len() >= root.len()
+        && root
+            .iter()
+            .zip(dialog.config_path.iter())
+            .all(|(expected, actual)| *expected == actual.as_str());
+    let rest = if matches_root {
+        &dialog.config_path[root.len()..]
+    } else {
+        &dialog.config_path[..]
+    };
+    let mut parts = vec![state.t(dialog.config_tab.label_key())];
+    parts.extend(rest.iter().cloned());
+    parts.join(" › ")
+}
+
+fn render_config_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &TuiState,
+    dialog: &DialogState,
+) {
+    let mut spans = Vec::new();
+    for tab in ConfigTab::ALL {
+        if !spans.is_empty() {
+            spans.push(Span::styled("   ", muted_style(theme)));
+        }
+        let label = state.t(tab.label_key());
+        if tab == dialog.config_tab {
+            spans.push(Span::styled(
+                format!(" {label} "),
+                selected_item_style(theme),
+            ));
+        } else {
+            spans.push(Span::styled(label, muted_style(theme)));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.elevated_style()),
+        area,
+    );
+}
+
 fn render_config_row(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1282,7 +1362,13 @@ fn render_config_row(
         content.height,
     );
 
-    let marker = if selected { "● " } else { "  " };
+    let marker = if selected {
+        "● "
+    } else if item.modified {
+        "• "
+    } else {
+        "  "
+    };
     let mut spans = vec![
         Span::styled(marker, row_style),
         Span::styled(item.label.clone(), row_style),

@@ -108,6 +108,30 @@ pub fn default_value(path: &[&str]) -> Option<toml_edit::Item> {
     item_from_schema(root, node)
 }
 
+pub fn default_display(path: &[&str]) -> Option<String> {
+    match default_value(path)? {
+        toml_edit::Item::Value(value) => value_display(&value),
+        _ => None,
+    }
+}
+
+fn value_display(value: &toml_edit::Value) -> Option<String> {
+    match value {
+        toml_edit::Value::String(text) => Some(text.value().to_string()),
+        toml_edit::Value::Integer(number) => Some(number.value().to_string()),
+        toml_edit::Value::Float(number) => Some(number.value().to_string()),
+        toml_edit::Value::Boolean(flag) => Some(flag.value().to_string()),
+        toml_edit::Value::Array(values) => Some(
+            values
+                .iter()
+                .filter_map(value_display)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        _ => None,
+    }
+}
+
 fn item_from_schema(root: &Value, node: &Value) -> Option<toml_edit::Item> {
     let node = deref(root, node);
     if let Some(default) = node.get("default").and_then(json_to_item) {

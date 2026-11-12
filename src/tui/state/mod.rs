@@ -274,6 +274,7 @@ pub struct DialogItem {
     pub section: Option<String>,
     pub right_detail: Option<String>,
     pub checked: bool,
+    pub modified: bool,
 }
 
 impl DialogItem {
@@ -286,7 +287,13 @@ impl DialogItem {
             section: None,
             right_detail: None,
             checked: false,
+            modified: false,
         }
+    }
+
+    pub fn with_modified(mut self, modified: bool) -> Self {
+        self.modified = modified;
+        self
     }
 
     pub fn with_description(mut self, description: Option<String>) -> Self {
@@ -326,6 +333,79 @@ pub enum ConfigFieldRef {
     NewField(Vec<String>),
     /// A sub-table the panel can enter and delete.
     Table(Vec<String>),
+}
+
+impl ConfigFieldRef {
+    pub fn path(&self) -> Option<&[String]> {
+        match self {
+            Self::Field(path)
+            | Self::Choice(path)
+            | Self::List(path)
+            | Self::ListItem(path, _)
+            | Self::NewField(path)
+            | Self::Table(path) => Some(path),
+            Self::NewEntry(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigTab {
+    #[default]
+    Overview,
+    Providers,
+    Agents,
+    Mcp,
+    Advanced,
+}
+
+impl ConfigTab {
+    pub const ALL: [Self; 5] = [
+        Self::Overview,
+        Self::Providers,
+        Self::Agents,
+        Self::Mcp,
+        Self::Advanced,
+    ];
+
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::Overview => "config.tab_overview",
+            Self::Providers => "config.tab_providers",
+            Self::Agents => "config.tab_agents",
+            Self::Mcp => "config.tab_mcp",
+            Self::Advanced => "config.tab_advanced",
+        }
+    }
+
+    pub fn root_path(self) -> &'static [&'static str] {
+        match self {
+            Self::Overview | Self::Advanced => &[],
+            Self::Providers => &["providers"],
+            Self::Agents => &["agents"],
+            Self::Mcp => &["mcp"],
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn for_path(path: &[String]) -> Option<Self> {
+        match path.first().map(String::as_str)? {
+            "providers" => Some(Self::Providers),
+            "agents" => Some(Self::Agents),
+            "mcp" => Some(Self::Mcp),
+            "global" | "permissions" | "subagents" | "tools" | "fake" => Some(Self::Advanced),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -558,6 +638,8 @@ pub struct DialogState {
     pub expert_primary_query: Option<String>,
     pub expert_primary_selected_agent: Option<String>,
     pub config_fields: Vec<ConfigFieldRef>,
+    pub config_tab: ConfigTab,
+    pub config_searching: bool,
     pub config_path: Vec<String>,
     pub config_selected: Vec<usize>,
     pub config_expanded: Option<usize>,
@@ -1123,6 +1205,8 @@ impl DialogState {
             expert_primary_query: None,
             expert_primary_selected_agent: None,
             config_fields: Vec::new(),
+            config_tab: ConfigTab::default(),
+            config_searching: false,
             config_path: Vec::new(),
             config_selected: Vec::new(),
             config_expanded: None,

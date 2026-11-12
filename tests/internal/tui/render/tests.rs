@@ -1002,6 +1002,8 @@ fn config_editor_renders_grouped_fields_and_footer() {
 
     assert!(rendered.contains("Provider"), "{rendered}");
     assert!(rendered.contains("Permission"), "{rendered}");
+    assert!(rendered.contains("Overview"), "{rendered}");
+    assert!(rendered.contains("Providers"), "{rendered}");
     assert!(rendered.contains("Enter"), "{rendered}");
 }
 

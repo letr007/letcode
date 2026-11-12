@@ -37,6 +37,7 @@
   "definitions": {
     "global": {
       "type": "object",
+      "description": "Session-wide limits, paths, input handling, retry policy, and transcript archiving.",
       "additionalProperties": false,
       "properties": {
         "max_iterations": {
@@ -53,7 +54,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 60,
-          "description": "Default timeout for ordinary tools in seconds. shell__exec keeps its own 300 second default."
+          "description": "Default timeout for ordinary tools in seconds. shell__exec keeps its own 120 second default."
         },
         "sessions_dir": {
           "type": "string",
@@ -75,6 +76,7 @@
           "description": "How new input received during an active turn is handled. `insert` closes the turn at the next tool batch boundary or at turn end and runs the input next; `queue` waits for the active turn to finish."
         },
         "compaction": {
+          "description": "History compaction.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -87,6 +89,7 @@
         },
         "retry": { "$ref": "#/definitions/retry" },
         "session_archive": {
+          "description": "Background archiving for idle session transcripts.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -110,7 +113,7 @@
       "description": "Physical retry policy. A provider level table inherits fields it does not declare from here.",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean", "default": true },
+        "enabled": { "description": "Retry failed requests. When false, the first failure is returned.", "type": "boolean", "default": true },
         "max_attempts": {
           "type": "integer",
           "minimum": 1,
@@ -131,13 +134,14 @@
           "default": 1,
           "description": "Delay before the first retry; the fixed delay when exponential_backoff = false."
         },
-        "exponential_backoff": { "type": "boolean", "default": true },
-        "backoff_multiplier": { "type": "number", "default": 2.0 },
-        "jitter_secs": { "type": "integer", "minimum": 0, "default": 1 }
+        "exponential_backoff": { "description": "Grow the delay by backoff_multiplier after each retry. When false, every retry waits initial_delay_secs.", "type": "boolean", "default": true },
+        "backoff_multiplier": { "description": "Growth factor applied to the delay after each retry when exponential_backoff is true.", "type": "number", "default": 2.0 },
+        "jitter_secs": { "description": "Maximum random extra delay added to each retry.", "type": "integer", "minimum": 0, "default": 1 }
       }
     },
     "permissions": {
       "type": "object",
+      "description": "Tool approval policy for the session.",
       "additionalProperties": false,
       "properties": {
         "mode": {
@@ -149,21 +153,23 @@
     },
     "tools": {
       "type": "object",
+      "description": "Per-tool behavior for the session.",
       "additionalProperties": false,
       "properties": {
         "parallelism": {
           "type": "object",
           "description": "Per-tool concurrency. It can only lower a tool that already allows parallel calls.",
-          "additionalProperties": { "enum": ["parallel", "exclusive"] }
+          "additionalProperties": { "description": "Concurrency for this tool: parallel or exclusive.", "enum": ["parallel", "exclusive"] }
         }
       }
     },
     "mcpServer": {
+      "description": "One MCP server. local runs a stdio command; remote connects to a URL.",
       "type": "object",
       "additionalProperties": false,
       "required": ["type"],
       "properties": {
-        "type": { "enum": ["local", "remote"] },
+        "type": { "description": "local runs command over stdio; remote connects to url over HTTP.", "enum": ["local", "remote"] },
         "enabled": {
           "type": "boolean",
           "default": true,
@@ -177,18 +183,18 @@
         },
         "command": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": { "description": "One argv element; the first element is the executable.", "type": "string", "minLength": 1 },
           "minItems": 1,
           "description": "Executable and arguments of a local stdio server. Required for type = \"local\"."
         },
         "environment": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": { "description": "Value of this environment variable for a local server.", "type": "string" },
           "description": "Environment variables passed to a local server. Aliased as `env`."
         },
         "env": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": { "description": "Value of this environment variable for a local server.", "type": "string" },
           "description": "Alias of `environment`."
         },
         "url": {
@@ -197,7 +203,7 @@
         },
         "headers": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": { "description": "Value of this request header for a remote server.", "type": "string" },
           "description": "Extra request headers for a remote server."
         },
         "oauth": {
@@ -250,7 +256,7 @@
           "type": "string",
           "enum": ["expert", "swarm"],
           "default": "expert",
-          "description": "Subagent execution mode."
+          "description": "expert lets the parent delegate to a named expert; swarm allows bounded recursive delegation in the session tree."
         },
         "max_depth": {
           "type": "integer",
@@ -307,11 +313,12 @@
       }
     },
     "agentRoute": {
+      "description": "Route for this expert. allowed_models lists the routes it may use; provider and model pin one default.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "provider": { "type": "string" },
-        "model": { "type": "string" },
+        "provider": { "description": "Provider key from [providers]. Must be set together with model.", "type": "string" },
+        "model": { "description": "Model key under the provider's [models]. Must be set together with provider.", "type": "string" },
         "allowed_models": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[^/]+/.+$" },
@@ -324,6 +331,7 @@
       }
     },
     "provider": {
+      "description": "One model provider. auth and endpoints are required.",
       "type": "object",
       "additionalProperties": false,
       "required": ["default_model", "auth", "endpoints"],
@@ -344,12 +352,12 @@
         "transport": { "$ref": "#/definitions/providerTransport" },
         "headers": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": { "description": "Value of this request header.", "type": "string" },
           "description": "Extra request headers. Reserved and duplicate headers are rejected."
         },
         "query": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": { "description": "Value of this query parameter.", "type": "string" },
           "description": "Extra query parameters. Reserved and duplicate keys are rejected."
         },
         "models": {
@@ -370,6 +378,7 @@
       "description": "Explicit provider profile. Never inferred from the provider or model name."
     },
     "auth": {
+      "description": "Request authentication for this provider.",
       "type": "object",
       "additionalProperties": false,
       "required": ["type"],
@@ -393,6 +402,7 @@
       }
     },
     "endpoints": {
+      "description": "Base URL and optional path or query overrides per protocol.",
       "type": "object",
       "additionalProperties": false,
       "required": ["base_url"],
@@ -412,6 +422,7 @@
       }
     },
     "endpointOverride": {
+      "description": "Path or query override for one protocol endpoint.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -421,27 +432,29 @@
         },
         "query": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": { "description": "Value of this query parameter.", "type": "string" },
           "description": "Query parameters appended to the endpoint."
         }
       }
     },
     "providerTransport": {
+      "description": "HTTP transport settings for this provider.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "connect_timeout_secs": { "type": "integer", "minimum": 1, "default": 10 },
-        "no_proxy_loopback": { "type": "boolean", "default": true }
+        "connect_timeout_secs": { "description": "TCP connect timeout in seconds.", "type": "integer", "minimum": 1, "default": 10 },
+        "no_proxy_loopback": { "description": "Bypass the proxy for loopback addresses.", "type": "boolean", "default": true }
       }
     },
     "model": {
+      "description": "One model route. Capabilities gate the generation defaults.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "display": { "type": "string", "description": "Human readable model label." },
         "strategy": { "$ref": "#/definitions/strategy" },
-        "context_window": { "type": "integer", "minimum": 1, "default": 262144 },
-        "effective_input_limit_tokens": { "type": "integer", "minimum": 1 },
+        "context_window": { "description": "Total context window in tokens.", "type": "integer", "minimum": 1, "default": 262144 },
+        "effective_input_limit_tokens": { "description": "Optional cap on the input budget. The budget derived from context_window is used when omitted.", "type": "integer", "minimum": 1 },
         "protocol": { "$ref": "#/definitions/protocol" },
         "model_override": {
           "type": "string",
@@ -449,6 +462,7 @@
         },
         "flavor": { "$ref": "#/definitions/flavor" },
         "transport": {
+          "description": "Per-model transport overrides.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -477,32 +491,33 @@
       "description": "Declared model capabilities. Every flag defaults to false, and only flags declared here may be used under [generation].",
       "additionalProperties": false,
       "properties": {
-        "tools": { "type": "boolean", "default": false },
-        "parallel_tool_calls": { "type": "boolean", "default": false },
-        "reasoning": { "type": "boolean", "default": false },
-        "input_images": { "type": "boolean", "default": false },
-        "tool_result_images": { "type": "boolean", "default": false },
-        "priority_service": { "type": "boolean", "default": false },
+        "tools": { "description": "Allow tool definitions and tool calls.", "type": "boolean", "default": false },
+        "parallel_tool_calls": { "description": "Allow multiple tool calls in one assistant turn.", "type": "boolean", "default": false },
+        "reasoning": { "description": "Allow reasoning output; required for reasoning_effort settings.", "type": "boolean", "default": false },
+        "input_images": { "description": "Accept image inputs.", "type": "boolean", "default": false },
+        "tool_result_images": { "description": "Accept images returned by tools.", "type": "boolean", "default": false },
+        "priority_service": { "description": "Use the provider's priority service tier.", "type": "boolean", "default": false },
         "generation": { "$ref": "#/definitions/generationCapabilities" }
       }
     },
     "generationCapabilities": {
+      "description": "Flags for the generation parameters this model accepts. A parameter under [generation] is rejected unless its flag is true.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "temperature": { "type": "boolean", "default": false },
-        "top_p": { "type": "boolean", "default": false },
-        "max_output_tokens": { "type": "boolean", "default": false },
-        "stop_sequences": { "type": "boolean", "default": false },
+        "temperature": { "description": "Allow generation.temperature.", "type": "boolean", "default": false },
+        "top_p": { "description": "Allow generation.top_p.", "type": "boolean", "default": false },
+        "max_output_tokens": { "description": "Allow generation.max_output_tokens.", "type": "boolean", "default": false },
+        "stop_sequences": { "description": "Allow generation.stop_sequences.", "type": "boolean", "default": false },
         "reasoning": {
           "type": "boolean",
           "default": false,
           "description": "Must also be true when reasoning_effort or reasoning_efforts is set."
         },
-        "reasoning_summary": { "type": "boolean", "default": false },
-        "text_verbosity": { "type": "boolean", "default": false },
-        "parallel_tool_calls": { "type": "boolean", "default": false },
-        "priority_service": { "type": "boolean", "default": false },
+        "reasoning_summary": { "description": "Allow generation.reasoning_summary.", "type": "boolean", "default": false },
+        "text_verbosity": { "description": "Allow generation.text_verbosity.", "type": "boolean", "default": false },
+        "parallel_tool_calls": { "description": "Allow generation.parallel_tool_calls.", "type": "boolean", "default": false },
+        "priority_service": { "description": "Allow the priority service tier for this model.", "type": "boolean", "default": false },
         "structured_output": {
           "enum": ["json_object", "json_schema"],
           "description": "json_schema constrains JSON syntax in the decoder; json_object only states the intent."
@@ -519,9 +534,9 @@
           "items": { "type": "string" },
           "description": "Tool names dispatched asynchronously. Requires the Astra strategy, protocol = \"responses\" and capabilities.tools = true."
         },
-        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
-        "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
-        "max_output_tokens": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "temperature": { "description": "Sampling temperature. Requires capabilities.generation.temperature = true.", "type": "number", "minimum": 0, "maximum": 2 },
+        "top_p": { "description": "Nucleus sampling probability. Requires capabilities.generation.top_p = true.", "type": "number", "minimum": 0, "maximum": 1 },
+        "max_output_tokens": { "description": "Maximum output tokens. Requires capabilities.generation.max_output_tokens = true.", "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "reasoning_effort": {
           "type": "string",
           "description": "none, minimal, low, medium, high, xhigh, max, or a provider specific value."
@@ -531,8 +546,8 @@
           "items": { "type": "string" },
           "description": "Reasoning levels the session may switch between for this model."
         },
-        "reasoning_summary": { "enum": ["auto", "concise", "detailed"] },
-        "text_verbosity": { "enum": ["low", "medium", "high"] },
+        "reasoning_summary": { "description": "Reasoning summary style. Requires capabilities.generation.reasoning_summary = true.", "enum": ["auto", "concise", "detailed"] },
+        "text_verbosity": { "description": "Output verbosity. Requires capabilities.generation.text_verbosity = true.", "enum": ["low", "medium", "high"] },
         "parallel_tool_calls": {
           "type": "boolean",
           "description": "Requires capabilities.parallel_tool_calls = true."
@@ -540,6 +555,7 @@
       }
     },
     "cache": {
+      "description": "Provider-native prompt cache settings.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -552,7 +568,7 @@
           "enum": ["in_memory", "24h"],
           "description": "Cache retention. 24h is Responses only and requires enabled = true."
         },
-        "namespace": { "type": "string" }
+        "namespace": { "description": "Prompt cache namespace. Defaults to the protocol name (completions or responses).", "type": "string" }
       }
     },
     "fake": {
@@ -561,6 +577,7 @@
       "additionalProperties": false,
       "properties": {
         "identity": {
+          "description": "Identity values reported while /fake is on. Missing values are generated per installation.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -568,16 +585,17 @@
               "type": "string",
               "description": "UUID reported as the client installation id; generated and persisted when omitted."
             },
-            "agent_name": { "type": "string" },
-            "account_uuid": { "type": "string" }
+            "agent_name": { "description": "Agent name in Codex turn metadata. Omitted when unset.", "type": "string" },
+            "account_uuid": { "description": "Account id reported by the Claude profile. Derived when omitted.", "type": "string" }
           }
         },
         "clock": {
+          "description": "Clock values reported while /fake is on.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "timezone": { "type": "string", "description": "IANA zone name, for example Asia/Shanghai." },
-            "date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
+            "date": { "description": "YYYY-MM-DD override. Derived from the real clock in the declared zone when omitted.", "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
           }
         },
         "codex": { "$ref": "#/definitions/fakeCodex" },
@@ -585,47 +603,49 @@
       }
     },
     "fakeCodex": {
+      "description": "Codex client profile reported while /fake codex is on. Unset fields use host values or the imitated client's defaults.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "version": { "type": "string" },
-        "originator": { "type": "string" },
-        "os": { "type": "string" },
-        "arch": { "type": "string" },
-        "terminal": { "type": "string" },
-        "beta_features": { "type": "array", "items": { "type": "string" } },
-        "sandbox": { "type": "string" },
-        "sandbox_mode": { "type": "string" },
-        "auto_review_enabled": { "type": "boolean" },
-        "node_repl_auto_review_required": { "type": "boolean" },
-        "node_repl_disabled": { "type": "boolean" },
-        "cwd": { "type": "string" },
-        "workspace": { "type": "string" },
-        "shell": { "type": "string" },
-        "git_commit_hash": { "type": "string" },
-        "git_remote_url": { "type": "string" },
-        "git_has_changes": { "type": "boolean" },
+        "version": { "description": "Client version in the user agent.", "type": "string" },
+        "originator": { "description": "Originator name in headers and turn metadata.", "type": "string" },
+        "os": { "description": "OS name reported to the provider. Host OS when omitted.", "type": "string" },
+        "arch": { "description": "CPU architecture reported to the provider. Host architecture when omitted.", "type": "string" },
+        "terminal": { "description": "Terminal name in the user agent. Detected terminal when omitted.", "type": "string" },
+        "beta_features": { "description": "Beta feature names sent in x-codex-beta-features.", "type": "array", "items": { "type": "string" } },
+        "sandbox": { "description": "Sandbox name in the environment context.", "type": "string" },
+        "sandbox_mode": { "description": "Sandbox mode in the environment context.", "type": "string" },
+        "auto_review_enabled": { "description": "Report auto review as enabled in turn metadata.", "type": "boolean" },
+        "node_repl_auto_review_required": { "description": "Report node REPL auto review as required in turn metadata.", "type": "boolean" },
+        "node_repl_disabled": { "description": "Report the node REPL as disabled in turn metadata.", "type": "boolean" },
+        "cwd": { "description": "Working directory in the environment context. Current directory when omitted.", "type": "string" },
+        "workspace": { "description": "Workspace path in the environment context. Defaults to cwd.", "type": "string" },
+        "shell": { "description": "Shell name in the environment context. Detected shell when omitted.", "type": "string" },
+        "git_commit_hash": { "description": "Git commit hash in the environment context. Read from the working tree when omitted.", "type": "string" },
+        "git_remote_url": { "description": "Git remote URL in the environment context. Read from the working tree when omitted.", "type": "string" },
+        "git_has_changes": { "description": "Whether the working tree has changes. Read from the working tree when omitted.", "type": "boolean" },
         "extra": {
           "type": "object",
           "description": "Extra turn metadata keys, at most 16, each up to 64 bytes and starting with an ASCII letter; values up to 128 bytes. Keys the turn already sets are rejected.",
           "maxProperties": 16,
           "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$" },
-          "additionalProperties": { "type": "string", "maxLength": 128 }
+          "additionalProperties": { "description": "Extra turn metadata value.", "type": "string", "maxLength": 128 }
         }
       }
     },
     "fakeClaude": {
+      "description": "Claude Code profile reported while /fake claude is on. Unset fields use the imitated client's published values.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "version": { "type": "string" },
-        "build": { "type": "string" },
-        "package_version": { "type": "string" },
-        "runtime_version": { "type": "string" },
-        "timeout": { "type": "string" },
-        "os": { "type": "string" },
-        "arch": { "type": "string" },
-        "betas": { "type": "array", "items": { "type": "string" } }
+        "version": { "description": "Client version in the user agent and billing header.", "type": "string" },
+        "build": { "description": "Build id in the billing header.", "type": "string" },
+        "package_version": { "description": "Value of x-stainless-package-version.", "type": "string" },
+        "runtime_version": { "description": "Value of x-stainless-runtime-version.", "type": "string" },
+        "timeout": { "description": "Value of x-stainless-timeout, in seconds.", "type": "string" },
+        "os": { "description": "Value of x-stainless-os. Host OS when omitted.", "type": "string" },
+        "arch": { "description": "Value of x-stainless-arch. Host architecture when omitted.", "type": "string" },
+        "betas": { "description": "Values of anthropic-beta. Defaults depend on the permission mode.", "type": "array", "items": { "type": "string" } }
       }
     }
   }

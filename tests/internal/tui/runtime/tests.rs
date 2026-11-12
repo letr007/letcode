@@ -6243,6 +6243,15 @@ fn config_editor_lists_grouped_fields() {
     assert!(labels.contains(&"active_provider"), "{labels:?}");
     assert!(labels.contains(&"providers"), "{labels:?}");
     assert!(labels.contains(&"permissions"), "{labels:?}");
+    assert!(
+        dialog
+            .items
+            .iter()
+            .find(|item| item.label == "providers")
+            .and_then(|item| item.description.as_deref())
+            .is_some_and(|text| !text.is_empty()),
+        "table rows carry their schema description"
+    );
 
     enter_config_table(&mut runtime, "permissions");
     let dialog = runtime.state().dialog().expect("config dialog");
@@ -6337,6 +6346,54 @@ fn config_editor_lists_every_provider_and_masks_credentials() {
         .expect("credential field");
     let display = credential.detail.as_deref().unwrap_or_default();
     assert!(!display.contains("secret-key"), "{display}");
+}
+
+#[test]
+fn config_editor_tabs_cycle_and_reset_uses_the_schema_default() {
+    let mut runtime =
+        runtime_with_config("active_provider = \"openai\"\n\n[global]\ntool_timeout_secs = 30\n");
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    assert_eq!(dialog.config_tab, ConfigTab::Overview);
+
+    search_config(&mut runtime, "tool_timeout_secs");
+    let index = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .position(|item| item.label == "tool_timeout_secs")
+        .expect("tool_timeout_secs field");
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::ConfigReset)
+        .expect("reset the field");
+
+    let document = runtime.config_draft.as_ref().expect("draft");
+    assert!(
+        document["global"]
+            .as_table()
+            .is_none_or(|table| !table.contains_key("tool_timeout_secs")),
+        "reset removes the explicit value"
+    );
+    assert!(runtime.state().dialog().expect("dialog").config_dirty);
+
+    runtime
+        .handle_input_action(InputAction::ConfigNextTab)
+        .expect("switch to the next tab");
+    assert_eq!(
+        runtime.state().dialog().expect("dialog").config_tab,
+        ConfigTab::Providers
+    );
 }
 
 #[test]
