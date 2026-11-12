@@ -1400,6 +1400,8 @@ pub struct TuiState {
     /// 底部 auto-scroll 时会把点击映射到全文顶部不可见区域。
     pub last_transcript_scroll_top: usize,
     pub last_scrollbar_area: ratatui::layout::Rect,
+    /// 最近一次软光标的屏幕坐标；draw 末尾把终端光标钉在这里，稳定 IME 预编辑位置。
+    pub composer_cursor_position: Option<(u16, u16)>,
     pub transcript_scrollbar_drag: Option<usize>,
     /// 拖拽选择期间最后一次鼠标位置，用于边缘自动滚动
     pub selection_last_mouse: Option<(u16, u16)>,
@@ -1502,6 +1504,7 @@ impl Default for TuiState {
             last_transcript_area: ratatui::layout::Rect::default(),
             last_transcript_scroll_top: 0,
             last_scrollbar_area: ratatui::layout::Rect::default(),
+            composer_cursor_position: None,
             transcript_scrollbar_drag: None,
             selection_last_mouse: None,
         }

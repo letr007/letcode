@@ -6628,19 +6628,32 @@ impl<'a> TerminalDrawer<'a> {
 
 impl RuntimeDrawer for TerminalDrawer<'_> {
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()> {
-        // Ratatui keeps the hardware cursor hidden for frames without a requested
-        // cursor. Avoid per-frame cursor moves here: some CJK IMEs follow the VT
-        // cursor even while hidden, which made their candidate window jitter.
+        // IMEs place preedit on the VT cursor, which Ratatui leaves on the last diffed cell.
+        // One synchronized update keeps the intermediate diff positions invisible.
         let terminal = self.terminal.terminal_mut();
-        let completed = terminal.draw(|frame| render::render(frame, state))?;
-        let overlay = super::transcript_ratatui::plan_hyperlink_overlay(
-            completed.buffer,
-            &self.applied_hyperlink_cells,
-            &state.frame_hyperlink_cells,
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::BeginSynchronizedUpdate
+        )?;
+        let result = (|| -> io::Result<()> {
+            let completed = terminal.draw(|frame| render::render(frame, state))?;
+            let overlay = super::transcript_ratatui::plan_hyperlink_overlay(
+                completed.buffer,
+                &self.applied_hyperlink_cells,
+                &state.frame_hyperlink_cells,
+            );
+            super::transcript_ratatui::write_hyperlink_overlay(terminal.backend_mut(), &overlay)?;
+            self.applied_hyperlink_cells = overlay.applied;
+            if let Some((x, y)) = state.composer_cursor_position {
+                terminal.set_cursor_position(ratatui::layout::Position::new(x, y))?;
+            }
+            Ok(())
+        })();
+        let ended = crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EndSynchronizedUpdate
         );
-        super::transcript_ratatui::write_hyperlink_overlay(terminal.backend_mut(), &overlay)?;
-        self.applied_hyperlink_cells = overlay.applied;
-        Ok(())
+        result.and(ended)
     }
 }
 

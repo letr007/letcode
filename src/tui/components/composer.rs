@@ -161,11 +161,12 @@ pub fn render_composer(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, 
     if let Some(permission) = &state.pending_permission {
         let translator = state.translator();
         let highlighted = state.pending_permission_choice.index();
-        if area.height < 3 || area.width < 16 {
-            render_pending_approval_tiny(frame, permission, area, theme, &translator);
+        let anchor = if area.height < 3 || area.width < 16 {
+            render_pending_approval_tiny(frame, permission, area, theme, &translator)
         } else {
-            render_pending_approval_panel(frame, permission, highlighted, area, theme, &translator);
-        }
+            render_pending_approval_panel(frame, permission, highlighted, area, theme, &translator)
+        };
+        state.composer_cursor_position = anchor;
         return;
     }
 
@@ -398,7 +399,7 @@ fn render_pending_approval_tiny(
     area: Rect,
     theme: Theme,
     translator: &crate::tui::i18n::Translator,
-) {
+) -> Option<(u16, u16)> {
     let bar_style = surface::accent_style(
         theme,
         surface::SurfaceEmphasis::Approval,
@@ -416,6 +417,7 @@ fn render_pending_approval_tiny(
         ),
     ]);
     frame.render_widget(Paragraph::new(line).style(element_style), area);
+    Some((area.x.saturating_add(2), area.y))
 }
 
 fn render_pending_approval_panel(
@@ -425,11 +427,11 @@ fn render_pending_approval_panel(
     area: Rect,
     theme: Theme,
     translator: &crate::tui::i18n::Translator,
-) {
+) -> Option<(u16, u16)> {
     let Some(shell) =
         render_connected_prompt_shell(frame, area, theme, surface::SurfaceEmphasis::Approval, 1)
     else {
-        return;
+        return None;
     };
 
     let pending_style = surface::surface_style(theme, surface::SurfaceKind::Element);
@@ -470,6 +472,7 @@ fn render_pending_approval_panel(
             translator,
         );
     }
+    Some((shell.content_area.x, shell.content_area.y))
 }
 
 fn render_child_read_only_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
@@ -803,16 +806,16 @@ fn render_panel_composer_cursor(
 
 fn render_composer_cursor_block(
     frame: &mut Frame<'_>,
-    _state: &mut TuiState,
+    state: &mut TuiState,
     cursor_area: Rect,
     theme: Theme,
     pulse: ComposerCursorPulse,
 ) {
     let _ = theme;
+    state.composer_cursor_position = Some((cursor_area.x, cursor_area.y));
     if let Some(cell) = frame.buffer_mut().cell_mut((cursor_area.x, cursor_area.y)) {
         cell.set_style(Style::default().bg(pulse.bg).fg(pulse.fg));
     }
-    // Soft caret remains buffer-only so terminal cursor movement cannot disturb IME popups.
 }
 
 /// Soft pulse driven by the shared tick clock. Spinner only advances on Tick now,

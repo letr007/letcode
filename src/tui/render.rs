@@ -102,6 +102,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     state.last_sidebar_context_header = Rect::default();
     state.last_sidebar_mcp_header = Rect::default();
     state.last_sidebar_todos_header = Rect::default();
+    state.composer_cursor_position = None;
     let theme = state.theme();
     let area = frame.area();
     state.last_terminal_width = area.width;

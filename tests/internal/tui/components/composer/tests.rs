@@ -267,6 +267,10 @@ fn pending_permission_takes_over_composer_surface() {
     );
     assert!(!rendered.contains("message letcode"), "{rendered}");
     assert!(!rendered.contains("args"), "{rendered}");
+    assert!(
+        state.composer_cursor_position.is_some(),
+        "接管输入区的审批面板必须给出 IME 锚点"
+    );
 }
 
 #[test]
