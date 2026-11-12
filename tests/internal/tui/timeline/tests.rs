@@ -557,6 +557,73 @@ fn active_subagents_carry_the_delegation_title() {
 }
 
 #[test]
+fn cancelled_background_subagent_leaves_the_task_section() {
+    let mut timeline = Timeline::new();
+    timeline.push_tool_started(ToolStartedEvent {
+        call_id: "background-call".into(),
+        name: "agent__explore".into(),
+        summary: "explore in background".into(),
+        arguments: Some(json!({"task": "inspect cancellation", "background": true}).to_string()),
+    });
+    assert!(
+        timeline.push_tool_finished(ToolFinishedEvent {
+            call_id: "background-call".into(),
+            name: "agent__explore".into(),
+            summary: "explorer running".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "ok": true,
+                    "tool": "agent__explore",
+                    "data": {
+                        "run_id": "run-cancelled",
+                        "child_session_id": "child-cancelled",
+                        "agent_name": "explorer",
+                        "status": "running",
+                        "summary": "inspect cancellation",
+                        "active": true,
+                        "background": true
+                    }
+                })
+                .to_string(),
+            ),
+        })
+    );
+    assert_eq!(timeline.active_subagents().len(), 1);
+
+    let result = crate::subagent::SubagentRunSummary {
+        run_id: "run-cancelled".into(),
+        child_session_id: "child-cancelled".into(),
+        agent_name: "explorer".into(),
+        status: crate::subagent::SubagentStatus::Cancelled,
+        failure_kind: None,
+        summary: "explorer cancelled".into(),
+        structured_result: crate::subagent::StructuredSubagentResult {
+            status: "cancelled".into(),
+            summary: "explorer cancelled".into(),
+            malformed: false,
+            findings: Vec::new(),
+            files_read: Vec::new(),
+            files_changed: Vec::new(),
+            commands_run: Vec::new(),
+            validation: Vec::new(),
+            blockers: Vec::new(),
+            next_steps: Vec::new(),
+            run_id: "run-cancelled".into(),
+            child_session_id: "child-cancelled".into(),
+            raw_excerpt: None,
+        },
+    };
+
+    assert!(timeline.finish_background_subagent_tool("background-call", &result));
+    assert!(timeline.active_subagents().is_empty());
+    assert!(matches!(
+        timeline.items().first(),
+        Some(TimelineItem::Tool(tool)) if tool.status == ToolExecutionStatus::Cancelled
+    ));
+}
+
+#[test]
 fn child_live_summaries_remain_bound_to_their_parent_tool_cards() {
     let mut timeline = Timeline::new();
     timeline.push_tool_started(ToolStartedEvent::new(

@@ -3162,6 +3162,10 @@ pub(crate) fn observe_background_subagent_completion(
             .mark_notified()
         {
             emit_child_terminal(session_transport_tx, &summary.child_session_id);
+            let _ = session_transport_tx.send(SessionTransportEvent::BackgroundSubagentCompleted {
+                parent_tool_call_id,
+                result: summary.clone(),
+            });
         }
         return false;
     }

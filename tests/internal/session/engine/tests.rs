@@ -574,7 +574,7 @@ mod integration_tests {
             &mut notified,
             &tx,
             &parent_session_id,
-            None,
+            Some("background-call".into()),
             &result,
         );
         assert!(
@@ -585,10 +585,15 @@ mod integration_tests {
             child_interrupted(rx.try_recv().expect("terminal")),
             Some("child-cancelled".into())
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "no background completion event is delivered for a cancelled run"
-        );
+        let completion = rx.try_recv().expect("cancelled completion");
+        assert!(matches!(
+            completion,
+            SessionTransportEvent::BackgroundSubagentCompleted {
+                parent_tool_call_id: Some(call_id),
+                result: summary,
+            } if call_id == "background-call" && summary.status == SubagentStatus::Cancelled
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
