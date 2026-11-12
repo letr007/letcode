@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -273,6 +273,8 @@ struct ProcessExit {
 // Dropping the guard aborts the driver, which terminates the process group.
 struct ForegroundGuard {
     handle: Option<tokio::task::JoinHandle<()>>,
+    task_id: String,
+    promotable: Arc<AtomicBool>,
 }
 
 impl ForegroundGuard {
@@ -283,6 +285,8 @@ impl ForegroundGuard {
 
 impl Drop for ForegroundGuard {
     fn drop(&mut self) {
+        self.promotable.store(false, Ordering::Relaxed);
+        background::discard_pending(&self.task_id);
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
@@ -323,7 +327,9 @@ async fn run_shell(
     let mut cancel_tx = Some(cancel_tx);
     let promoted = background
         && can_background
-        && promote(&task_id, session_id, command, title, &sink, &mut cancel_tx);
+        && promote(&task_id, session_id, command, title, &sink, &mut cancel_tx)
+            == background::RegisterOutcome::Registered;
+    let promotable = Arc::new(AtomicBool::new(can_background && !promoted));
 
     let mut run = ForegroundGuard {
         handle: Some(tokio::spawn(drive_process(
@@ -336,7 +342,10 @@ async fn run_shell(
             done_tx,
             cancel_rx,
             started,
+            Arc::clone(&promotable),
         ))),
+        task_id: task_id.clone(),
+        promotable: Arc::clone(&promotable),
     };
 
     let mut stdout_acc = StreamAccumulator::new();
@@ -365,11 +374,28 @@ async fn run_shell(
                 return Ok(exited_result(command, shell, exit, &stdout_acc, &stderr_acc));
             }
             _ = &mut deadline => {
-                if can_background
-                    && promote(&task_id, session_id, command, title, &sink, &mut cancel_tx)
-                {
-                    run.disarm();
-                    return Ok(background_result(&task_id, command, shell, &sink));
+                if can_background {
+                    match promote(&task_id, session_id, command, title, &sink, &mut cancel_tx) {
+                        background::RegisterOutcome::Registered => {
+                            run.disarm();
+                            return Ok(background_result(&task_id, command, shell, &sink));
+                        }
+                        background::RegisterOutcome::AlreadyCompleted => {
+                            if let Some(path) = lock_sink(&sink).output_path() {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            let exit = done_rx.await.ok();
+                            drain_delta(&mut delta_rx, &mut stdout_acc, &mut stderr_acc);
+                            return Ok(exited_result(
+                                command,
+                                shell,
+                                exit,
+                                &stdout_acc,
+                                &stderr_acc,
+                            ));
+                        }
+                        background::RegisterOutcome::Rejected => {}
+                    }
                 }
                 if let Some(tx) = cancel_tx.take() {
                     let _ = tx.send(());
@@ -401,6 +427,7 @@ async fn drive_process(
     done_tx: oneshot::Sender<ProcessExit>,
     cancel_rx: oneshot::Receiver<()>,
     started: Instant,
+    promotable: Arc<AtomicBool>,
 ) {
     let stdout_task = tokio::spawn(read_command_stream(
         ToolOutputStream::Stdout,
@@ -465,7 +492,16 @@ async fn drive_process(
         },
     };
     let duration_ms = started.elapsed().as_millis() as u64;
-    if background::complete(&task_id, state, duration_ms, total, path.clone(), preview).is_none()
+    if background::complete(
+        &task_id,
+        state,
+        duration_ms,
+        total,
+        path.clone(),
+        preview,
+        &promotable,
+    )
+    .is_none()
         && let Some(path) = path
     {
         let _ = std::fs::remove_file(path);
@@ -493,14 +529,14 @@ fn promote(
     title: Option<&str>,
     sink: &Arc<Mutex<OutputSink>>,
     cancel_tx: &mut Option<oneshot::Sender<()>>,
-) -> bool {
+) -> background::RegisterOutcome {
     if cancel_tx.is_none() || !background::has_capacity(session_id) {
-        return false;
+        return background::RegisterOutcome::Rejected;
     }
     let log = {
         let mut guard = lock_sink(sink);
         if guard.persist().is_err() {
-            return false;
+            return background::RegisterOutcome::Rejected;
         }
         guard.state()
     };

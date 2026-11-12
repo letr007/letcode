@@ -1,9 +1,10 @@
 //! Background shell tasks: registry, rolling log window, terminal delivery.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result};
@@ -35,6 +36,13 @@ impl TaskState {
     fn is_terminal(&self) -> bool {
         !matches!(self, Self::Running)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RegisterOutcome {
+    Registered,
+    AlreadyCompleted,
+    Rejected,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +215,7 @@ struct Registry {
     next_id: u64,
     notifier: Option<Notifier>,
     tasks: HashMap<String, TaskRecord>,
+    pending_terminal: HashSet<String>,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -243,29 +252,36 @@ pub(super) fn register(
     title: Option<&str>,
     log: Arc<Mutex<LogState>>,
     cancel: &mut Option<oneshot::Sender<()>>,
-) -> bool {
-    let notifier = {
-        let mut registry = lock(registry());
-        if live_count(&registry, session_id) >= MAX_BACKGROUND_TASKS {
-            return false;
-        }
-        let Some(cancel) = cancel.take() else {
-            return false;
-        };
-        registry.tasks.insert(
-            task_id.to_string(),
-            TaskRecord {
-                session_id: session_id.map(str::to_string),
-                command: command.to_string(),
-                state: TaskState::Running,
-                log: Some(log),
-                cancel: Some(cancel),
-                observed: false,
-            },
-        );
-        registry.notifier.clone()
+) -> RegisterOutcome {
+    let mut registry = lock(registry());
+    if registry.pending_terminal.remove(task_id) {
+        return RegisterOutcome::AlreadyCompleted;
+    }
+    if registry
+        .tasks
+        .get(task_id)
+        .is_some_and(|task| task.state.is_terminal())
+    {
+        return RegisterOutcome::AlreadyCompleted;
+    }
+    if live_count(&registry, session_id) >= MAX_BACKGROUND_TASKS {
+        return RegisterOutcome::Rejected;
+    }
+    let Some(cancel) = cancel.take() else {
+        return RegisterOutcome::Rejected;
     };
-    if let Some(notifier) = notifier {
+    registry.tasks.insert(
+        task_id.to_string(),
+        TaskRecord {
+            session_id: session_id.map(str::to_string),
+            command: command.to_string(),
+            state: TaskState::Running,
+            log: Some(log),
+            cancel: Some(cancel),
+            observed: false,
+        },
+    );
+    if let Some(notifier) = registry.notifier.clone() {
         notifier(BackgroundEvent::Started {
             task_id: task_id.to_string(),
             session_id: session_id.map(str::to_string),
@@ -273,7 +289,11 @@ pub(super) fn register(
             title: title.map(str::to_string),
         });
     }
-    true
+    RegisterOutcome::Registered
+}
+
+pub(super) fn discard_pending(task_id: &str) {
+    lock(registry()).pending_terminal.remove(task_id);
 }
 
 pub(crate) fn complete(
@@ -283,10 +303,16 @@ pub(crate) fn complete(
     output_bytes: u64,
     output_path: Option<PathBuf>,
     preview: String,
+    promotable: &AtomicBool,
 ) -> Option<TaskOutcome> {
     let (notifier, outcome) = {
         let mut registry = lock(registry());
-        let task = registry.tasks.get_mut(task_id)?;
+        let Some(task) = registry.tasks.get_mut(task_id) else {
+            if promotable.load(Ordering::Relaxed) {
+                registry.pending_terminal.insert(task_id.to_string());
+            }
+            return None;
+        };
         if task.state.is_terminal() {
             return None;
         }
@@ -442,3 +468,7 @@ pub(crate) fn end_session(session_id: &str) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/internal/tool/background/tests.rs"]
+mod tests;
