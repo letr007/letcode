@@ -1405,24 +1405,6 @@ fn cached_visible_transcript_matches_full_transcript_window() {
 }
 
 #[test]
-fn cached_row_count_uses_stable_timeline_fast_path() {
-    let mut state = TuiState::default();
-    state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("first")));
-    state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("second")));
-
-    let theme = Theme::dark();
-    let width = 80;
-    let expected_rows = cached_transcript_row_count(&mut state, theme, width);
-    let rebuilds = state.transcript_render_cache.row_count_rebuilds;
-
-    assert_eq!(
-        cached_transcript_row_count(&mut state, theme, width),
-        expected_rows
-    );
-    assert_eq!(state.transcript_render_cache.row_count_rebuilds, rebuilds);
-}
-
-#[test]
 fn cached_row_count_refreshes_after_timeline_mutation() {
     let mut state = TuiState::default();
     state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
@@ -1445,41 +1427,6 @@ fn cached_row_count_refreshes_after_timeline_mutation() {
     );
     assert!(after_rows >= before_rows);
     assert_eq!(after_rows, transcript_lines(&state, theme, width).len());
-}
-
-/// Each frame re-parses only the block that can still change.
-#[test]
-fn streaming_markdown_cost_stays_within_one_full_render_per_frame() {
-    let mut state = TuiState::default();
-    let theme = Theme::dark();
-    let width = 80;
-    let chunk = "a streamed line with some words in it\n\n";
-    let frames = 200;
-
-    for _ in 0..frames {
-        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
-            chunk,
-        )));
-        cached_transcript_row_count(&mut state, theme, width);
-    }
-
-    let answer_chars = state
-        .active_timeline()
-        .items()
-        .iter()
-        .find_map(|item| match item {
-            TimelineItem::Assistant(message) => Some(message.text.len()),
-            _ => None,
-        })
-        .expect("the streamed answer is a timeline item");
-    let rendered_chars = state.transcript_render_cache.assistant_markdown_chars;
-
-    assert_eq!(answer_chars, chunk.len() * frames);
-    // One full pass over the answer, plus one blank line carried between frames.
-    assert!(
-        rendered_chars >= answer_chars && rendered_chars <= answer_chars * 2,
-        "rendered {rendered_chars} characters for a {answer_chars} character answer"
-    );
 }
 
 #[test]

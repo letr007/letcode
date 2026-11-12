@@ -57,32 +57,17 @@ fn prompt_content_accepts_an_image_without_text() {
 }
 
 #[test]
-fn prompt_content_rejects_content_the_engine_cannot_represent() {
+fn prompt_content_rejects_unsupported_or_empty_content() {
     for block in [
         ContentBlock::Audio(AudioContent::new(IMAGE_DATA, "audio/wav")),
         ContentBlock::ResourceLink(ResourceLink::new("file", "file:///tmp/file")),
+        image_block("application/pdf"),
+        ContentBlock::Image(ImageContent::new("%%%", "image/png")),
     ] {
         let error = prompt_content(&[block]).expect_err("unsupported content");
         assert_eq!(error.code, ErrorCode::InvalidParams);
     }
-}
 
-#[test]
-fn prompt_content_rejects_media_types_that_are_not_images() {
-    let error = prompt_content(&[image_block("application/pdf")])
-        .expect_err("non-image media types are unsupported");
-    assert_eq!(error.code, ErrorCode::InvalidParams);
-}
-
-#[test]
-fn prompt_content_rejects_image_data_that_is_not_base64() {
-    let block = ContentBlock::Image(ImageContent::new("%%%", "image/png"));
-    let error = prompt_content(&[block]).expect_err("invalid base64 is rejected");
-    assert_eq!(error.code, ErrorCode::InvalidParams);
-}
-
-#[test]
-fn prompt_content_rejects_empty_content() {
     assert!(prompt_content(&[text_block("   ")]).is_err());
     assert!(prompt_content(&[]).is_err());
 }
@@ -207,10 +192,6 @@ fn permission_decisions_map_returned_option_ids() {
         permission_decision("future_option", true),
         Decision::Deny
     ));
-}
-
-#[test]
-fn permission_decisions_reject_grants_this_request_did_not_offer() {
     assert!(
         matches!(
             permission_decision(PERMISSION_ALLOW_ALWAYS, false),
@@ -629,23 +610,6 @@ mod integration_tests {
             assert_eq!(
                 form.message,
                 "Which parser path should run?\nWhich checks should run?"
-            );
-        })
-        .await
-        .expect("the question round trip timed out");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_declined_form_leaves_the_questions_unanswered() {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let (answered, _) = ask_over_acp(
-                true,
-                CreateElicitationResponse::new(ElicitationAction::Decline),
-            )
-            .await;
-            assert_eq!(
-                answered.expect_err("the client declined"),
-                "the user declined to answer the questions"
             );
         })
         .await

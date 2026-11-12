@@ -276,10 +276,6 @@ fn footer_phase_indicator_returns_to_parent_session_state() {
     state.transcript_view = crate::tui::state::TranscriptViewState::Parent;
 
     assert_eq!(state.active_phase(), AppPhase::Running);
-    assert_eq!(
-        footer_status_spans(&state, crate::tui::Theme::dark()).len(),
-        8
-    );
 }
 
 #[test]

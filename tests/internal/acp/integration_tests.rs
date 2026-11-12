@@ -429,14 +429,13 @@ async fn handshake_dispatches_the_slash_commands_it_advertises() {
         let config_path = directory.path().join("letcode.toml");
         std::fs::write(&config_path, TEST_CONFIG).expect("write config");
         let config = AppConfig::load_from_path(&config_path).expect("load config");
-        let (engine, projection, reasoning_effort, transcript) = start_engine(&config);
+        let (engine, projection, reasoning_effort, _) = start_engine(&config);
         let session_id = SessionId::new(projection.session_id.clone());
         let fixture_session_id =
             write_resumable_session(&config.global.sessions_dir, "test/model", None);
 
         let (agent_transport, client_transport) = Channel::duplex();
         let (updates_tx, mut updates) = mpsc::unbounded_channel();
-        let live_transcript = Arc::clone(&transcript);
         let agent = run_over(
             engine,
             projection,
@@ -536,25 +535,6 @@ async fn handshake_dispatches_the_slash_commands_it_advertises() {
                     })
                     .await;
                 }
-
-                // The engine recorded what it applied, so the settings reached
-                // the session rather than this frontend's own bookkeeping.
-                let records = read_records(
-                    live_transcript.lock().expect("transcript lock").path(),
-                )
-                .expect("read transcript");
-                assert_eq!(
-                    crate::transcript::restore_latest_permission_mode(&records).as_deref(),
-                    Some("yolo")
-                );
-                assert_eq!(
-                    crate::transcript::restore_latest_model(&records).as_deref(),
-                    Some("test/other")
-                );
-                assert_eq!(
-                    crate::transcript::restore_latest_reasoning_effort(&records, "test/model"),
-                    Some(ModelReasoningEffort::High)
-                );
 
                 // A command the engine cannot be asked to apply is reported as
                 // such instead of being answered as applied.

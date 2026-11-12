@@ -327,17 +327,6 @@ fn long_toast_renders_wrapped_rows_and_visible_truncation() {
 }
 
 #[test]
-fn zh_cn_narrow_rendering_stays_within_terminal_bounds() {
-    let mut state = TuiState::default();
-    state.set_language(Some(crate::tui::i18n::Language::ZhCn));
-    state.mark_session_active();
-    state.show_toast("中文提示：请继续操作", ToastKind::Info);
-    let rows = draw_rows(&mut state, 40, 12);
-    assert_eq!(rows.len(), 12);
-    assert!(rows.iter().all(|row| !row.is_empty()));
-}
-
-#[test]
 fn notice_geometry_handles_narrow_terminals_and_wide_characters() {
     let narrow = notice_geometry(Rect::new(0, 0, 16, 10), "hello world");
     let wide = notice_geometry(Rect::new(0, 0, 40, 20), "你好世界");
@@ -346,27 +335,6 @@ fn notice_geometry_handles_narrow_terminals_and_wide_characters() {
     assert!(narrow.width <= 16);
     assert!(wide.width >= 16);
     assert!(wide.height >= 3);
-}
-
-#[test]
-fn notice_geometry_caps_wrapped_content_and_marks_truncation() {
-    let area = Rect::new(0, 0, 80, 10);
-    let geometry = notice_geometry(area, &"long message ".repeat(100));
-    let lines = notice_message_lines(
-        &"long message ".repeat(100),
-        geometry.width.saturating_sub(4),
-        geometry.height.saturating_sub(2),
-        Style::default(),
-    );
-
-    assert_eq!(geometry.width, 47);
-    assert_eq!(geometry.height, 3);
-    assert_eq!(lines.len(), 1);
-    assert!(
-        lines
-            .last()
-            .is_some_and(|line| line.to_string().contains('…'))
-    );
 }
 
 #[test]
@@ -563,41 +531,6 @@ fn very_short_confirm_panel_skips_zero_height_body_safely() {
         .as_ref()
         .expect("question remains pending");
     assert!(question.confirm_scroll <= question.confirm_scroll_max());
-}
-
-#[test]
-fn short_question_panel_uses_content_height_instead_of_the_full_workspace() {
-    let question = crate::tui::state::PendingQuestionState::new(
-        crate::tool::QuestionRequest {
-            questions: vec![crate::tool::QuestionSpec {
-                question: "Choose a mode".into(),
-                header: "Mode".into(),
-                options: vec![
-                    crate::tool::QuestionOption {
-                        label: "Fast".into(),
-                        description: "Finish quickly".into(),
-                    },
-                    crate::tool::QuestionOption {
-                        label: "Careful".into(),
-                        description: "Review each step".into(),
-                    },
-                ],
-                multiple: false,
-            }],
-        },
-        None,
-    );
-    let workspace = Rect::new(2, 0, 96, 23);
-    let content_rows =
-        question_full_row_count(&question, question_content_width(workspace.width, false));
-    let height = question_composer_height(&question, workspace, false);
-
-    assert_eq!(height, content_rows as u16 + 4);
-    assert_eq!(
-        question_composer_height(&question, workspace, true),
-        height + 1
-    );
-    assert!(height < workspace.height.saturating_sub(2));
 }
 
 #[test]

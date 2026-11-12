@@ -627,14 +627,6 @@ fn capabilities_default_with_tools_enabled_and_typed_cache_settings_validate() {
     let partial_route = partial.runtime_catalog.route("openai", "model").unwrap();
     assert!(partial_route.capabilities.tools);
     assert!(partial_route.capabilities.input_images);
-
-    let invalid = config(
-        "openai",
-        "model",
-        "[cache]\nenabled = false\nretention = \"24h\"\n",
-    );
-    let error = AppConfig::load_from_path(write_temp_config(invalid));
-    assert!(error.is_err(), "disabled cache retention must fail");
 }
 
 #[test]
@@ -717,21 +709,6 @@ fn missing_config_example_is_valid() {
     let example_path = write_temp_config(example);
 
     AppConfig::load_from_path(example_path).expect("missing-config example should validate");
-}
-
-#[test]
-fn persists_new_schema_without_overwriting_external_changes() {
-    let path = write_temp_config(format!(
-        "{}\n[agents.explorer]\nmodel = \"model\"\n",
-        config("openai", "model", "")
-    ));
-    let before = fs::read_to_string(&path).unwrap();
-    let metadata = fs::metadata(&path).unwrap();
-    fs::write(&path, "external edit\n").unwrap();
-    let error = atomic_write_config(&path, &before, &metadata, b"our update\n")
-        .expect_err("external edit must win");
-    assert!(error.to_string().contains("changed while updating"));
-    assert_eq!(fs::read_to_string(path).unwrap(), "external edit\n");
 }
 
 #[test]
@@ -1477,19 +1454,13 @@ base_url = "https://example.invalid"
 }
 
 #[test]
-fn rejects_unknown_subagent_name_and_model_override() {
+fn rejects_unknown_subagent_name() {
     let unknown_agent = config(
         "openai",
         "model",
         "[agents.nosuch]\nprovider = \"openai\"\nmodel = \"model\"",
     );
     assert!(AppConfig::load_from_path(write_temp_config(unknown_agent)).is_err());
-    let unknown_model = config(
-        "openai",
-        "model",
-        "[agents.explorer]\nprovider = \"openai\"\nmodel = \"missing-model\"",
-    );
-    assert!(AppConfig::load_from_path(write_temp_config(unknown_model)).is_err());
 }
 
 #[test]

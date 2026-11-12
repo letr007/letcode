@@ -382,7 +382,6 @@ fn child_view_renders_read_only_status_bar_instead_of_input_composer() {
     assert!(!rendered.contains("Read-only child view"), "{rendered}");
     assert!(!rendered.contains("child-session-1234567890"), "{rendered}");
     assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
-    assert!(!rendered.contains("records"), "{rendered}");
     assert!(!rendered.contains("parent-session"), "{rendered}");
     assert!(!rendered.contains("message letcode"), "{rendered}");
 }

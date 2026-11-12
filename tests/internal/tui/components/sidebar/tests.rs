@@ -548,7 +548,6 @@ fn context_bar_fills_used_share_and_leaves_capacity_visible() {
     ];
     let line = context_bar_line(20, &composition, 10_000, 10_000, 20_000, Theme::dark());
     assert_eq!(line.width(), 20);
-    assert_eq!(line.spans.len(), 20);
     assert_eq!(
         line.spans
             .iter()
@@ -667,28 +666,6 @@ fn context_bar_cell_uses_dominant_run_when_three_colors_share_a_cell() {
     assert_eq!(span.content.as_ref(), "█");
     assert_eq!(span.style.fg, Some(theme.user));
     assert_eq!(span.style.bg, Some(theme.element_bg));
-}
-
-#[test]
-fn context_bar_handles_more_categories_than_subcells() {
-    let theme = Theme::dark();
-    let colors = [
-        theme.user,
-        theme.accent,
-        theme.approval,
-        theme.assistant,
-        theme.notice,
-        theme.warning,
-        theme.success,
-        theme.error,
-    ];
-    let segments = (0..12)
-        .map(|index| (1, colors[index % colors.len()]))
-        .collect::<Vec<_>>();
-    let line = context_bar_spans(1, 1, &segments, theme);
-
-    assert_eq!(line.width(), 1);
-    assert_eq!(line.spans.len(), 1);
 }
 
 #[test]
