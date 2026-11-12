@@ -6535,7 +6535,7 @@ fn config_editor_descriptions_follow_the_active_language() {
             crate::tui::i18n::Language::En,
             "Provider used by the current session",
         ),
-        (crate::tui::i18n::Language::ZhCn, "当前会话使用的 provider"),
+        (crate::tui::i18n::Language::ZhCn, "当前会话默认的模型服务商"),
     ] {
         let mut runtime = runtime_with_config("active_provider = \"openai\"\n");
         runtime.state_mut().set_language(Some(language));
