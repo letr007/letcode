@@ -879,6 +879,51 @@ fn diff_uses_single_column_layout_at_narrow_width_without_overflow() {
 }
 
 #[test]
+fn patch_diff_soft_wraps_long_lines_without_clipping() {
+    let long = "ABCDEFGHIJ".repeat(12);
+    let tool = ToolView {
+        call_id: "call-long-line".into(),
+        name: "edit__apply_patch".into(),
+        summary: "patched".into(),
+        arguments: Some(
+            json!({
+                "edits": [{
+                    "path": "src/main.rs",
+                    "find": "old line",
+                    "replace": long.as_str(),
+                    "replace_all": false
+                }]
+            })
+            .to_string(),
+        ),
+        output: None,
+        status: ToolExecutionStatus::Succeeded,
+    };
+
+    for width in [40, 100] {
+        let lines = render_tool_card_lines(&tool, Theme::dark(), width);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let alphabetic = rendered
+            .chars()
+            .filter(char::is_ascii_alphabetic)
+            .collect::<String>();
+
+        assert!(alphabetic.contains(&long), "{width}: {rendered}");
+        assert!(!rendered.contains('…'), "{width}: {rendered}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= width),
+            "{width}: {rendered}"
+        );
+    }
+}
+
+#[test]
 fn patch_diff_renders_each_file_in_its_own_card() {
     let tool = ToolView {
         call_id: "call-multi-file-edit".into(),
