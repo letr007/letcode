@@ -67,6 +67,10 @@ impl Theme {
         }
     }
 
+    pub fn selection_style(self) -> Style {
+        Style::default().fg(self.on_accent).bg(self.accent)
+    }
+
     pub const fn card_guide(self) -> Color {
         self.border
     }

@@ -109,12 +109,15 @@ fn contents_highlight_fills_the_focused_row_like_picker_items() {
             assert_eq!(
                 selected.bg,
                 if focused {
-                    theme.element_bg
+                    theme.accent
                 } else {
                     theme.elevated_bg
                 }
             );
-            assert_eq!(selected.fg, theme.text);
+            assert_eq!(
+                selected.fg,
+                if focused { theme.on_accent } else { theme.text }
+            );
             assert!(selected.modifier.contains(Modifier::BOLD));
             assert_eq!(buffer[(column, area.y)].bg, theme.elevated_bg);
         }

@@ -232,10 +232,11 @@ fn item_width(item: &DialogItem) -> usize {
 
 fn render_item_line(item: &DialogItem, selected: bool, theme: Theme) -> Line<'static> {
     let marker = if selected { "› " } else { "  " };
+    let selected_style = theme.selection_style();
     let mut spans = vec![Span::styled(
         marker,
         if selected {
-            accent_style(theme)
+            selected_style
         } else {
             muted_style(theme)
         },
@@ -251,8 +252,13 @@ fn render_item_line(item: &DialogItem, selected: bool, theme: Theme) -> Line<'st
     ));
 
     if let Some(detail) = &item.detail {
-        spans.push(Span::styled(" · ", muted_style(theme)));
-        spans.push(Span::styled(detail.clone(), muted_style(theme)));
+        let detail_style = if selected {
+            selected_style
+        } else {
+            muted_style(theme)
+        };
+        spans.push(Span::styled(" · ", detail_style));
+        spans.push(Span::styled(detail.clone(), detail_style));
     }
 
     Line::from(spans)
@@ -270,10 +276,7 @@ fn item_style(theme: Theme) -> Style {
 }
 
 fn selected_item_style(theme: Theme) -> Style {
-    Style::default()
-        .fg(theme.text)
-        .bg(theme.element_bg)
-        .add_modifier(Modifier::BOLD)
+    theme.selection_style().add_modifier(Modifier::BOLD)
 }
 
 fn muted_style(theme: Theme) -> Style {

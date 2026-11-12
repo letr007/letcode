@@ -176,70 +176,47 @@ fn scroll_indicator(
 }
 
 fn highlighted_row_style(theme: Theme) -> Style {
-    Style::default().bg(theme.element_bg).fg(theme.text)
+    theme.selection_style()
 }
 
 fn row_padding_style(theme: Theme, selected: bool) -> Style {
-    let background = if selected {
-        theme.element_bg
+    if selected {
+        theme.selection_style()
     } else {
-        theme.elevated_bg
-    };
-    Style::default().fg(theme.text).bg(background)
+        Style::default().fg(theme.text).bg(theme.elevated_bg)
+    }
 }
 
 fn marker_style(theme: Theme, selected: bool) -> Style {
-    Style::default()
-        .fg(if selected {
-            theme.accent
-        } else {
-            theme.dim_text
-        })
-        .bg(if selected {
-            theme.element_bg
-        } else {
-            theme.elevated_bg
-        })
-        .add_modifier(if selected {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        })
+    if selected {
+        theme.selection_style().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.dim_text).bg(theme.elevated_bg)
+    }
 }
 
 fn command_style(theme: Theme, selected: bool) -> Style {
-    let background = if selected {
-        theme.element_bg
+    if selected {
+        theme.selection_style().add_modifier(Modifier::BOLD)
     } else {
-        theme.elevated_bg
-    };
-    Style::default()
-        .fg(if selected { theme.text } else { theme.user })
-        .bg(background)
-        .add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.user).bg(theme.elevated_bg)
+    }
 }
 
 fn description_style(theme: Theme, selected: bool) -> Style {
-    Style::default()
-        .fg(if selected {
-            theme.text
-        } else {
-            theme.muted_text
-        })
-        .bg(if selected {
-            theme.element_bg
-        } else {
-            theme.elevated_bg
-        })
+    if selected {
+        theme.selection_style()
+    } else {
+        Style::default().fg(theme.muted_text).bg(theme.elevated_bg)
+    }
 }
 
 fn indicator_style(theme: Theme, selected: bool) -> Style {
-    let background = if selected {
-        theme.element_bg
+    if selected {
+        theme.selection_style()
     } else {
-        theme.elevated_bg
-    };
-    Style::default().fg(theme.dim_text).bg(background)
+        Style::default().fg(theme.dim_text).bg(theme.elevated_bg)
+    }
 }
 
 #[cfg(test)]

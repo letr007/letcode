@@ -1295,7 +1295,7 @@ fn render_config_tabs(
         let right = padding - left;
         let text = format!("{}{}{}", " ".repeat(left), label, " ".repeat(right));
         let style = if tab == dialog.config_tab {
-            Style::default().fg(theme.notice).bg(theme.element_bg)
+            theme.selection_style().add_modifier(Modifier::BOLD)
         } else {
             muted_style(theme)
         };
@@ -1478,11 +1478,11 @@ fn render_agent_row(
         return;
     }
 
-    let detail_style = Style::default().fg(theme.muted_text).bg(if selected {
-        theme.element_bg
+    let detail_style = if selected {
+        theme.selection_style()
     } else {
-        theme.elevated_bg
-    });
+        muted_style(theme)
+    };
     for (offset, line) in wrap_model_list(models, text_width as usize)
         .into_iter()
         .enumerate()
@@ -1586,7 +1586,7 @@ fn render_session_row(
                 truncate_display_width(right_detail, right_width as usize),
                 if let Some(color) = status_color {
                     Style::default().fg(color).bg(if selected {
-                        theme.element_bg
+                        theme.accent
                     } else {
                         theme.elevated_bg
                     })
@@ -1640,10 +1640,7 @@ pub(super) fn item_style(theme: Theme) -> Style {
 }
 
 pub(super) fn selected_item_style(theme: Theme) -> Style {
-    Style::default()
-        .fg(theme.text)
-        .bg(theme.element_bg)
-        .add_modifier(Modifier::BOLD)
+    theme.selection_style().add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn muted_style(theme: Theme) -> Style {
@@ -1658,7 +1655,7 @@ pub(super) fn accent_style(theme: Theme) -> Style {
 }
 
 fn selected_muted_style(theme: Theme) -> Style {
-    Style::default().fg(theme.muted_text).bg(theme.element_bg)
+    theme.selection_style()
 }
 
 #[cfg(test)]
