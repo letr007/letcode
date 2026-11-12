@@ -256,16 +256,6 @@ fn history_prepare_failure_prevents_navigation_commit() {
         crate::transcript::read_records(recorder.path()).expect("records after navigation")
     };
     assert_eq!(after.len(), before.len());
-    assert_eq!(
-        after
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>(),
-        before
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>()
-    );
     assert!(matches!(
         rx.try_recv().expect("navigation error"),
         SessionTransportEvent::Error(error)

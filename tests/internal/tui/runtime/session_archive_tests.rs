@@ -83,7 +83,7 @@ fn archive_anomalies_count_the_remaining_sessions() {
 }
 
 #[test]
-fn a_successful_archive_pass_leaves_the_ui_unchanged() {
+fn archive_pass_leaves_the_ui_unchanged_on_success_or_failure() {
     let mut runtime = runtime();
     deliver_report(
         &mut runtime,
@@ -92,23 +92,15 @@ fn a_successful_archive_pass_leaves_the_ui_unchanged() {
             ..ArchiveRunReport::default()
         },
     );
-
     runtime.poll_session_archive_pass();
-
     assert!(runtime.state().toast().is_none());
     assert!(runtime.archive_pass_rx.is_none());
-}
 
-#[test]
-fn a_failed_archive_pass_stays_out_of_the_ui() {
-    let mut runtime = runtime();
     let (tx, rx) = mpsc::unbounded_channel();
     runtime.archive_pass_rx = Some(rx);
     tx.send(Err(anyhow::anyhow!("unreadable sessions directory")))
         .expect("archive failure should send");
-
     runtime.poll_session_archive_pass();
-
     assert!(runtime.state().toast().is_none());
     assert!(runtime.archive_pass_rx.is_none());
 }

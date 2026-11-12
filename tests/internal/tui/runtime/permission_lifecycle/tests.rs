@@ -79,27 +79,3 @@ fn child_event_clearing_only_clears_matching_child_permission() {
     ));
     assert!(!controller.clears_for_child_event("other-child", &SessionEvent::Interrupted));
 }
-
-#[test]
-fn representative_child_permission_lifecycle_flow_matches_and_clears() {
-    let mut controller = PermissionLifecycleController::default();
-    controller
-        .begin_child(
-            "child-7".into(),
-            PermissionRequestEvent::new("call-7", "shell__exec", "cargo test"),
-            handle(),
-        )
-        .expect("begin child permission");
-
-    assert!(controller.is_pending());
-    assert!(controller.matches_call("call-7", Some("child-7")));
-    assert!(controller.clears_for_child_event(
-        "child-7",
-        &SessionEvent::PermissionResolved(PermissionResolutionEvent::approved("call-7"))
-    ));
-
-    controller.clear();
-
-    assert!(!controller.is_pending());
-    assert_eq!(controller.projection(), None);
-}

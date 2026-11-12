@@ -70,15 +70,11 @@ async fn dropping_parallel_join_future_aborts_the_tool_task() {
 }
 
 #[test]
-fn question_is_exempt_from_global_tool_timeout() {
+fn only_question_is_exempt_from_global_tool_timeout() {
     assert_eq!(
         non_shell_tool_timeout_secs(Some(60), tool_names::TOOL_QUESTION),
         None
     );
-}
-
-#[test]
-fn ordinary_non_shell_tool_inherits_global_tool_timeout() {
     assert_eq!(
         non_shell_tool_timeout_secs(Some(60), tool_names::TOOL_FS_READ),
         Some(60)

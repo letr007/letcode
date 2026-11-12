@@ -600,9 +600,5 @@ fn truncate_text(content: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
-#[path = "../tests/internal/transcript/session_title_tests.rs"]
-mod session_title_tests;
-
-#[cfg(test)]
 #[path = "../tests/internal/transcript/tests.rs"]
 mod tests;

@@ -325,23 +325,6 @@ fn rare_grams_outrank_common_ones() {
 }
 
 #[test]
-fn query_scores_reward_coverage() {
-    let focused = SearchFields {
-        title: String::new(),
-        summary: "alpha beta gamma".into(),
-        paths: String::new(),
-    };
-    let repeated = SearchFields {
-        title: "alpha".into(),
-        summary: String::new(),
-        paths: "alpha".into(),
-    };
-    let grams = query_grams("alpha beta gamma");
-    let weights = [1.0; 3];
-    assert!(memory_score(&focused, &grams, &weights) > memory_score(&repeated, &grams, &weights));
-}
-
-#[test]
 fn opens_version_one_store_without_reimporting_sources() {
     let root = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

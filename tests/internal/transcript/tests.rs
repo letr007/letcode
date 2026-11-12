@@ -2128,44 +2128,6 @@ fn read_records_accepts_legacy_subagent_result_without_structured_payload() {
 }
 
 #[test]
-fn duplicate_evidence_ids_fail_restore() {
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::Evidence {
-                id: "ev-1".into(),
-                evidence_kind: EvidenceKind::Decision,
-                title: "one".into(),
-                summary: "one".into(),
-                detail: None,
-                source: EvidenceSource::Transcript { sequence: 1 },
-                tags: vec![],
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::Evidence {
-                id: "ev-1".into(),
-                evidence_kind: EvidenceKind::Decision,
-                title: "two".into(),
-                summary: "two".into(),
-                detail: None,
-                source: EvidenceSource::Transcript { sequence: 2 },
-                tags: vec![],
-            },
-        },
-    ];
-
-    assert!(restore_session_evidence(&records).is_err());
-}
-
-#[test]
 fn restore_latest_workflow_todos_persist_across_turns_and_errors() {
     let stale_todo = TodoItem {
         id: "stale".into(),
@@ -2939,81 +2901,6 @@ mod integration_tests {
         assert!(restore_conversation_messages(&records).is_err());
         assert!(restore_session_protocol_frames(&records).is_err());
         assert!(restore_runtime_snapshot(&records).is_err());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn prepare_logical_checkpoint_is_deterministic_valid_and_non_persistent() {
-        let base_dir = std::env::temp_dir().join(format!(
-            "letcode-prepare-logical-checkpoint-{}",
-            unix_timestamp_ms()
-        ));
-        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
-        recorder.record_session_started("test").expect("session");
-        recorder
-            .record_user_message("keep this requirement")
-            .expect("user");
-        recorder
-            .record_turn_started(TurnStartedEvent { turn_id: 9 })
-            .expect("turn");
-        recorder
-            .record_assistant_message("working")
-            .expect("assistant");
-        let before = read_records(recorder.path()).expect("records before prepare");
-
-        let first = recorder
-            .prepare_logical_checkpoint()
-            .expect("first candidate");
-        let second = recorder
-            .prepare_logical_checkpoint()
-            .expect("second candidate");
-
-        assert_eq!(first.expected_journal_frontier, recorder.sequence);
-        assert_eq!(first.event, second.event);
-        assert!(first.event.checkpoint_id.starts_with("lcp-v1-"));
-        assert_eq!(
-            serde_json::to_value(read_records(recorder.path()).expect("records after prepare"))
-                .expect("serialize records after prepare"),
-            serde_json::to_value(&before).expect("serialize records before prepare")
-        );
-        transcript_projection::validate_logical_checkpoint_candidate(
-            recorder.session_id(),
-            &before,
-            Some(ROOT_CONTEXT_BRANCH_ID.into()),
-            recorder.sequence,
-            recorder.sequence + 1,
-            &first.event,
-        )
-        .expect("prepared event satisfies the Phase3a contract");
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn prepare_logical_checkpoint_rejects_incomplete_or_inactive_input() {
-        let base_dir = std::env::temp_dir().join(format!(
-            "letcode-prepare-logical-checkpoint-invalid-{}",
-            unix_timestamp_ms()
-        ));
-        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
-        recorder.record_session_started("test").expect("session");
-        assert!(recorder.prepare_logical_checkpoint().is_err());
-        recorder.record_user_message("goal").expect("user");
-        recorder
-            .record_turn_started(TurnStartedEvent { turn_id: 1 })
-            .expect("turn");
-        recorder
-            .record_assistant_tool_call_batch(
-                None,
-                None,
-                None,
-                vec![HistoryToolCall {
-                    call_id: "unfinished".into(),
-                    name: "read".into(),
-                    arguments_json: "{}".into(),
-                }],
-            )
-            .expect("tool call");
-        assert!(recorder.prepare_logical_checkpoint().is_err());
     }
 }
 

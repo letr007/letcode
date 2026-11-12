@@ -57,17 +57,9 @@ fn assert_question_padding_frame(tool: &ToolView, width: usize) {
 }
 
 #[test]
-fn width_zero_returns_empty_string() {
+fn truncation_uses_display_width_and_preserves_graphemes() {
     assert_eq!(truncate_display_width("abcdef", 0), "");
-}
-
-#[test]
-fn cjk_text_truncates_on_display_cells() {
     assert_eq!(truncate_display_width("你好吗", 5), "你好…");
-}
-
-#[test]
-fn truncation_preserves_extended_graphemes() {
     assert_eq!(truncate_display_width("e\u{301}xy", 2), "e\u{301}…");
     assert_eq!(truncate_display_width("👩‍💻xy", 3), "👩‍💻…");
 }

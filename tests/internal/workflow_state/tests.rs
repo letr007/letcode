@@ -17,7 +17,7 @@ fn compaction_reminder_lists_open_todos_only() {
             todo("finished-item", "scaffold module", TodoStatus::Completed),
             todo("dropped-item", "abandoned spike", TodoStatus::Cancelled),
         ],
-        auto_continue: AutoContinueState::default(),
+        auto_continue: AutoContinueState { enabled: true },
     };
 
     let reminder = state.render_compaction_reminder().expect("reminder");
@@ -31,16 +31,6 @@ fn compaction_reminder_lists_open_todos_only() {
     );
     assert!(!reminder.contains("finished-item"), "{reminder}");
     assert!(!reminder.contains("abandoned spike"), "{reminder}");
-}
-
-#[test]
-fn compaction_reminder_reports_auto_continue() {
-    let state = WorkflowState {
-        todos: Vec::new(),
-        auto_continue: AutoContinueState { enabled: true },
-    };
-
-    let reminder = state.render_compaction_reminder().expect("reminder");
     assert!(reminder.contains("Auto-continue is enabled."), "{reminder}");
 }
 

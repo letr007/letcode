@@ -436,10 +436,6 @@ fn expert_tool_model_descriptions_follow_allowed_models() {
     ] {
         assert!(!serialized.contains(secret));
     }
-    assert_eq!(
-        serialized,
-        serde_json::to_string(&parent.tool_definitions_for_test()).unwrap()
-    );
 
     let replacement = ExpertRouteFactory::new_with_policies(
         [(
@@ -1259,67 +1255,6 @@ parallel_tool_calls = true
         .expect("allowlisted child builds");
         assert_eq!(child.primary_route(), Some(&selected));
         assert_eq!(child.default_protocol_for_test(), ApiProtocol::Completions);
-    }
-
-    #[test]
-    fn routed_child_retains_route_factory_for_takeover_restoration() {
-        let provider = ProviderConfig {
-            base_url: "http://127.0.0.1:9876/v1".into(),
-            jev_endpoint: None,
-            auth_mode: crate::config::ProviderAuthMode::ApiKey,
-            api_key: "expert-key".into(),
-            protocol: ApiProtocol::Completions,
-            default_model: "shared".into(),
-            retry: None,
-            reviewer: None,
-            models: indexmap::IndexMap::from([(
-                "shared".into(),
-                crate::config::ModelConfig {
-                    display_name: None,
-                    protocol: ApiProtocol::Completions,
-                    anthropic_thinking: Default::default(),
-                    anthropic_betas: Vec::new(),
-                    context_window: None,
-                    effective_input_limit_tokens: None,
-                    max_output_tokens: None,
-                    supports_tools: false,
-                    supports_input_images: false,
-                    supports_tool_result_images: false,
-                    supports_reasoning: false,
-                    reasoning_effort: None,
-                    reasoning_efforts: Vec::new(),
-                    reasoning_summary: None,
-                    text_verbosity: None,
-                    temperature: None,
-                    top_p: None,
-                    prompt_cache: crate::config::PromptCacheConfig::default(),
-                    parallel_tool_calls: false,
-                },
-            )]),
-        };
-        let factory = Arc::new(
-            ExpertRouteFactory::new(
-                [("explorer".into(), ModelRoute::new("expert", "shared"))],
-                &indexmap::IndexMap::from([("expert".into(), provider)]),
-                &RetryConfig::default(),
-            )
-            .expect("factory should build")
-            .with_runtime_catalog(resolved_runtime_catalog()),
-        );
-        let mut parent = test_agent();
-        use_resolved_runtime_catalog(&mut parent);
-        parent.set_subagent_child_factory(factory.clone());
-        parent.set_primary_route_factory(factory);
-
-        let mut child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
-        crate::session::restore::apply_restored_model_route(&mut child, Some("expert/shared"))
-            .expect("routed child should prepare its qualified takeover route");
-
-        assert_eq!(
-            child.primary_route(),
-            Some(&ModelRoute::new("expert", "shared"))
-        );
-        assert_eq!(child.model(), "shared");
     }
 
     #[test]

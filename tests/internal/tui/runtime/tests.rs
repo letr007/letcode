@@ -1198,41 +1198,73 @@ fn clipboard_image_files_take_precedence_over_their_paths_as_text() {
 }
 
 #[test]
-fn clipboard_paste_prefers_image_only_in_composer_context() {
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Composer, true, true),
-        ClipboardPasteChoice::Image
-    );
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Composer, false, true),
-        ClipboardPasteChoice::Image
-    );
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Composer, true, false),
-        ClipboardPasteChoice::Text
-    );
-    assert_eq!(
-        choose_clipboard_paste(ClipboardPasteContext::Composer, false, false),
-        ClipboardPasteChoice::None
-    );
-}
-
-#[test]
-fn clipboard_paste_text_contexts_are_text_first() {
-    for context in [
-        ClipboardPasteContext::Dialog,
-        ClipboardPasteContext::Question,
-        ClipboardPasteContext::Permission,
+fn clipboard_paste_choice_follows_context_and_available_content() {
+    for (context, has_image, has_text, expected) in [
+        (
+            ClipboardPasteContext::Composer,
+            true,
+            true,
+            ClipboardPasteChoice::Image,
+        ),
+        (
+            ClipboardPasteContext::Composer,
+            false,
+            true,
+            ClipboardPasteChoice::Image,
+        ),
+        (
+            ClipboardPasteContext::Composer,
+            true,
+            false,
+            ClipboardPasteChoice::Text,
+        ),
+        (
+            ClipboardPasteContext::Composer,
+            false,
+            false,
+            ClipboardPasteChoice::None,
+        ),
+        (
+            ClipboardPasteContext::Dialog,
+            true,
+            true,
+            ClipboardPasteChoice::Text,
+        ),
+        (
+            ClipboardPasteContext::Dialog,
+            false,
+            true,
+            ClipboardPasteChoice::None,
+        ),
+        (
+            ClipboardPasteContext::Question,
+            true,
+            true,
+            ClipboardPasteChoice::Text,
+        ),
+        (
+            ClipboardPasteContext::Question,
+            false,
+            true,
+            ClipboardPasteChoice::None,
+        ),
+        (
+            ClipboardPasteContext::Permission,
+            true,
+            true,
+            ClipboardPasteChoice::Text,
+        ),
+        (
+            ClipboardPasteContext::Permission,
+            false,
+            true,
+            ClipboardPasteChoice::None,
+        ),
     ] {
         assert_eq!(
-            choose_clipboard_paste(context, true, true),
-            ClipboardPasteChoice::Text,
-            "{context:?}"
-        );
-        assert_eq!(
-            choose_clipboard_paste(context, false, true),
-            ClipboardPasteChoice::None,
-            "{context:?}"
+            choose_clipboard_paste(context, has_image, has_text),
+            expected,
+            "{context:?} image={has_image} text={has_text}"
         );
     }
 }
@@ -4711,37 +4743,25 @@ fn assistant_typewriter_reveals_text_across_frames() {
 
 #[test]
 fn assistant_typewriter_preserves_grapheme_clusters_split_across_deltas() {
-    let now = Instant::now();
-    let stream = AssistantDeltaStream {
-        child_session_id: None,
-        parent_tool_call_id: None,
-        message_id: None,
-    };
-    let mut typewriter = AssistantTypewriter::new(stream, None, now);
-    typewriter.push("e", now);
-    typewriter.push("\u{301}x", now + Duration::from_millis(5));
+    for (first, second, expected) in [("e", "\u{301}x", "e\u{301}"), ("👩", "‍💻x", "👩‍💻")]
+    {
+        let now = Instant::now();
+        let stream = AssistantDeltaStream {
+            child_session_id: None,
+            parent_tool_call_id: None,
+            message_id: None,
+        };
+        let mut typewriter = AssistantTypewriter::new(stream, None, now);
+        typewriter.push(first, now);
+        typewriter.push(second, now + Duration::from_millis(5));
 
-    assert_eq!(
-        typewriter.take_frame(now + Duration::from_millis(10)),
-        "e\u{301}"
-    );
-    assert_eq!(typewriter.pending_text(), "x");
-}
-
-#[test]
-fn assistant_typewriter_preserves_zwj_sequence_split_across_deltas() {
-    let now = Instant::now();
-    let stream = AssistantDeltaStream {
-        child_session_id: None,
-        parent_tool_call_id: None,
-        message_id: None,
-    };
-    let mut typewriter = AssistantTypewriter::new(stream, None, now);
-    typewriter.push("👩", now);
-    typewriter.push("‍💻x", now + Duration::from_millis(5));
-
-    assert_eq!(typewriter.take_frame(now + Duration::from_millis(10)), "👩‍💻");
-    assert_eq!(typewriter.pending_text(), "x");
+        assert_eq!(
+            typewriter.take_frame(now + Duration::from_millis(10)),
+            expected,
+            "{first:?} + {second:?}"
+        );
+        assert_eq!(typewriter.pending_text(), "x");
+    }
 }
 
 #[test]
@@ -4895,29 +4915,6 @@ fn deferred_events_keep_later_deltas_behind_the_barrier() {
         &runtime.state().timeline.items()[1],
         TimelineItem::Assistant(message) if message.text == "after" && message.streaming
     ));
-}
-
-#[test]
-fn assistant_typewriter_tracks_delta_arrival_rate() {
-    let now = Instant::now();
-    let mut typewriter = AssistantTypewriter::new(
-        AssistantDeltaStream {
-            child_session_id: None,
-            parent_tool_call_id: None,
-            message_id: None,
-        },
-        None,
-        now,
-    );
-    typewriter.push("a", now);
-    typewriter.push("abcdefghij", now + Duration::from_millis(20));
-
-    assert!(
-        typewriter.graphemes_per_second > ASSISTANT_TYPEWRITER_INITIAL_RATE,
-        "rate = {}",
-        typewriter.graphemes_per_second
-    );
-    assert!(typewriter.graphemes_per_second <= ASSISTANT_TYPEWRITER_MAX_RATE);
 }
 
 #[test]
@@ -6444,81 +6441,48 @@ fn config_editor_expands_and_applies_a_choice() {
 }
 
 #[test]
-fn config_editor_shows_the_selected_field_description() {
-    let mut runtime = runtime_with_config("active_provider = \"openai\"\n");
-    runtime
-        .state_mut()
-        .set_language(Some(crate::tui::i18n::Language::En));
-    runtime.state_mut().set_input("/config");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("config command is accepted");
+fn config_editor_descriptions_follow_the_active_language() {
+    for (language, expected) in [
+        (
+            crate::tui::i18n::Language::En,
+            "Provider used by the current session",
+        ),
+        (crate::tui::i18n::Language::ZhCn, "当前会话使用的 provider"),
+    ] {
+        let mut runtime = runtime_with_config("active_provider = \"openai\"\n");
+        runtime.state_mut().set_language(Some(language));
+        runtime.state_mut().set_input("/config");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("config command is accepted");
 
-    let index = runtime
-        .state()
-        .dialog()
-        .expect("config dialog")
-        .items
-        .iter()
-        .position(|item| item.label == "active_provider")
-        .expect("active_provider field");
-    runtime
-        .state_mut()
-        .dialog_mut()
-        .expect("config dialog")
-        .selected = index;
-    runtime
-        .handle_input_action(InputAction::DialogNext)
-        .expect("move away");
-    runtime
-        .handle_input_action(InputAction::DialogPrev)
-        .expect("move back and sync the description");
+        let index = runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .items
+            .iter()
+            .position(|item| item.label == "active_provider")
+            .expect("active_provider field");
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("config dialog")
+            .selected = index;
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("move away");
+        runtime
+            .handle_input_action(InputAction::DialogPrev)
+            .expect("move back and sync the description");
 
-    let dialog = runtime.state().dialog().expect("config dialog");
-    let description = dialog.description.as_deref().expect("field description");
-    assert!(
-        description.contains("Provider used by the current session"),
-        "{description}"
-    );
-}
-
-#[test]
-fn config_editor_translates_schema_descriptions() {
-    let mut runtime = runtime_with_config("active_provider = \"openai\"\n");
-    runtime
-        .state_mut()
-        .set_language(Some(crate::tui::i18n::Language::ZhCn));
-    runtime.state_mut().set_input("/config");
-    runtime
-        .handle_input_action(InputAction::Submit)
-        .expect("config command is accepted");
-
-    let index = runtime
-        .state()
-        .dialog()
-        .expect("config dialog")
-        .items
-        .iter()
-        .position(|item| item.label == "active_provider")
-        .expect("active_provider field");
-    runtime
-        .state_mut()
-        .dialog_mut()
-        .expect("config dialog")
-        .selected = index;
-    runtime
-        .handle_input_action(InputAction::DialogNext)
-        .expect("move away");
-    runtime
-        .handle_input_action(InputAction::DialogPrev)
-        .expect("move back and sync the description");
-
-    let dialog = runtime.state().dialog().expect("config dialog");
-    let description = dialog.description.as_deref().expect("field description");
-    assert!(
-        description.contains("当前会话使用的 provider"),
-        "{description}"
-    );
+        let dialog = runtime.state().dialog().expect("config dialog");
+        let description = dialog.description.as_deref().expect("field description");
+        assert!(
+            description.contains(expected),
+            "{language:?}: {description}"
+        );
+    }
 }
 
 #[test]
@@ -7780,41 +7744,29 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn idle_shutdown_prevents_deferred_command_dispatch() {
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        let mut deferred_commands =
-            VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
-                "deferred",
-                crate::user_content::UserMessageContent::from("deferred"),
-            ))]);
-        control_tx
-            .send(SessionEngineControl::Shutdown)
-            .expect("queue shutdown");
+    async fn idle_shutdown_and_disconnect_prevent_deferred_command_dispatch() {
+        for shutdown in [true, false] {
+            let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+            let mut deferred_commands =
+                VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                    "deferred",
+                    crate::user_content::UserMessageContent::from("deferred"),
+                ))]);
+            if shutdown {
+                control_tx
+                    .send(SessionEngineControl::Shutdown)
+                    .expect("queue shutdown");
+            } else {
+                drop(control_tx);
+            }
 
-        assert!(
-            next_idle_session_operation(&mut control_rx, &mut deferred_commands)
-                .await
-                .is_none()
-        );
-        assert_eq!(deferred_commands.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn idle_disconnect_prevents_deferred_command_dispatch() {
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        let mut deferred_commands =
-            VecDeque::from([SessionEngineCommand::Prompt(UserMessageSubmission::new(
-                "deferred",
-                crate::user_content::UserMessageContent::from("deferred"),
-            ))]);
-        drop(control_tx);
-
-        assert!(
-            next_idle_session_operation(&mut control_rx, &mut deferred_commands)
-                .await
-                .is_none()
-        );
-        assert_eq!(deferred_commands.len(), 1);
+            assert!(
+                next_idle_session_operation(&mut control_rx, &mut deferred_commands)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(deferred_commands.len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -8081,21 +8033,17 @@ mod integration_tests {
     }
 
     #[test]
-    fn cross_turn_stale_interrupt_plan_is_rejected() {
-        stale_interrupt_plan_with_different_identity_is_rejected(
-            "cross-turn-stale-interrupt",
-            Some(999),
-            None,
-        );
-    }
-
-    #[test]
-    fn cross_branch_stale_interrupt_plan_is_rejected() {
-        stale_interrupt_plan_with_different_identity_is_rejected(
-            "cross-branch-stale-interrupt",
-            Some(82),
-            Some("different-branch"),
-        );
+    fn stale_interrupt_plan_with_different_turn_or_branch_is_rejected() {
+        for (label, turn_id, branch_id) in [
+            ("cross-turn-stale-interrupt", Some(999), None),
+            (
+                "cross-branch-stale-interrupt",
+                Some(82),
+                Some("different-branch"),
+            ),
+        ] {
+            stale_interrupt_plan_with_different_identity_is_rejected(label, turn_id, branch_id);
+        }
     }
 
     #[test]

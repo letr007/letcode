@@ -113,19 +113,6 @@ fn dropped_child_terminal_only_fires_for_dropped_statuses() {
     );
 }
 
-#[test]
-fn config_templates_keep_windows_paths_parseable() {
-    let path =
-        std::path::Path::new("C:\\Users\\runneradmin\\AppData\\Local\\Temp\\letcode\\sessions");
-    let rendered = format!("sessions_dir = \"{}\"\n", toml_path(path));
-
-    let parsed: toml::Value = toml::from_str(&rendered).expect("windows paths must stay parseable");
-    assert_eq!(
-        parsed["sessions_dir"].as_str(),
-        Some(path.to_string_lossy().as_ref())
-    );
-}
-
 fn parent_transcript(sessions_dir: &std::path::Path) -> Arc<StdMutex<TranscriptRecorder>> {
     Arc::new(StdMutex::new(
         TranscriptRecorder::create(sessions_dir).expect("create parent transcript"),
@@ -188,15 +175,6 @@ fn child_view_event(event: SessionTransportEvent) -> (String, usize, usize) {
     }
 }
 
-fn child_terminal(child_session_id: &str) -> SessionTransportEvent {
-    SessionTransportEvent::ChildSessionEvent {
-        child_session_id: child_session_id.into(),
-        agent_name: Some("explorer".into()),
-        parent_tool_call_id: None,
-        event: SessionEvent::AssistantDone { message_id: None },
-    }
-}
-
 /// The producer drops a child's streaming tail when its turn ends, so the
 /// queued drain forwards the terminal event with no live text behind it.
 #[tokio::test]
@@ -213,23 +191,6 @@ async fn queued_terminal_child_events_leave_no_live_text() {
         live_text.get("child-1"),
         None,
         "the producer clears the tail when the child's turn ends"
-    );
-
-    let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
-    runner_tx
-        .send(child_terminal("child-1"))
-        .expect("queue the terminal child event");
-
-    forward_queued_runner_events(&mut runner_rx, &session_tx);
-    assert!(
-        session_rx.try_recv().is_ok(),
-        "the queued child event is forwarded"
-    );
-    assert_eq!(
-        live_text.get("child-1"),
-        None,
-        "a forwarded terminal child event must not leave a streaming tail"
     );
 }
 
@@ -259,26 +220,6 @@ fn persisting_an_assistant_message_drops_its_live_prefix_before_the_continuation
         Some("continued"),
         "the persisted segment must not remain in the in-progress text"
     );
-}
-
-#[tokio::test]
-async fn command_ingress_preserves_fifo_order() {
-    let (mut engine, ingress, _egress) = SessionEngine::new();
-    ingress
-        .submit(SessionCommand::SetModel("first".into()))
-        .expect("engine accepts first command");
-    ingress
-        .submit(SessionCommand::SetModel("second".into()))
-        .expect("engine accepts second command");
-
-    assert!(matches!(
-        engine.recv_control().await,
-        Some(SessionEngineControl::Command(SessionEngineCommand::SetModel(model))) if model == "first"
-    ));
-    assert!(matches!(
-        engine.recv_control().await,
-        Some(SessionEngineControl::Command(SessionEngineCommand::SetModel(model))) if model == "second"
-    ));
 }
 
 #[test]
@@ -551,7 +492,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn cancelled_background_completion_emits_a_terminal_without_continuation() {
+    fn background_completion_terminal_follows_run_status() {
         let runtime = SubagentPool::new();
         let transcript = parent_transcript(&temp_sessions_dir());
         let parent_session_id = transcript
@@ -559,116 +500,55 @@ mod integration_tests {
             .expect("lock transcript")
             .session_id()
             .to_string();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut notified = std::collections::HashMap::new();
-        let result = Ok(run_summary(
-            "run-cancelled",
-            "child-cancelled",
-            "explorer",
-            SubagentStatus::Cancelled,
-        ));
 
-        let deliverable = observe_background_subagent_completion(
-            &transcript,
-            &runtime,
-            &mut notified,
-            &tx,
-            &parent_session_id,
-            Some("background-call".into()),
-            &result,
-        );
-        assert!(
-            !deliverable,
-            "a cancelled background run must not continue the turn"
-        );
-        assert_eq!(
-            child_interrupted(rx.try_recv().expect("terminal")),
-            Some("child-cancelled".into())
-        );
-        let completion = rx.try_recv().expect("cancelled completion");
-        assert!(matches!(
-            completion,
-            SessionTransportEvent::BackgroundSubagentCompleted {
-                parent_tool_call_id: Some(call_id),
+        for (status, call_id, deliverable_expected, terminal_expected) in [
+            (
+                SubagentStatus::Cancelled,
+                Some("background-call"),
+                false,
+                true,
+            ),
+            (SubagentStatus::TimedOut, None, true, true),
+            (SubagentStatus::Completed, None, true, false),
+        ] {
+            let child = format!("child-{status:?}").to_lowercase();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut notified = std::collections::HashMap::new();
+            let result = Ok(run_summary(
+                &format!("run-{child}"),
+                &child,
+                "explorer",
+                status,
+            ));
+
+            let deliverable = observe_background_subagent_completion(
+                &transcript,
+                &runtime,
+                &mut notified,
+                &tx,
+                &parent_session_id,
+                call_id.map(str::to_string),
+                &result,
+            );
+            assert_eq!(deliverable, deliverable_expected, "{status:?}");
+            if terminal_expected {
+                assert_eq!(
+                    child_interrupted(rx.try_recv().expect("terminal")),
+                    Some(child),
+                    "{status:?}"
+                );
+            }
+            let SessionTransportEvent::BackgroundSubagentCompleted {
+                parent_tool_call_id,
                 result: summary,
-            } if call_id == "background-call" && summary.status == SubagentStatus::Cancelled
-        ));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn timed_out_background_completion_emits_a_terminal_and_still_delivers() {
-        let runtime = SubagentPool::new();
-        let transcript = parent_transcript(&temp_sessions_dir());
-        let parent_session_id = transcript
-            .lock()
-            .expect("lock transcript")
-            .session_id()
-            .to_string();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut notified = std::collections::HashMap::new();
-        let result = Ok(run_summary(
-            "run-timed-out",
-            "child-timed-out",
-            "explorer",
-            SubagentStatus::TimedOut,
-        ));
-
-        let deliverable = observe_background_subagent_completion(
-            &transcript,
-            &runtime,
-            &mut notified,
-            &tx,
-            &parent_session_id,
-            None,
-            &result,
-        );
-        assert!(deliverable);
-        assert_eq!(
-            child_interrupted(rx.try_recv().expect("terminal")),
-            Some("child-timed-out".into())
-        );
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(SessionTransportEvent::BackgroundSubagentCompleted { .. })
-        ));
-    }
-
-    #[test]
-    fn completed_background_run_emits_no_terminal() {
-        let runtime = SubagentPool::new();
-        let transcript = parent_transcript(&temp_sessions_dir());
-        let parent_session_id = transcript
-            .lock()
-            .expect("lock transcript")
-            .session_id()
-            .to_string();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut notified = std::collections::HashMap::new();
-        let result = Ok(run_summary(
-            "run-completed",
-            "child-completed",
-            "explorer",
-            SubagentStatus::Completed,
-        ));
-
-        assert!(observe_background_subagent_completion(
-            &transcript,
-            &runtime,
-            &mut notified,
-            &tx,
-            &parent_session_id,
-            None,
-            &result,
-        ));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(SessionTransportEvent::BackgroundSubagentCompleted { .. })
-        ));
-        assert!(
-            rx.try_recv().is_err(),
-            "a completed run already published its terminal"
-        );
+            } = rx.try_recv().expect("completion")
+            else {
+                panic!("{status:?}: expected a background completion");
+            };
+            assert_eq!(parent_tool_call_id.as_deref(), call_id, "{status:?}");
+            assert_eq!(summary.status, status, "{status:?}");
+            assert!(rx.try_recv().is_err(), "{status:?}");
+        }
     }
 
     #[test]

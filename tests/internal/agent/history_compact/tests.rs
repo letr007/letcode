@@ -37,25 +37,16 @@ fn plan_turn_cut_keeps_recent_complete_tool_group() {
 
 #[test]
 fn plan_turn_cut_with_zero_budget_compacts_the_full_safe_history() {
-    let history = vec![HistoryItem::user("old"), HistoryItem::assistant("recent")];
-
-    let cut = plan_turn_cut(&history, None, 0)
-        .expect("plan")
-        .expect("history is compactable");
-
-    assert_eq!(cut.cut_end, history.len());
-    assert_eq!(cut.prefix, history);
-}
-
-#[test]
-fn plan_turn_cut_compacts_a_single_entry_without_a_suffix() {
-    let history = [HistoryItem::user("only")];
-    let cut = plan_turn_cut(&history, None, 0)
-        .expect("plan")
-        .expect("single entry is compactable");
-
-    assert_eq!(cut.cut_end, history.len());
-    assert_eq!(cut.prefix, history);
+    for history in [
+        vec![HistoryItem::user("old"), HistoryItem::assistant("recent")],
+        vec![HistoryItem::user("only")],
+    ] {
+        let cut = plan_turn_cut(&history, None, 0)
+            .expect("plan")
+            .expect("history is compactable");
+        assert_eq!(cut.cut_end, history.len());
+        assert_eq!(cut.prefix, history);
+    }
 }
 
 #[test]

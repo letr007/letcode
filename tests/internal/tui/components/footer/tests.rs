@@ -330,23 +330,15 @@ fn footer_hides_git_branch_outside_a_repository() {
 }
 
 #[test]
-fn token_budget_units_keep_cache_input_and_output_segments() {
+fn token_budget_units_follow_usage_and_keep_categories_visible() {
     assert_eq!(
         token_budget_segment_units(100, 10, [20, 30, 10]),
         [16, 24, 8]
     );
-}
-
-#[test]
-fn token_budget_units_keep_low_usage_visible() {
     assert_eq!(
         token_budget_segment_units(400_000, 10, [0, 15_900, 1_400]),
         [0, 3, 0]
     );
-}
-
-#[test]
-fn token_budget_units_make_tiny_used_total_visible_once() {
     assert_eq!(
         token_budget_segment_units(1_000_000, 10, [0, 10, 0]),
         [0, 1, 0]

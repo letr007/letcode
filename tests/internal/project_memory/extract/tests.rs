@@ -189,25 +189,6 @@ fn interrupted_and_failed_turns_are_consumable_boundaries() {
 }
 
 #[test]
-fn parser_accepts_empty_unknown_fields_and_deduplicates_sources() {
-    let records = vec![
-        record(
-            1,
-            TranscriptEvent::UserMessage {
-                content: "decision".into(),
-            },
-        ),
-        record(2, finalized()),
-    ];
-    let batch = prepare_batch(&records, 0, &[]).unwrap().unwrap();
-    let update = parse_update(r#"{"memories":[],"withdrawn_ids":[]}"#, &batch, &[]).unwrap();
-    assert!(update.memories.is_empty());
-    assert!(update.withdrawn_ids.is_empty());
-    let bad = r#"{"memories":[{"kind":"decision","title":"x","summary":"y","status":"useful","source_ids":["raw:99"],"paths":[],"supersedes":[]}],"withdrawn_ids":[]}"#;
-    assert!(parse_update(bad, &batch, &[]).is_err());
-}
-
-#[test]
 fn parser_ignores_unknown_fields_and_deduplicates_sources() {
     let records = vec![record(1, finalized())];
     let batch = prepare_batch(&records, 0, &[]).unwrap().unwrap();
@@ -220,6 +201,12 @@ fn parser_ignores_unknown_fields_and_deduplicates_sources() {
         .unwrap();
     assert_eq!(update.memories[0].source_ids, ["raw:1"]);
     assert_eq!(update.memories[0].supersedes, ["memory-1"]);
+
+    let empty = parse_update(r#"{"memories":[],"withdrawn_ids":[]}"#, &batch, &[]).unwrap();
+    assert!(empty.memories.is_empty());
+    assert!(empty.withdrawn_ids.is_empty());
+    let bad = r#"{"memories":[{"kind":"decision","title":"x","summary":"y","status":"useful","source_ids":["raw:99"],"paths":[],"supersedes":[]}],"withdrawn_ids":[]}"#;
+    assert!(parse_update(bad, &batch, &[]).is_err());
 }
 
 #[test]

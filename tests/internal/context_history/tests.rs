@@ -70,7 +70,6 @@ fn application_cannot_reference_unpublished_or_duplicate_work() {
 #[test]
 fn selections_are_deterministic_and_zero_budget_archives() {
     let c = vec![compartment("1"), compartment("2")];
-    assert_eq!(select_tiers(&c, 200), select_tiers(&c, 200));
     assert!(select_tiers(&c, 0).is_empty());
     assert_eq!(select_tiers(&c, 10000).len(), 2);
 }

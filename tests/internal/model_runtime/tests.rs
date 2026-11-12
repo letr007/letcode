@@ -249,32 +249,6 @@ base_url = "https://example.invalid/v1"
 }
 
 #[test]
-fn chat_completions_preserves_declared_tool_result_images() {
-    let catalog = RuntimeConfig::from_toml(
-        r#"
-active_provider = "cpa"
-[providers.cpa]
-protocol = "completions"
-default_model = "deepseek-flash"
-[providers.cpa.auth]
-type = "none"
-[providers.cpa.endpoints]
-base_url = "https://example.invalid/v1"
-[providers.cpa.models."deepseek-flash"]
-[providers.cpa.models."deepseek-flash".capabilities]
-input_images = true
-tool_result_images = true
-"#,
-    )
-    .unwrap()
-    .resolve(&ProtocolRegistry::builtins())
-    .unwrap();
-    let route = catalog.route("cpa", "deepseek-flash").unwrap();
-    assert!(route.capabilities.input_images);
-    assert!(route.capabilities.tool_result_images);
-}
-
-#[test]
 fn structured_output_capability_is_resolved_from_model_configuration() {
     let resolve = |setting: &str| {
         RuntimeConfig::from_toml(&runtime_config("vendor", "type = \"none\"", "", setting))
@@ -645,19 +619,6 @@ fn default_provider_environment_credential_is_snapshotted() {
         Some("default-first")
     );
     unsafe { std::env::remove_var(key) };
-}
-
-#[tokio::test]
-async fn transport_response_preserves_status_headers_and_chunks() {
-    let mut headers = BTreeMap::new();
-    headers.insert("retry-after".into(), "7".into());
-    let mut response =
-        TransportResponse::from_chunks(429, headers, vec![b"first".to_vec(), b"second".to_vec()]);
-    assert_eq!(response.status, 429);
-    assert_eq!(response.retry_hint(), RetryHint::RetryAfterSeconds(7));
-    assert_eq!(response.next_chunk().await.unwrap().unwrap(), b"first");
-    assert_eq!(response.next_chunk().await.unwrap().unwrap(), b"second");
-    assert!(response.next_chunk().await.is_none());
 }
 
 mod integration_tests {

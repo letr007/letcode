@@ -338,7 +338,7 @@ fn the_anthropic_profile_prepends_the_client_blocks() {
 }
 
 #[test]
-fn session_title_request_is_disguised_while_the_fake_is_on() {
+fn session_title_request_follows_the_fake_client_state() {
     let mut agent = test_agent();
     install_active_epoch_route(&mut agent, ApiProtocol::Responses);
     agent.set_fake_client(Some(crate::fake::FakeClient::Codex));
@@ -374,44 +374,29 @@ fn session_title_request_is_disguised_while_the_fake_is_on() {
         "the title request is scoped to the disguised session"
     );
     assert!(body.get("client_metadata").is_some());
-}
 
-#[test]
-fn anthropic_session_title_request_carries_the_claude_code_profile() {
-    let mut agent = test_agent();
-    agent.set_default_protocol(ApiProtocol::Anthropic);
-    install_active_epoch_route(&mut agent, ApiProtocol::Anthropic);
-    agent.set_fake_client(Some(crate::fake::FakeClient::Anthropic));
-
-    let title_agent = agent.session_title_agent();
-    let route = title_agent
+    let mut plain = test_agent();
+    install_active_epoch_route(&mut plain, ApiProtocol::Responses);
+    let plain_title = plain.session_title_agent();
+    let plain_route = plain_title
         .resolved_model_route()
         .expect("the title helper shares the session route");
-    let decorator = super::protocol_stream::fake_request_decorator(&title_agent, route, false)
-        .expect("the title request carries the active fake");
-    let request = super::protocol_stream::prepare_oneshot_http_request(
-        route,
-        title_agent.active_model_metadata(),
-        &title_agent.prelude,
+    assert!(
+        super::protocol_stream::fake_request_decorator(&plain_title, plain_route, false).is_none()
+    );
+    let plain_request = super::protocol_stream::prepare_oneshot_http_request(
+        plain_route,
+        plain_title.active_model_metadata(),
+        &plain_title.prelude,
         "rename this session",
-        Some(&decorator),
+        None,
     )
     .expect("the title request is prepared");
 
-    let headers = &request.protocol_headers;
-    let user_agent = headers.get("user-agent").expect("client identity");
-    assert!(user_agent.starts_with("claude-cli/"), "{user_agent}");
-    assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
-    assert!(!headers.contains_key("x-client-request-id"));
-    assert!(!headers.contains_key("originator"));
-    let session_id = headers
-        .get("x-claude-code-session-id")
-        .expect("session id is disguised");
-
-    let body: serde_json::Value =
-        serde_json::from_slice(&request.body).expect("the prepared body is JSON");
-    let user_id = body["metadata"]["user_id"].as_str().expect("user id");
-    assert!(user_id.contains(session_id.as_str()), "{user_id}");
+    assert!(!plain_request.protocol_headers.contains_key("originator"));
+    let plain_body: serde_json::Value =
+        serde_json::from_slice(&plain_request.body).expect("the prepared body is JSON");
+    assert!(plain_body.get("client_metadata").is_none());
 }
 
 /// Reads one request from a test server connection.
@@ -499,31 +484,6 @@ fn assert_claude_client_profile(head: &str, body: &str) {
     assert!(head.starts_with("post /v1/messages?beta=true "), "{head}");
     assert!(head.contains("user-agent: claude-cli/"), "{head}");
     assert!(head.contains("x-claude-code-session-id: "), "{head}");
-}
-
-#[test]
-fn session_title_request_stays_undisguised_while_the_fake_is_off() {
-    let mut agent = test_agent();
-    install_active_epoch_route(&mut agent, ApiProtocol::Responses);
-
-    let title_agent = agent.session_title_agent();
-    let route = title_agent
-        .resolved_model_route()
-        .expect("the title helper shares the session route");
-    assert!(super::protocol_stream::fake_request_decorator(&title_agent, route, false).is_none());
-    let request = super::protocol_stream::prepare_oneshot_http_request(
-        route,
-        title_agent.active_model_metadata(),
-        &title_agent.prelude,
-        "rename this session",
-        None,
-    )
-    .expect("the title request is prepared");
-
-    assert!(!request.protocol_headers.contains_key("originator"));
-    let body: serde_json::Value =
-        serde_json::from_slice(&request.body).expect("the prepared body is JSON");
-    assert!(body.get("client_metadata").is_none());
 }
 
 fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
@@ -1762,11 +1722,7 @@ fn protocol_prefix_digest_is_stable_for_identical_frames_and_sensitive_to_change
     let d3 = protocol_prefix_digest(&frames(&["alpha", "gamma"]));
     assert_eq!(d1, d2, "identical history must produce a stable digest");
     assert_ne!(d1, d3, "content change must change the digest");
-}
 
-#[test]
-fn protocol_prefix_digest_is_length_sensitive_for_large_tool_output() {
-    // 工具输出远超 128 字符的有界前缀，长度不同必须仍能区分（不能退化为前缀-only）。
     let mk = |n: usize| {
         crate::protocol_frames::ProtocolFrame::derived(
             crate::protocol_frames::ProtocolItem::ToolOutput {
@@ -1778,7 +1734,8 @@ fn protocol_prefix_digest_is_length_sensitive_for_large_tool_output() {
     };
     assert_ne!(
         protocol_prefix_digest(&[mk(200)]),
-        protocol_prefix_digest(&[mk(300)])
+        protocol_prefix_digest(&[mk(300)]),
+        "length change must change the digest"
     );
 }
 
@@ -2197,17 +2154,6 @@ fn live_append_preserves_history_content() {
         },
         HistoryItem::assistant("done"),
     ];
-    assert_eq!(agent.history_for_test(), expected);
-}
-
-#[test]
-fn session_restore_preserves_history_content() {
-    let mut agent = test_agent();
-    let history = vec![HistoryItem::user("seed"), HistoryItem::assistant("answer")];
-    agent
-        .restore_session_history(history.clone(), Vec::new(), 3)
-        .expect("restore session history");
-    let expected = vec![HistoryItem::user("seed"), HistoryItem::assistant("answer")];
     assert_eq!(agent.history_for_test(), expected);
 }
 

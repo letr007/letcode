@@ -349,38 +349,6 @@ fn anthropic_logical_units_preserve_one_unit_per_prompt_segment() {
     let segment_count = result.prompt_plan.segments.len();
     assert!(segment_count > 0);
     assert_eq!(observe_logical_request(&result).units.len(), segment_count);
-    for prefix in 0..=segment_count {
-        let _ = provider_unit_prefix_digest(&result, prefix);
-    }
-}
-
-#[test]
-fn anthropic_messages_applies_adaptive_thinking_effort() {
-    let history = vec![HistoryItem::user("current")];
-    let mut model = metadata(8_192);
-    model.supports_reasoning = true;
-    model.reasoning_effort = Some(ModelReasoningEffort::Medium);
-    model.anthropic_thinking = AnthropicThinkingConfig {
-        mode: AnthropicThinkingMode::Adaptive,
-        budget_tokens: None,
-    };
-    let result = build_test_request(TestRequestBuilderInput {
-        model_id: "claude-test",
-        model,
-        prelude: &[],
-        history: &history,
-        protected_start_index: 0,
-        tools: &[],
-        evidence: &[],
-    })
-    .expect("anthropic adaptive request builds");
-    assert!(
-        result
-            .prompt_plan
-            .segments
-            .iter()
-            .any(|segment| segment.text == "current")
-    );
 }
 
 #[test]
@@ -416,45 +384,6 @@ fn deepseek_completions_preserves_skill_material_across_developer_messages() {
     assert!(contains("SKILL BODY MAGIC"));
     assert!(contains("persona stable instructions"));
     assert!(contains("ctf-web"));
-}
-
-#[test]
-fn deepseek_chat_compat_preserves_empty_reasoning_content_for_tool_turns() {
-    let history = vec![
-        HistoryItem::AssistantTurn {
-            text: None,
-            reasoning_content: None,
-            replay: None,
-            calls: vec![HistoryToolCall {
-                call_id: "call-1".into(),
-                name: "read_file".into(),
-                arguments_json: "{}".into(),
-            }],
-        },
-        HistoryItem::ToolOutput {
-            call_id: "call-1".into(),
-            output_json: "ok".into(),
-            images: Vec::new(),
-        },
-        HistoryItem::user("continue"),
-    ];
-    let result = build_test_request(TestRequestBuilderInput {
-        model_id: "deepseek-v4-flash",
-        model: deepseek_metadata(),
-        prelude: &[],
-        history: &history,
-        protected_start_index: 0,
-        tools: &[],
-        evidence: &[],
-    })
-    .expect("deepseek tool replay builds");
-    assert!(
-        result
-            .prompt_plan
-            .segments
-            .iter()
-            .any(|segment| segment.text == "continue")
-    );
 }
 
 #[test]

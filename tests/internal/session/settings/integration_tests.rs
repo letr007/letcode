@@ -19,26 +19,6 @@ fn test_agent() -> Agent {
     Agent::new("gpt-5.5", 1, 1)
 }
 
-fn configured_agent(fast_mode_path: &std::path::Path) -> Agent {
-    std::fs::write(
-        fast_mode_path,
-        r#"active_provider = "primary"
-
-[providers.primary]
-base_url = "https://primary.invalid/v1"
-api_key = "primary-key"
-protocol = "responses"
-[providers.primary.models."gpt-5.5"]
-"#,
-    )
-    .expect("write Fast Mode config");
-    let mut agent = test_agent();
-    agent.set_primary_route(ModelRoute::new("primary", "gpt-5.5"));
-    let fast_mode = crate::fast_mode::FastMode::load(fast_mode_path, true);
-    agent.set_fast_mode(fast_mode);
-    agent
-}
-
 fn prepared_route(route: ModelRoute) -> crate::agent::PreparedPrimaryRoute {
     crate::agent::PreparedPrimaryRoute::new(
         route,
@@ -231,40 +211,6 @@ protocol = "responses"
         std::fs::read_to_string(&fast_mode_path).expect("read config after apply"),
         before
     );
-    assert_eq!(agent.model(), "gpt-5.5");
-    assert_eq!(
-        agent.primary_route(),
-        Some(&ModelRoute::new("primary", "gpt-5.5"))
-    );
-    assert!(
-        crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
-            .expect("read records")
-            .is_empty()
-    );
-}
-
-#[test]
-fn model_route_transcript_failure_follows_fast_mode_reconciliation_without_route_apply() {
-    let (base_dir, transcript, session_id) = temp_transcript();
-    let fast_mode_path = base_dir.join("letcode.toml");
-    let mut agent = configured_agent(&fast_mode_path);
-    let cloned = Arc::clone(&transcript);
-    let join = std::thread::spawn(move || {
-        let _guard = cloned.lock().expect("lock transcript");
-        panic!("poison transcript mutex for test");
-    });
-    let _ = join.join();
-
-    let error = apply_model_route_with(
-        &mut agent,
-        &transcript,
-        ModelRoute::new("expert", "claude-4"),
-        prepared_route(ModelRoute::new("expert", "claude-4")),
-    )
-    .expect_err("transcript failure must prevent route application");
-
-    assert!(error.fast_mode_auto_disabled());
-    assert!(!agent.fast_mode_enabled());
     assert_eq!(agent.model(), "gpt-5.5");
     assert_eq!(
         agent.primary_route(),

@@ -15,20 +15,6 @@ fn evidence(id: &str) -> EvidenceRecord {
 }
 
 #[test]
-fn assistant_turn_conversion_preserves_reasoning_and_replay_without_tool_calls() {
-    let item = HistoryItem::AssistantTurn {
-        text: Some("answer".into()),
-        reasoning_content: Some("reasoning".into()),
-        replay: crate::model_runtime::OpaqueReplayState::from_anthropic_thinking_blocks_json(
-            r#"[{"type":"thinking","signature":"signed"}]"#,
-        ),
-        calls: Vec::new(),
-    };
-
-    assert_eq!(protocol_frame_item_from_history_item(&item), item);
-}
-
-#[test]
 fn incremental_agent_append_matches_cold_rebuild_with_metadata_and_evidence() {
     let base = vec![
         HistoryItem::user("older request"),

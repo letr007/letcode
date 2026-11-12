@@ -13,7 +13,7 @@ fn explicit_strategy_overrides_name_inference() {
 }
 
 #[test]
-fn astra_is_inferred_from_configured_or_wire_model_name() {
+fn strategy_is_inferred_from_configured_or_wire_model_name() {
     assert_eq!(
         ModelStrategyId::resolve(None, "gpt-6-astra", None),
         ModelStrategyId::Astra
@@ -22,14 +22,6 @@ fn astra_is_inferred_from_configured_or_wire_model_name() {
         ModelStrategyId::resolve(None, "friendly-name", Some("GPT-6-Astra-preview")),
         ModelStrategyId::Astra
     );
-    assert_eq!(
-        ModelStrategyId::resolve(None, "gpt-5.6", None),
-        ModelStrategyId::Default
-    );
-}
-
-#[test]
-fn deepseek_is_inferred_from_configured_or_wire_model_name() {
     assert_eq!(
         ModelStrategyId::resolve(None, "deepseek-flash", None),
         ModelStrategyId::Deepseek
@@ -46,15 +38,6 @@ fn deepseek_is_inferred_from_configured_or_wire_model_name() {
         ModelStrategyId::resolve(None, "gpt-5.6", None),
         ModelStrategyId::Default
     );
-}
-
-#[test]
-fn deepseek_harness_is_interactive_only() {
-    let message = ModelStrategyId::Deepseek
-        .interactive_prelude_message()
-        .expect("deepseek harness");
-    assert_eq!(message.origin, PromptMessageOrigin::StaticPrelude);
-    assert!(message.text.contains("DeepSeek 工作指引"));
 }
 
 #[test]
@@ -91,16 +74,23 @@ fn astra_uses_the_first_explicit_effort_when_no_default_is_configured() {
 }
 
 #[test]
-fn astra_harness_is_interactive_only_and_default_is_empty() {
+fn harness_prelude_is_interactive_only() {
     assert!(
         ModelStrategyId::Default
             .interactive_prelude_message()
             .is_none()
     );
-    let message = ModelStrategyId::Astra
+
+    let astra = ModelStrategyId::Astra
         .interactive_prelude_message()
         .expect("astra harness");
-    assert_eq!(message.origin, PromptMessageOrigin::StaticPrelude);
-    assert!(message.text.contains("GPT-6 Astra 工作指引"));
-    assert!(message.text.contains("自然段"));
+    assert_eq!(astra.origin, PromptMessageOrigin::StaticPrelude);
+    assert!(astra.text.contains("GPT-6 Astra 工作指引"));
+    assert!(astra.text.contains("自然段"));
+
+    let deepseek = ModelStrategyId::Deepseek
+        .interactive_prelude_message()
+        .expect("deepseek harness");
+    assert_eq!(deepseek.origin, PromptMessageOrigin::StaticPrelude);
+    assert!(deepseek.text.contains("DeepSeek 工作指引"));
 }

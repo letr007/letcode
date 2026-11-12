@@ -583,62 +583,36 @@ fn interrupted_event_cancels_active_tool_and_clears_permission() {
 
 #[test]
 fn unseen_late_tool_events_do_not_revive_parent_state_after_interrupt() {
-    let mut state = TuiState::default();
-    state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
-        "call-1",
-        "shell__exec",
-    )));
-    state.apply_event(SessionEvent::Interrupted);
-
-    state.apply_event(SessionEvent::ToolFinished(
-        crate::tui::events::ToolFinishedEvent::new(
+    for late in [
+        SessionEvent::ToolFinished(crate::tui::events::ToolFinishedEvent::new(
             "late-call",
             "fs__write",
             "fs__write completed",
             ToolOutcome::Success,
-        ),
-    ));
+        )),
+        SessionEvent::ToolCancelled(ToolCancelledEvent::new("late-call", "fs__write")),
+    ] {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
+            "call-1",
+            "shell__exec",
+        )));
+        state.apply_event(SessionEvent::Interrupted);
 
-    assert_eq!(state.phase, AppPhase::Completed);
-    assert_eq!(state.active_tool_call_id, None);
+        state.apply_event(late);
 
-    assert_eq!(
-        state
-            .timeline
-            .items()
-            .iter()
-            .filter(|item| matches!(item, crate::tui::timeline::TimelineItem::Tool(_)))
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn unseen_late_tool_cancelled_does_not_override_interrupt_state() {
-    let mut state = TuiState::default();
-    state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
-        "call-1",
-        "shell__exec",
-    )));
-    state.apply_event(SessionEvent::Interrupted);
-
-    state.apply_event(SessionEvent::ToolCancelled(ToolCancelledEvent::new(
-        "late-call",
-        "fs__write",
-    )));
-
-    assert_eq!(state.phase, AppPhase::Completed);
-    assert_eq!(state.active_tool_call_id, None);
-
-    assert_eq!(
-        state
-            .timeline
-            .items()
-            .iter()
-            .filter(|item| matches!(item, crate::tui::timeline::TimelineItem::Tool(_)))
-            .count(),
-        1
-    );
+        assert_eq!(state.phase, AppPhase::Completed);
+        assert_eq!(state.active_tool_call_id, None);
+        assert_eq!(
+            state
+                .timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(item, crate::tui::timeline::TimelineItem::Tool(_)))
+                .count(),
+            1
+        );
+    }
 }
 
 #[test]

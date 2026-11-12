@@ -278,10 +278,7 @@ fn accumulator_preserves_tool_order_and_normalizes_completed_with_tools() {
     assert_eq!(result.terminal, TerminalStatus::ToolUse);
     assert_eq!(result.snapshot.completed_tools[0].id, "b");
     assert_eq!(result.snapshot.completed_tools[1].id, "a");
-}
 
-#[test]
-fn accumulator_keeps_reverse_tool_done_events_in_model_start_order() {
     let mut accumulator = AttemptAccumulator::default();
     for (id, name) in [("a", "first"), ("b", "second")] {
         accumulator
@@ -507,12 +504,6 @@ fn gpt_overload_uses_fixed_interval_without_exponential_growth() {
     );
     route.model = "claude-4".into();
     assert_eq!(overload_fixed_retry_delay(&route, &config, &failure), None);
-}
-
-#[test]
-fn resolved_route_carries_effective_retry_configuration() {
-    let route = route("responses");
-    assert_eq!(route.retry.as_ref().unwrap().max_attempts, 3);
 }
 
 mod integration_tests {

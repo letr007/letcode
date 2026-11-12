@@ -22,10 +22,15 @@ fn upsert_and_rows_roundtrip() {
     upsert(dir.path(), "parent", row(3)).unwrap();
     upsert(dir.path(), "other", row(5)).unwrap();
 
-    let rows = rows(dir.path());
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows["parent"].record_count, 3);
-    assert_eq!(rows["other"].record_count, 5);
+    let initial = rows(dir.path());
+    assert_eq!(initial.len(), 2);
+    assert_eq!(initial["parent"].record_count, 3);
+    assert_eq!(initial["other"].record_count, 5);
+
+    upsert(dir.path(), "parent", row(7)).unwrap();
+    let updated = rows(dir.path());
+    assert_eq!(updated.len(), 2);
+    assert_eq!(updated["parent"].record_count, 7);
 }
 
 #[test]
@@ -165,17 +170,4 @@ fn archived_ids_scan_transcripts_only() {
             .unwrap()
             .is_empty()
     );
-}
-
-#[test]
-fn concurrent_upserts_keep_every_row() {
-    let dir = tempfile::tempdir().unwrap();
-    upsert(dir.path(), "a", row(1)).unwrap();
-    upsert(dir.path(), "b", row(2)).unwrap();
-    upsert(dir.path(), "a", row(3)).unwrap();
-
-    let rows = rows(dir.path());
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows["a"].record_count, 3);
-    assert_eq!(rows["b"].record_count, 2);
 }

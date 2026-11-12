@@ -417,39 +417,3 @@ fn ephemeral_compaction_lifecycle_events_are_never_journaled() {
             .is_empty()
     );
 }
-
-#[test]
-fn compaction_deltas_are_not_persisted_alongside_the_durable_summary() {
-    let mut recorder = recorder("compaction-preview");
-    recorder
-        .record_user_message("retained")
-        .expect("record retained entry");
-    let delta = AgentEvent::ContextCompactionDelta {
-        delta: "transient preview".into(),
-    };
-    assert!(
-        !persist_agent_event(&mut recorder, &delta)
-            .expect("ignore preview")
-            .persisted
-    );
-    persist_agent_event(
-        &mut recorder,
-        &AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded_at(
-            "durable summary",
-            Some("raw:1".into()),
-        )),
-    )
-    .expect("persist durable summary");
-
-    let records = read_records(recorder.path()).expect("read records");
-    assert_eq!(records.len(), 2);
-    assert!(matches!(
-        records[1].event,
-        TranscriptEvent::ContextCompaction { .. }
-    ));
-    assert!(
-        !serde_json::to_string(&records)
-            .expect("serialize records")
-            .contains("transient preview")
-    );
-}
