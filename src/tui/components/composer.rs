@@ -428,11 +428,8 @@ fn render_pending_approval_panel(
     theme: Theme,
     translator: &crate::tui::i18n::Translator,
 ) -> Option<(u16, u16)> {
-    let Some(shell) =
-        render_connected_prompt_shell(frame, area, theme, surface::SurfaceEmphasis::Approval, 1)
-    else {
-        return None;
-    };
+    let shell =
+        render_connected_prompt_shell(frame, area, theme, surface::SurfaceEmphasis::Approval, 1)?;
 
     let pending_style = surface::surface_style(theme, surface::SurfaceKind::Element);
     let heading = approval_heading_line(
