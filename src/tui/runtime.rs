@@ -4437,6 +4437,25 @@ impl TuiRuntime {
                 &["mcp".to_string(), path[1].clone(), "remote".to_string()],
             );
             let nested = local.is_some() || remote.is_some();
+            let flat_local =
+                crate::config::config_array_in(document, &["mcp", &path[1], "command"])
+                    .is_some_and(|values| !values.is_empty())
+                    || Self::config_table(
+                        document,
+                        &[
+                            "mcp".to_string(),
+                            path[1].clone(),
+                            "environment".to_string(),
+                        ],
+                    )
+                    .is_some_and(|table| table.iter().next().is_some());
+            let flat_remote = Self::config_text(document, &["mcp", &path[1], "url"]).is_some()
+                || Self::config_table(
+                    document,
+                    &["mcp".to_string(), path[1].clone(), "headers".to_string()],
+                )
+                .is_some_and(|table| table.iter().next().is_some())
+                || Self::config_bool(document, &["mcp", &path[1], "oauth"]).unwrap_or(false);
             if path.len() == 4 {
                 return match path[2].as_str() {
                     "local" => local.is_some() && remote.is_none(),
@@ -4446,8 +4465,20 @@ impl TuiRuntime {
             }
             match path[2].as_str() {
                 "type" => return !nested,
-                "local" => return remote.is_none() && kind.as_deref() != Some("remote"),
-                "remote" => return local.is_none() && kind.as_deref() != Some("local"),
+                "local" => {
+                    return if nested {
+                        local.is_some() && remote.is_none()
+                    } else {
+                        !flat_local && kind.as_deref() == Some("local")
+                    };
+                }
+                "remote" => {
+                    return if nested {
+                        remote.is_some() && local.is_none()
+                    } else {
+                        !flat_remote && kind.as_deref() == Some("remote")
+                    };
+                }
                 "command" | "environment" | "env" => {
                     return !nested && kind.as_deref() != Some("remote");
                 }

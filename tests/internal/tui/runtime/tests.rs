@@ -6358,6 +6358,32 @@ fn config_editor_uses_mcp_local_and_remote_subtables() {
 }
 
 #[test]
+fn config_editor_keeps_legacy_mcp_flat_fields_visible() {
+    let mut runtime = runtime_with_config(
+        "[mcp.docs]\ntype = \"remote\"\nurl = \"https://example.invalid/mcp\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+    enter_config_table(&mut runtime, "mcp");
+    enter_config_table(&mut runtime, "docs");
+
+    let labels = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"type"), "{labels:?}");
+    assert!(labels.contains(&"url"), "{labels:?}");
+    assert!(!labels.contains(&"local"), "{labels:?}");
+    assert!(!labels.contains(&"remote"), "{labels:?}");
+}
+
+#[test]
 fn config_editor_lists_grouped_fields() {
     let mut runtime = runtime_with_config(
         "active_provider = \"openai\"\n\n[providers.openai]\ndefault_model = \"gpt-5.5\"\n\n[permissions]\nmode = \"default\"\n",
