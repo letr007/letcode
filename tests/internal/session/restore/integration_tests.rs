@@ -164,9 +164,6 @@ base_url = "https://primary.example.invalid/v1"
 tools = true
 parallel_tool_calls = true
 reasoning = true
-[providers.primary.models.shared.capabilities.generation]
-reasoning = true
-parallel_tool_calls = true
 [providers.primary.models.shared.generation]
 reasoning_effort = "medium"
 reasoning_efforts = ["medium", "high"]
@@ -183,9 +180,6 @@ base_url = "https://expert.example.invalid/v1"
 tools = true
 parallel_tool_calls = true
 reasoning = true
-[providers.expert.models.shared.capabilities.generation]
-reasoning = true
-parallel_tool_calls = true
 [providers.expert.models.shared.generation]
 reasoning_effort = "medium"
 reasoning_efforts = ["medium", "high"]

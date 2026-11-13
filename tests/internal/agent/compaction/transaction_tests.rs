@@ -20,7 +20,6 @@ type = "none"
 base_url = "http://127.0.0.1:1"
 [providers.test.models."test-model"]
 [providers.test.models."test-model".capabilities]
-generation = { max_output_tokens = true }
 [providers.test.models."test-model".generation]
 max_output_tokens = 128
 "#,
@@ -288,7 +287,6 @@ backoff_multiplier = 1.0
 jitter_secs = 0
 [providers.test.models."test-model"]
 [providers.test.models."test-model".capabilities]
-generation = {{ max_output_tokens = true }}
 [providers.test.models."test-model".generation]
 max_output_tokens = 128
 "#

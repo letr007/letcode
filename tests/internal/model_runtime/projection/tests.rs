@@ -19,9 +19,6 @@ tools = true
 parallel_tool_calls = true
 reasoning = true
 input_images = true
-[providers.vendor.models.model.capabilities.generation]
-max_output_tokens = true
-parallel_tool_calls = true
 "#
     ))
     .unwrap()
@@ -273,7 +270,6 @@ base_url = "https://example.invalid/v1"
 [providers.p.models.m.capabilities]
 tools = true
 parallel_tool_calls = true
-generation = {{ parallel_tool_calls = true }}
 input_images = {input_images}
 tool_result_images = {tool_result_images}
 "#

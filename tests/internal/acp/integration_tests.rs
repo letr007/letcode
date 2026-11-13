@@ -41,7 +41,6 @@ base_url = "http://127.0.0.1:1"
 
 [providers.test.models.model.capabilities]
 reasoning = true
-generation = { reasoning = true }
 
 [providers.test.models.model.generation]
 reasoning_effort = "low"

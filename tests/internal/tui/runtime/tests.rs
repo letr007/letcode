@@ -6320,7 +6320,7 @@ fn config_editor_groups_provider_fields_by_purpose() {
 }
 
 #[test]
-fn config_editor_uses_mcp_local_and_remote_subtables() {
+fn config_editor_uses_the_mcp_local_subtable() {
     let mut runtime = runtime_with_config(
         "[mcp.tool]\nenabled = true\n\n[mcp.tool.local]\ncommand = [\"echo\"]\n",
     );

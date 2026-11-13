@@ -552,7 +552,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn reviewer_route_selects_the_backend_from_its_provider() {
+    fn reviewer_route_backend_selects_the_jev_transport() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("letcode.toml");
         fs::write(
@@ -572,13 +572,17 @@ base_url = "http://127.0.0.1:1"
 [providers.typesafe]
 protocol = "responses"
 default_model = "jev-latest"
-reviewer = "jev"
 [providers.typesafe.auth]
 type = "bearer"
 credential = "typesafe-key"
 [providers.typesafe.endpoints]
 base_url = "https://api.typesafe.ai"
 [providers.typesafe.models."jev-latest"]
+
+[agents.reviewer]
+provider = "typesafe"
+model = "jev-latest"
+backend = "jev"
 "#,
         )
         .unwrap();
@@ -615,7 +619,6 @@ base_url = "http://127.0.0.1:1"
 [providers.test.models.current]
 [providers.test.models.current.capabilities]
 reasoning = true
-generation = { reasoning = true }
 [providers.test.models.current.generation]
 reasoning_efforts = ["high"]
 [providers.test.models.default]
@@ -1469,9 +1472,10 @@ base_url = "http://127.0.0.1:1/v1"
             active_provider = "primary"
 
             [mcp.alpha]
-            type = "local"
-            command = ["alpha"]
             enabled = true
+
+            [mcp.alpha.local]
+            command = ["alpha"]
 
             [providers.primary]
             protocol = "responses"
@@ -1484,8 +1488,6 @@ base_url = "http://127.0.0.1:1/v1"
 
             [providers.primary.models.primary-model]
             [providers.primary.models.primary-model.capabilities]
-            reasoning = true
-            [providers.primary.models.primary-model.capabilities.generation]
             reasoning = true
             [providers.primary.models.primary-model.generation]
             reasoning_effort = "high"
@@ -2314,8 +2316,6 @@ context_window = 128000
 effective_input_limit_tokens = 64000
 [providers.test.models.model.capabilities]
 tools = true
-[providers.test.models.model.capabilities.generation]
-max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,
@@ -2538,8 +2538,6 @@ context_window = 128000
 effective_input_limit_tokens = 64000
 [providers.test.models.model.capabilities]
 tools = true
-[providers.test.models.model.capabilities.generation]
-max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,
@@ -2807,8 +2805,6 @@ context_window = 128000
 effective_input_limit_tokens = 64000
 [providers.test.models.model.capabilities]
 tools = true
-[providers.test.models.model.capabilities.generation]
-max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,
@@ -3034,8 +3030,6 @@ context_window = 128000
 effective_input_limit_tokens = 64000
 [providers.test.models.model.capabilities]
 tools = true
-[providers.test.models.model.capabilities.generation]
-max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,
@@ -3165,8 +3159,6 @@ context_window = 128000
 effective_input_limit_tokens = 64000
 [providers.test.models.model.capabilities]
 tools = true
-[providers.test.models.model.capabilities.generation]
-max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,
@@ -3318,8 +3310,6 @@ context_window = 128000
 effective_input_limit_tokens = 64000
 [providers.test.models.model.capabilities]
 tools = true
-[providers.test.models.model.capabilities.generation]
-max_output_tokens = true
 [providers.test.models.model.generation]
 max_output_tokens = 4096
 "#,

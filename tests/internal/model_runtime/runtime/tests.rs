@@ -55,8 +55,6 @@ jitter_secs = 0
 [providers.vendor.models.model.capabilities]
 tools = true
 reasoning = true
-[providers.vendor.models.model.capabilities.generation]
-reasoning = true
 {protocol_settings}
 "#
     );

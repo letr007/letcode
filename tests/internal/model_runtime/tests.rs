@@ -503,7 +503,7 @@ fn exact_generation_defaults_change_the_runtime_fingerprint() {
         "vendor",
         "type = \"bearer\"\ncredential = \"secret\"",
         "",
-        "[capabilities]\ngeneration = { max_output_tokens = true }\n[generation]\nmax_output_tokens = 128",
+        "[capabilities]\n\n[generation]\nmax_output_tokens = 128",
     );
     let changed = base.replace("max_output_tokens = 128", "max_output_tokens = 256");
     let first = RuntimeConfig::from_toml(&base)

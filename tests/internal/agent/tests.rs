@@ -551,8 +551,6 @@ tools = true
 parallel_tool_calls = true
 input_images = {supports_images}
 tool_result_images = {supports_images}
-[providers.test.models.m1.capabilities.generation]
-parallel_tool_calls = true
 "#,
         protocol.as_str()
     ))
@@ -745,9 +743,6 @@ type = "none"
 base_url = "https://test.example.invalid/v1"
 [providers.test.models.gpt-test.capabilities]
 tools = true
-parallel_tool_calls = true
-priority_service = true
-[providers.test.models.gpt-test.capabilities.generation]
 parallel_tool_calls = true
 priority_service = true
 "#,

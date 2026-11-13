@@ -188,7 +188,7 @@ fn permissions_jev_section_is_rejected_as_unknown() {
 }
 
 #[test]
-fn reviewer_provider_marker_selects_the_jev_backend() {
+fn legacy_reviewer_provider_marker_selects_the_jev_backend() {
     let text = format!(
         "{}\n[providers.typesafe]\nprotocol = \"responses\"\ndefault_model = \"jev-latest\"\nreviewer = \"jev\"\n\n[providers.typesafe.auth]\ntype = \"bearer\"\ncredential = \"typesafe-key\"\n\n[providers.typesafe.endpoints]\nbase_url = \"https://api.typesafe.ai\"\n\n[providers.typesafe.models.\"jev-latest\"]\n\n[agents.reviewer]\nprovider = \"typesafe\"\nmodel = \"jev-latest\"\n",
         config("primary", "model-a", "")
@@ -250,13 +250,12 @@ fn reviewer_route_backend_chat_overrides_the_legacy_provider_marker() {
 }
 
 #[test]
-fn reviewer_provider_supports_custom_endpoint_and_alias() {
+fn reviewer_route_backend_supports_custom_endpoint_and_alias() {
     let text = format!(
         r#"{}
 [providers.newapi]
 protocol = "responses"
 default_model = "jev-latest"
-reviewer = "jev"
 
 [providers.newapi.auth]
 type = "bearer"
@@ -273,6 +272,7 @@ path = "decisions"
 [agents.reviewer]
 provider = "newapi"
 model = "jev-latest"
+backend = "jev"
 "#,
         config("primary", "model-a", "")
     );
@@ -298,7 +298,6 @@ model = "jev-latest"
 [providers.newapi]
 protocol = "responses"
 default_model = "jev-latest"
-reviewer = "jev"
 
 [providers.newapi.auth]
 type = "bearer"
@@ -315,6 +314,7 @@ path = "/v1/decisions"
 [agents.reviewer]
 provider = "newapi"
 model = "jev-latest"
+backend = "jev"
 "#,
         config("primary", "model-a", "")
     );
@@ -358,7 +358,7 @@ fn loads_new_schema_and_resolves_non_empty_catalog() {
 model_override = "wire-standard"
 [capabilities]
 tools = true
-generation = { max_output_tokens = true }
+
 [generation]
 max_output_tokens = 256
 [cache]
@@ -387,7 +387,7 @@ fn astra_strategy_is_inferred_and_can_be_overridden_explicitly() {
         "gpt-6-astra",
         r#"[capabilities]
 reasoning = true
-generation = { reasoning = true }
+
 "#,
     )))
     .expect("astra model should infer its strategy");
@@ -435,7 +435,7 @@ generation = { reasoning = true }
         "gpt-6-astra",
         r#"[capabilities]
 reasoning = true
-generation = { reasoning = true }
+
 [generation]
 reasoning_efforts = ["high"]
 "#,
@@ -1213,7 +1213,7 @@ fn model_parallel_tool_calls_default_to_disabled_and_can_be_enabled() {
     let enabled = config(
         "openai",
         "model",
-        "[capabilities]\nparallel_tool_calls = true\ngeneration = { parallel_tool_calls = true }\n[generation]\nparallel_tool_calls = true",
+        "[capabilities]\nparallel_tool_calls = true\n\n[generation]\nparallel_tool_calls = true",
     );
     let enabled_config =
         AppConfig::load_from_path(write_temp_config(enabled)).expect("enabled config should load");
@@ -1528,13 +1528,13 @@ fn anthropic_reasoning_defaults_require_adaptive_thinking() {
     };
 
     let error = AppConfig::load_from_path(write_temp_config(route(
-            "[capabilities]\nreasoning = true\ngeneration = { reasoning = true }\n[generation]\nreasoning_effort = \"high\"",
-        )))
-        .expect_err("reasoning without thinking settings should fail");
+        "[capabilities]\nreasoning = true\n\n[generation]\nreasoning_effort = \"high\"",
+    )))
+    .expect_err("reasoning without thinking settings should fail");
     assert!(format!("{error:#}").contains("anthropic_thinking"));
 
     let loaded = AppConfig::load_from_path(write_temp_config(route(
-            "[capabilities]\nreasoning = true\ngeneration = { reasoning = true }\n[generation]\nreasoning_effort = \"high\"\n[protocol_settings]\nanthropic_thinking = { mode = \"adaptive\" }",
+            "[capabilities]\nreasoning = true\n\n[generation]\nreasoning_effort = \"high\"\n[protocol_settings]\nanthropic_thinking = { mode = \"adaptive\" }",
         )))
         .expect("adaptive thinking should load");
     assert!(
@@ -1566,7 +1566,7 @@ fn rejects_out_of_range_sampling_parameters() {
     let error = AppConfig::load_from_path(write_temp_config(config(
         "openai",
         "model",
-        "[capabilities]\ngeneration = { temperature = true }\n[generation]\ntemperature = 3.0",
+        "[capabilities]\n\n[generation]\ntemperature = 3.0",
     )))
     .expect_err("load should fail");
     assert!(format!("{error:#}").contains("temperature"));
@@ -1642,7 +1642,7 @@ fn persists_through_config_symlink_without_replacing_it() {
 #[test]
 fn rejects_invalid_mcp_local_config() {
     let error = AppConfig::load_from_path(write_temp_config(format!(
-        "{}\n\n[mcp.empty]\ntype = \"local\"\ncommand = []",
+        "{}\n\n[mcp.empty]\n\n[mcp.empty.local]\ncommand = []",
         config("openai", "model", "")
     )))
     .expect_err("load should fail");
@@ -1701,7 +1701,7 @@ fn mcp_nested_tables_reject_conflicting_shapes() {
 #[test]
 fn rejects_remote_mcp_oauth_until_supported() {
     let error = AppConfig::load_from_path(write_temp_config(format!(
-        "{}\n\n[mcp.docs]\ntype = \"remote\"\nurl = \"https://example.invalid/mcp\"\noauth = true",
+        "{}\n\n[mcp.docs]\n\n[mcp.docs.remote]\nurl = \"https://example.invalid/mcp\"\noauth = true",
         config("openai", "model", "")
     )))
     .expect_err("load should fail");

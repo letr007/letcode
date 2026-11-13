@@ -17,8 +17,6 @@ base_url = "https://test.example.invalid/v1"
 [providers.test.models.model.capabilities]
 tools = true
 parallel_tool_calls = true
-[providers.test.models.model.capabilities.generation]
-parallel_tool_calls = true
 "#,
     )
     .unwrap()
