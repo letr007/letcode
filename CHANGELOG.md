@@ -5,6 +5,28 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [0.29.0] - 2026-11-13
+
+### Added
+
+- 新增 `/rename [title]` 重命名当前会话。
+- `/config` 编辑器改为分页展示，只显示适用字段。
+
+### Changed
+
+- MCP 服务配置改为 `local` 与 `remote` 子表。
+- 审批审查后端改由 `[agents.reviewer] backend` 选择。
+- 生成参数改由协议与模型能力推导，结构化输出移至 `capabilities.structured_output`。
+- 仿真客户端剖面同步到 Claude Code 2.1.322 与 Codex 0.167.2。
+
+### Fixed
+
+- 修复恢复会话时报 `orphan tool output` 的问题。
+- 修复 diff 长行被截断。
+- 修复输入法预编辑随流式输出跳动。
+- 修复后台 shell 完成后任务列表残留条目。
+- 修复被取消的后台子代理未在任务面板结算。
+
 ## [0.28.0] - 2026-11-04
 
 ### Added
