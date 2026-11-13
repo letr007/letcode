@@ -3693,16 +3693,42 @@ impl TuiRuntime {
         &self,
         document: &toml_edit::DocumentMut,
     ) -> (Vec<DialogItem>, Vec<ConfigFieldRef>) {
-        self.config_filtered_root_items(
+        let (mut items, fields) = self.config_filtered_root_items(
             document,
             &[
                 "active_provider",
                 "permissions",
+                "subagents",
                 "providers",
                 "agents",
                 "mcp",
             ],
-        )
+        );
+        if let Some(item) = items.iter_mut().find(|item| item.id == "active_provider")
+            && let Some(provider) = item.detail.clone()
+            && let Some(model) = Self::config_active_model(document)
+        {
+            item.detail = Some(format!("{provider} · {model}"));
+        }
+        if let Some(item) = items
+            .iter_mut()
+            .find(|item| item.id == "mcp" || item.id == "new/mcp")
+            && let Some(summary) = self.config_mcp_summary(document)
+        {
+            item.detail = Some(summary);
+        }
+        for (index, item) in items.iter_mut().enumerate() {
+            item.section = Some(
+                self.state
+                    .t(if index < 3 {
+                        "config.section_common"
+                    } else {
+                        "config.section_manage"
+                    })
+                    .to_string(),
+            );
+        }
+        (items, fields)
     }
 
     fn config_advanced_items(
@@ -3773,11 +3799,6 @@ impl TuiRuntime {
             }
             return (Vec::new(), Vec::new());
         };
-        let section = if level.len() > 1 {
-            level.last().cloned()
-        } else {
-            None
-        };
         let baseline = self.config_baseline_document();
         let mut items = Vec::new();
         let mut fields = Vec::new();
@@ -3795,16 +3816,13 @@ impl TuiRuntime {
             let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
             match item {
                 toml_edit::Item::Table(_) => {
-                    let mut row = DialogItem::new(
+                    let row = DialogItem::new(
                         path.join("/"),
                         key.to_string(),
                         self.config_table_detail(document, &path),
                     )
                     .with_description(Self::config_description(&self.state, &path_refs))
                     .with_right_detail("›");
-                    if let Some(section) = &section {
-                        row = row.with_section(section.clone());
-                    }
                     items.push(row);
                     fields.push(ConfigFieldRef::Table(path));
                 }
@@ -3818,7 +3836,7 @@ impl TuiRuntime {
                         ConfigFieldRef::Field(path.clone())
                     };
                     let affordance = Self::config_affordance(&entry, &field);
-                    let mut row = DialogItem::new(path.join("/"), entry.label, Some(entry.display))
+                    let row = DialogItem::new(path.join("/"), entry.label, Some(entry.display))
                         .with_description(Self::config_description(&self.state, &path_refs))
                         .with_modified(Self::config_field_modified(
                             document,
@@ -3826,9 +3844,6 @@ impl TuiRuntime {
                             &path,
                         ))
                         .with_right_detail(affordance);
-                    if let Some(section) = &section {
-                        row = row.with_section(section.clone());
-                    }
                     items.push(row);
                     fields.push(field);
                 }
@@ -3863,12 +3878,9 @@ impl TuiRuntime {
                 _ => "＋",
             };
             let detail = Self::config_effective_missing_value(document, &path);
-            let mut row = DialogItem::new(path.join("/"), name, detail)
+            let row = DialogItem::new(path.join("/"), name, detail)
                 .with_description(Self::config_description(&self.state, &path_refs))
                 .with_right_detail(affordance);
-            if let Some(section) = &section {
-                row = row.with_section(section.clone());
-            }
             items.push(row);
             fields.push(field);
         }
@@ -3878,29 +3890,23 @@ impl TuiRuntime {
                 if document.get(&table).is_some() {
                     continue;
                 }
-                let mut row = DialogItem::new(
+                let row = DialogItem::new(
                     format!("new/{table}"),
                     self.state.t_fmt("config.new_entry", &[("table", &table)]),
                     None,
                 )
                 .with_description(Self::config_description(&self.state, &[table.as_str()]));
-                if let Some(section) = &section {
-                    row = row.with_section(section.clone());
-                }
                 items.push(row);
                 fields.push(ConfigFieldRef::NewEntry(table));
             }
         } else if crate::config::table_accepts_entries(&level_refs) {
             let name = level.last().cloned().unwrap_or_default();
-            let mut row = DialogItem::new(
+            let row = DialogItem::new(
                 format!("new/{}", level.join("/")),
                 self.state.t_fmt("config.new_entry", &[("table", &name)]),
                 None,
             )
             .with_description(Self::config_description(&self.state, &level_refs));
-            if let Some(section) = &section {
-                row = row.with_section(section.clone());
-            }
             items.push(row);
             fields.push(ConfigFieldRef::NewEntry(level.join("/")));
         }
@@ -4062,12 +4068,16 @@ impl TuiRuntime {
                         "models".to_string(),
                     ],
                 );
+                let auth = Self::config_text(document, &["providers", name, "auth", "type"]);
                 let mut parts = Vec::new();
                 if let Some(protocol) = protocol {
                     parts.push(protocol);
                 }
                 if let Some(default_model) = default_model {
                     parts.push(default_model);
+                }
+                if let Some(auth) = auth {
+                    parts.push(auth);
                 }
                 if models > 0 {
                     parts.push(
@@ -4111,7 +4121,7 @@ impl TuiRuntime {
                         .map(|(_, value)| value);
                 let model = crate::config::config_value_in(document, &["agents", name, "model"])
                     .map(|(_, value)| value);
-                match (provider, model) {
+                let route = match (provider, model) {
                     (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
                     _ => crate::config::config_array_in(
                         document,
@@ -4119,6 +4129,25 @@ impl TuiRuntime {
                     )
                     .and_then(|values| values.into_iter().next())
                     .or_else(|| Some(self.state.t("config.follow_session"))),
+                };
+                let backend =
+                    Self::config_text(document, &["agents", name, "backend"]).or_else(|| {
+                        Self::config_effective_missing_value(
+                            document,
+                            &[
+                                "agents".to_string(),
+                                name.to_string(),
+                                "backend".to_string(),
+                            ],
+                        )
+                    });
+                match (route, backend) {
+                    (Some(route), Some(backend)) if backend != "chat" => {
+                        Some(format!("{route} · {backend}"))
+                    }
+                    (Some(route), _) => Some(route),
+                    (None, Some(backend)) if backend != "chat" => Some(backend),
+                    _ => None,
                 }
             }
             (Some("mcp"), 1) => {
@@ -4154,6 +4183,35 @@ impl TuiRuntime {
     fn config_count_text(&self, count: usize) -> String {
         self.state
             .t_fmt("config.count", &[("count", &count.to_string())])
+    }
+
+    fn config_active_model(document: &toml_edit::DocumentMut) -> Option<String> {
+        let provider = Self::config_text(document, &["active_provider"])?;
+        Self::config_text(document, &["providers", &provider, "default_model"])
+    }
+
+    fn config_mcp_summary(&self, document: &toml_edit::DocumentMut) -> Option<String> {
+        let table = Self::config_table(document, &["mcp".to_string()])?;
+        let mut total = 0usize;
+        let mut enabled = 0usize;
+        for (name, item) in table.iter() {
+            if item.as_table_like().is_none() {
+                continue;
+            }
+            total += 1;
+            if Self::config_bool(document, &["mcp", name, "enabled"]).unwrap_or(true) {
+                enabled += 1;
+            }
+        }
+        (total > 0).then(|| {
+            self.state.t_fmt(
+                "config.mcp_summary",
+                &[
+                    ("total", &total.to_string()),
+                    ("enabled", &enabled.to_string()),
+                ],
+            )
+        })
     }
 
     fn persist_fast_mode(&self, enabled: bool) {

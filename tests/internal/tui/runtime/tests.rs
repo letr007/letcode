@@ -6223,6 +6223,73 @@ fn rename_dialog_rejects_an_empty_title() {
 }
 
 #[test]
+fn config_editor_entity_lists_show_connection_and_backend_summaries() {
+    let config = "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\nreviewer = \"jev\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[agents.reviewer]\nprovider = \"alpha\"\nmodel = \"m\"\n";
+    let mut runtime = runtime_with_config(config);
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+    enter_config_table(&mut runtime, "providers");
+    let detail = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .find(|item| item.label == "alpha")
+        .and_then(|item| item.detail.clone())
+        .expect("provider summary");
+    assert!(detail.contains("bearer"), "{detail}");
+
+    let mut runtime = runtime_with_config(config);
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+    enter_config_table(&mut runtime, "agents");
+    let detail = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .find(|item| item.label == "reviewer")
+        .and_then(|item| item.detail.clone())
+        .expect("reviewer summary");
+    assert_eq!(detail, "alpha/m · jev");
+}
+
+#[test]
+fn config_editor_overview_summarizes_the_active_configuration() {
+    let mut runtime = runtime_with_config(
+        "active_provider = \"alpha\"\n\n[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[permissions]\nmode = \"yolo\"\n\n[subagents]\nmode = \"swarm\"\n\n[mcp.one]\ntype = \"local\"\ncommand = [\"echo\"]\nenabled = true\n\n[mcp.two]\ntype = \"remote\"\nurl = \"https://example.invalid/mcp\"\nenabled = false\n",
+    );
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::En));
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let item = |label: &str| {
+        dialog
+            .items
+            .iter()
+            .find(|item| item.label == label)
+            .unwrap_or_else(|| panic!("{label} row"))
+    };
+    assert_eq!(item("active_provider").detail.as_deref(), Some("alpha · m"));
+    assert_eq!(item("permissions").detail.as_deref(), Some("yolo"));
+    assert_eq!(item("subagents").detail.as_deref(), Some("swarm"));
+    assert_eq!(item("mcp").detail.as_deref(), Some("2 total · 1 enabled"));
+    assert_eq!(item("active_provider").section.as_deref(), Some("Common"));
+    assert_eq!(item("providers").section.as_deref(), Some("Manage"));
+}
+
+#[test]
 fn config_editor_lists_grouped_fields() {
     let mut runtime = runtime_with_config(
         "active_provider = \"openai\"\n\n[providers.openai]\ndefault_model = \"gpt-5.5\"\n\n[permissions]\nmode = \"default\"\n",
