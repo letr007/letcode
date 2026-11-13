@@ -6678,6 +6678,71 @@ fn config_editor_hides_auth_fields_for_none() {
 }
 
 #[test]
+fn config_editor_toggles_the_single_value_reviewer_marker() {
+    let mut runtime = runtime_with_config(
+        "[providers.alpha]\nprotocol = \"responses\"\nreviewer = \"jev\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "providers");
+    enter_config_table(&mut runtime, "alpha");
+    let reviewer_index = |runtime: &TuiRuntime| {
+        runtime
+            .state()
+            .dialog()
+            .expect("config dialog")
+            .items
+            .iter()
+            .position(|item| item.label == "reviewer")
+            .expect("reviewer field")
+    };
+    let index = reviewer_index(&runtime);
+    let dialog = runtime.state().dialog().expect("config dialog");
+    assert_eq!(dialog.items[index].right_detail.as_deref(), Some("[x]"));
+    assert!(matches!(
+        dialog.config_fields.get(index),
+        Some(ConfigFieldRef::Field(path)) if path == &["providers", "alpha", "reviewer"]
+    ));
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("disable the reviewer marker");
+    assert!(
+        runtime.config_draft.as_ref().expect("draft")["providers"]["alpha"]
+            .get("reviewer")
+            .is_none()
+    );
+
+    let index = reviewer_index(&runtime);
+    assert_eq!(
+        runtime.state().dialog().expect("config dialog").items[index]
+            .right_detail
+            .as_deref(),
+        Some("[ ]")
+    );
+    runtime
+        .state_mut()
+        .dialog_mut()
+        .expect("config dialog")
+        .selected = index;
+    runtime
+        .handle_input_action(InputAction::DialogAccept)
+        .expect("enable the reviewer marker");
+    assert_eq!(
+        runtime.config_draft.as_ref().expect("draft")["providers"]["alpha"]["reviewer"].as_str(),
+        Some("jev")
+    );
+}
+
+#[test]
 fn config_editor_links_reasoning_generation_to_both_capabilities() {
     let mut runtime = runtime_with_config(
         "[providers.alpha]\nprotocol = \"responses\"\n\n[providers.alpha.models.m]\n\n[providers.alpha.models.m.capabilities]\nreasoning = true\n\n[providers.alpha.models.m.capabilities.generation]\nreasoning = true\n\n[providers.alpha.models.m.generation]\nreasoning_effort = \"medium\"\n",

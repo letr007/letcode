@@ -3810,14 +3810,21 @@ impl TuiRuntime {
                 }
                 toml_edit::Item::Value(value) => {
                     let entry = crate::config::leaf_config_entry(&path, value);
-                    let field = if entry.kind == crate::config::ConfigEntryKind::Array {
+                    let reviewer = Self::config_is_reviewer(&path);
+                    let field = if reviewer {
+                        ConfigFieldRef::Field(path.clone())
+                    } else if entry.kind == crate::config::ConfigEntryKind::Array {
                         ConfigFieldRef::List(path.clone())
                     } else if Self::config_field_values(document, &path).is_some() {
                         ConfigFieldRef::Choice(path.clone())
                     } else {
                         ConfigFieldRef::Field(path.clone())
                     };
-                    let affordance = Self::config_affordance(&entry, &field);
+                    let affordance = if reviewer {
+                        if entry.display == "jev" { "[x]" } else { "[ ]" }.to_string()
+                    } else {
+                        Self::config_affordance(&entry, &field)
+                    };
                     let mut row = DialogItem::new(path.join("/"), entry.label, Some(entry.display))
                         .with_description(Self::config_description(&self.state, &path_refs))
                         .with_modified(Self::config_field_modified(
@@ -3849,7 +3856,10 @@ impl TuiRuntime {
                 continue;
             }
             let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
-            let field = if Self::config_field_values(document, &path).is_some() {
+            let reviewer = Self::config_is_reviewer(&path);
+            let field = if reviewer {
+                ConfigFieldRef::Field(path.clone())
+            } else if Self::config_field_values(document, &path).is_some() {
                 if crate::config::field_is_array(&path_refs) {
                     ConfigFieldRef::List(path.clone())
                 } else {
@@ -3858,9 +3868,13 @@ impl TuiRuntime {
             } else {
                 ConfigFieldRef::NewField(path.clone())
             };
-            let affordance = match field {
-                ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => "▸",
-                _ => "＋",
+            let affordance = if reviewer {
+                "[ ]"
+            } else {
+                match field {
+                    ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => "▸",
+                    _ => "＋",
+                }
             };
             let mut row = DialogItem::new(path.join("/"), name, None)
                 .with_description(Self::config_description(&self.state, &path_refs))
@@ -3924,14 +3938,21 @@ impl TuiRuntime {
                 continue;
             }
             let path: Vec<&str> = entry.path.iter().map(String::as_str).collect();
-            let field = if entry.kind == crate::config::ConfigEntryKind::Array {
+            let reviewer = Self::config_is_reviewer(&entry.path);
+            let field = if reviewer {
+                ConfigFieldRef::Field(entry.path.clone())
+            } else if entry.kind == crate::config::ConfigEntryKind::Array {
                 ConfigFieldRef::List(entry.path.clone())
             } else if Self::config_field_values(document, &entry.path).is_some() {
                 ConfigFieldRef::Choice(entry.path.clone())
             } else {
                 ConfigFieldRef::Field(entry.path.clone())
             };
-            let affordance = Self::config_affordance(&entry, &field);
+            let affordance = if reviewer {
+                if entry.display == "jev" { "[x]" } else { "[ ]" }.to_string()
+            } else {
+                Self::config_affordance(&entry, &field)
+            };
             let section = entry.path.first().cloned().unwrap_or_default();
             items.push(
                 DialogItem::new(entry.path.join("."), entry.label, Some(entry.display))
@@ -4350,6 +4371,10 @@ impl TuiRuntime {
             }
         }
         true
+    }
+
+    fn config_is_reviewer(path: &[String]) -> bool {
+        path.len() == 3 && path[0] == "providers" && path[2] == "reviewer"
     }
 
     fn config_path_present(document: &toml_edit::DocumentMut, path: &[String]) -> bool {
@@ -5065,6 +5090,10 @@ impl TuiRuntime {
             }
             ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => self.expand_config_field(index),
             ConfigFieldRef::Field(path) => {
+                if Self::config_is_reviewer(&path) {
+                    self.toggle_config_reviewer(&path);
+                    return;
+                }
                 let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
                 let kind = self
                     .config_draft
@@ -5273,6 +5302,33 @@ impl TuiRuntime {
                 &path,
                 crate::config::ConfigScalar::Bool(!current),
             )
+        });
+        match result {
+            Ok(()) => {
+                self.refresh_config_dialog();
+                self.state
+                    .show_toast(self.state.t("config.unsaved"), ToastKind::Info);
+            }
+            Err(error) => self.report_config_save_failure(error),
+        }
+    }
+
+    fn toggle_config_reviewer(&mut self, segments: &[String]) {
+        let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+        let enabled = self
+            .config_draft
+            .as_ref()
+            .is_some_and(|document| crate::config::config_value_in(document, &path).is_some());
+        let result = self.edit_config_document(|document| {
+            if enabled {
+                crate::config::remove_config_table(document, &path)
+            } else {
+                crate::config::set_config_scalar(
+                    document,
+                    &path,
+                    crate::config::ConfigScalar::String("jev".to_string()),
+                )
+            }
         });
         match result {
             Ok(()) => {
