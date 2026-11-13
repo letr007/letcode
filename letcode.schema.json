@@ -327,6 +327,12 @@
         "reasoning_effort": {
           "type": "string",
           "description": "Reasoning level for every run of this expert. The model it resolves to must support it."
+        },
+        "backend": {
+          "type": "string",
+          "enum": ["chat", "jev"],
+          "default": "chat",
+          "description": "Approval-review transport for the reviewer expert. chat uses the normal model route; jev posts to the provider's Jev endpoint."
         }
       }
     },
@@ -345,7 +351,8 @@
         "flavor": { "$ref": "#/definitions/flavor" },
         "reviewer": {
           "enum": ["jev"],
-          "description": "Marks this provider as an approval reviewer backend. The Jev reviewer needs auth.type = \"bearer\"."
+          "deprecated": true,
+          "description": "Legacy Jev marker. Set agents.reviewer.backend instead; the loader still reads this field."
         },
         "auth": { "$ref": "#/definitions/auth" },
         "endpoints": { "$ref": "#/definitions/endpoints" },

@@ -100,6 +100,11 @@ run_timeout_secs = 600           # swarm run 默认超时秒数
 # model = "gpt-5.5"
 # allowed_models = ["openai/gpt-5.5"] # 单次委派可选路由；不改变默认模型
 # 同样适用于：fixer, oracle, designer, librarian, general, reviewer, historian
+#
+# [agents.reviewer]
+# provider = "typesafe"
+# model = "jev-latest"
+# backend = "jev"                # chat（默认）或 jev；jev 要求 auth.type = "bearer"
 
 [tools.parallelism]
 # "fs__read" = "parallel"   # 只能收窄已经声明 Parallel 的工具
@@ -275,7 +280,9 @@ namespace = "my-cache"
 - `agents.<expert>.allowed_models` 仅接受 `provider/model`，用于 `agent__*`
   单次委派选择；省略 `model` 时仍使用 expert 默认路由，单次选择不会写回配置。
 - `permissions.mode = "auto"` 的 Ask 矩阵与 `default` 相同，但由粘性的
-  `reviewer` expert 来回答审批。
+  `reviewer` expert 来回答审批。`agents.reviewer.backend` 选择审查传输：`chat`
+  走普通模型，`jev` 调用该 provider 的 Jev 接口。provider 上的
+  `reviewer = "jev"` 是旧版标记，仅用于兼容已有配置。
 - `generation.async_tools` 列出异步工具名，需同时满足 Astra 策略、`protocol = "responses"` 与 `capabilities.tools = true`；Astra 只支持 `low` 及以上的 reasoning effort。
 - `capabilities.generation.structured_output` 声明该路由的强制能力（非布尔值）：`json_schema` 由上游在解码层约束 JSON 语法，`json_object` 只表达“输出 JSON”的意图。
 - `[fake.codex]` 与 `[fake.claude]` 省略的字段按真实主机或所模拟客户端的典型值推导；`identity.installation_id` 必须是 UUID，否则会被替换；`clock.timezone` 需为 IANA 名。

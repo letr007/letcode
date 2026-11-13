@@ -212,6 +212,44 @@ fn reviewer_provider_marker_selects_the_jev_backend() {
 }
 
 #[test]
+fn reviewer_route_backend_selects_jev_without_a_provider_marker() {
+    let text = format!(
+        "{}\n[providers.typesafe]\nprotocol = \"responses\"\ndefault_model = \"jev-latest\"\n\n[providers.typesafe.auth]\ntype = \"bearer\"\ncredential = \"typesafe-key\"\n\n[providers.typesafe.endpoints]\nbase_url = \"https://api.typesafe.ai\"\n\n[providers.typesafe.models.\"jev-latest\"]\n\n[agents.reviewer]\nprovider = \"typesafe\"\nmodel = \"jev-latest\"\nbackend = \"jev\"\n",
+        config("primary", "model-a", "")
+    );
+    let loaded = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+        .expect("config should load");
+    let route = loaded
+        .agents
+        .reviewer
+        .route
+        .clone()
+        .expect("reviewer route");
+    let jev = jev_review_for_route(&loaded.providers, &route).expect("jev backend");
+
+    assert_eq!(jev.provider, "typesafe");
+    assert_eq!(jev.model, "jev-latest");
+}
+
+#[test]
+fn reviewer_route_backend_chat_overrides_the_legacy_provider_marker() {
+    let text = format!(
+        "{}\n[providers.typesafe]\nprotocol = \"responses\"\ndefault_model = \"jev-latest\"\nreviewer = \"jev\"\n\n[providers.typesafe.auth]\ntype = \"bearer\"\ncredential = \"typesafe-key\"\n\n[providers.typesafe.endpoints]\nbase_url = \"https://api.typesafe.ai\"\n\n[providers.typesafe.models.\"jev-latest\"]\n\n[agents.reviewer]\nprovider = \"typesafe\"\nmodel = \"jev-latest\"\nbackend = \"chat\"\n",
+        config("primary", "model-a", "")
+    );
+    let loaded = AppConfig::load_from_str_at_path(Path::new("letcode.toml"), &text)
+        .expect("config should load");
+    let route = loaded
+        .agents
+        .reviewer
+        .route
+        .clone()
+        .expect("reviewer route");
+
+    assert!(jev_review_for_route(&loaded.providers, &route).is_none());
+}
+
+#[test]
 fn reviewer_provider_supports_custom_endpoint_and_alias() {
     let text = format!(
         r#"{}

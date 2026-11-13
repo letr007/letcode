@@ -12,8 +12,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::{
-    ApiProtocol, PromptCacheRetention, RawMcpServerKind, SubagentMode, SubagentsConfig,
-    SubmitWhileRunning,
+    ApiProtocol, PromptCacheRetention, RawMcpServerKind, ReviewerBackend, SubagentMode,
+    SubagentsConfig, SubmitWhileRunning,
 };
 use crate::model_runtime::strategy::ModelStrategyId;
 use crate::model_runtime::{
@@ -41,6 +41,17 @@ fn targets() -> Result<Vec<Target>> {
     let archive = SessionArchiveConfig::default();
     let subagents = SubagentsConfig::default();
     Ok(vec![
+        Target {
+            pointer: &["definitions", "agentRoute", "properties", "backend"],
+            injection: Injection::Enum(wire_values(&[
+                ReviewerBackend::Chat,
+                ReviewerBackend::Jev,
+            ])?),
+        },
+        Target {
+            pointer: &["definitions", "agentRoute", "properties", "backend"],
+            injection: Injection::Default(wire(&ReviewerBackend::Chat)?),
+        },
         Target {
             pointer: &["definitions", "subagents", "properties", "mode"],
             injection: Injection::Enum(wire_values(&[SubagentMode::Expert, SubagentMode::Swarm])?),

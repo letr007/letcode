@@ -208,7 +208,7 @@ base_url = "https://api.openai.com/v1"
 - `protocol`：传输协议类型，支持 `responses`、`completions` 与 `anthropic`。
 - `flavor`：接口特征模式，支持 `standard` 或适配 DeepSeek 的 `deepseek`。
 - `default_model`：未显式指定模型时的默认模型标识。必须是该服务商 `[models]` 下已定义的键。
-- `reviewer`：可选设置。设为 `"jev"` 时将该服务商标记为审批审查后端。Jev 审查要求 `auth.type = "bearer"`。
+- `reviewer`：旧版 Jev 标记，仅用于兼容已有配置。新配置改用 `[agents.reviewer] backend`。
 - `headers`：附加的固定请求头映射表。
 - `query`：附加的固定 URL 查询参数映射表。
 
@@ -396,6 +396,7 @@ reasoning_effort = "medium"
 
 - `allowed_models`：该专家允许使用的路由列表，格式为 `provider/model`。列表第一项作为默认路由；后续项限定单次 `agent__*` 委派时可通过参数覆盖的目标模型范围。未配置专家路由时，系统自动回退至全局默认模型。
 - `reasoning_effort`：该专家每次运行使用的思考强度。所选模型必须支持该档位。
+- `backend`：仅 `reviewer` 使用。`chat` 走普通模型审查；`jev` 调用该 provider 的 Jev 接口，要求 `auth.type = "bearer"`。
 
 ## 仿真伪装配置 `[fake]`
 

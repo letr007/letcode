@@ -466,6 +466,14 @@ impl ModelRoute {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewerBackend {
+    #[default]
+    Chat,
+    Jev,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentMode {
     #[default]
@@ -1009,6 +1017,7 @@ struct RawAgentConfig {
     #[serde(default)]
     allowed_models: Vec<String>,
     reasoning_effort: Option<String>,
+    backend: Option<ReviewerBackend>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1109,7 +1118,42 @@ fn runtime_retry(
     })
 }
 
-fn build_runtime_config(raw: RawAppConfig) -> Result<RuntimeConfig> {
+fn apply_reviewer_backend(raw: &mut RawAppConfig) -> Result<()> {
+    let Some(reviewer) = raw
+        .agents
+        .as_ref()
+        .and_then(|agents| agents.reviewer.as_ref())
+    else {
+        return Ok(());
+    };
+    let Some(backend) = reviewer.backend else {
+        return Ok(());
+    };
+    let provider = reviewer.provider.clone().or_else(|| {
+        reviewer.allowed_models.first().and_then(|route| {
+            route
+                .split_once('/')
+                .map(|(provider, _)| provider.to_string())
+        })
+    });
+    let Some(provider) = provider else {
+        if backend == ReviewerBackend::Jev {
+            bail!(
+                "agents.reviewer.backend = \"jev\" requires agents.reviewer.provider or allowed_models"
+            );
+        }
+        return Ok(());
+    };
+    let provider = raw
+        .providers
+        .get_mut(&provider)
+        .ok_or_else(|| anyhow!("agents.reviewer references unknown provider '{provider}'"))?;
+    provider.reviewer = (backend == ReviewerBackend::Jev).then_some(ProviderReviewerBackend::Jev);
+    Ok(())
+}
+
+fn build_runtime_config(mut raw: RawAppConfig) -> Result<RuntimeConfig> {
+    apply_reviewer_backend(&mut raw)?;
     if raw.providers.is_empty() {
         bail!("config must define at least one provider under [providers]");
     }
@@ -1629,6 +1673,10 @@ fn build_agent_config(
     let Some(raw) = raw else {
         return Ok(AgentConfig::default());
     };
+    let backend = raw.backend;
+    if agent_name != "reviewer" && backend.is_some() {
+        bail!("agents.{agent_name}.backend is only supported for agents.reviewer");
+    }
 
     let allowed_models = raw
         .allowed_models
