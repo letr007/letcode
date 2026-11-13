@@ -3862,7 +3862,8 @@ impl TuiRuntime {
                 ConfigFieldRef::Choice(_) | ConfigFieldRef::List(_) => "▸",
                 _ => "＋",
             };
-            let mut row = DialogItem::new(path.join("/"), name, None)
+            let detail = Self::config_effective_missing_value(document, &path);
+            let mut row = DialogItem::new(path.join("/"), name, detail)
                 .with_description(Self::config_description(&self.state, &path_refs))
                 .with_right_detail(affordance);
             if let Some(section) = &section {
@@ -4354,6 +4355,28 @@ impl TuiRuntime {
             }
         }
         true
+    }
+
+    fn config_effective_missing_value(
+        document: &toml_edit::DocumentMut,
+        path: &[String],
+    ) -> Option<String> {
+        if path.len() != 3 || path[0] != "agents" || path[1] != "reviewer" || path[2] != "backend" {
+            return None;
+        }
+        let provider =
+            Self::config_text(document, &["agents", "reviewer", "provider"]).or_else(|| {
+                crate::config::config_array_in(document, &["agents", "reviewer", "allowed_models"])
+                    .and_then(|routes| routes.first().cloned())
+                    .and_then(|route| {
+                        route
+                            .split_once('/')
+                            .map(|(provider, _)| provider.to_string())
+                    })
+            })?;
+        (Self::config_text(document, &["providers", &provider, "reviewer"]).as_deref()
+            == Some("jev"))
+        .then(|| "jev".to_string())
     }
 
     fn config_path_present(document: &toml_edit::DocumentMut, path: &[String]) -> bool {

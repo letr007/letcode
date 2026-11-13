@@ -6701,6 +6701,31 @@ fn config_editor_hides_the_legacy_provider_reviewer_marker() {
 }
 
 #[test]
+fn config_editor_shows_the_legacy_reviewer_backend_as_the_effective_value() {
+    let mut runtime = runtime_with_config(
+        "[providers.alpha]\nprotocol = \"responses\"\nreviewer = \"jev\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[agents.reviewer]\nprovider = \"alpha\"\nmodel = \"m\"\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+
+    enter_config_table(&mut runtime, "agents");
+    enter_config_table(&mut runtime, "reviewer");
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let index = dialog
+        .items
+        .iter()
+        .position(|item| item.label == "backend")
+        .expect("backend field");
+    assert_eq!(dialog.items[index].detail.as_deref(), Some("jev"));
+    assert!(matches!(
+        dialog.config_fields.get(index),
+        Some(ConfigFieldRef::Choice(path)) if path == &["agents", "reviewer", "backend"]
+    ));
+}
+
+#[test]
 fn config_editor_shows_the_reviewer_backend_only_on_the_reviewer_route() {
     for (expert, visible) in [("reviewer", true), ("explorer", false)] {
         let mut runtime = runtime_with_config(&format!(
