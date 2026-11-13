@@ -314,14 +314,14 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
                 };
                 let marker = choice::choice_marker(active);
                 let option_style = if active {
-                    theme.selection_style()
+                    Style::default().fg(theme.notice).bg(theme.element_bg)
                 } else if selected {
                     Style::default().fg(theme.success)
                 } else {
                     Style::default().fg(theme.text)
                 };
                 let meta_style = if active {
-                    theme.selection_style()
+                    Style::default().fg(theme.muted_text).bg(theme.element_bg)
                 } else {
                     Style::default().fg(theme.muted_text)
                 };
@@ -350,7 +350,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
             };
             let custom_label = format!("{custom_prefix}Type your own answer{custom_trailing}");
             let custom_base_style = if custom_active {
-                theme.selection_style()
+                Style::default().fg(theme.notice).bg(theme.element_bg)
             } else if custom_selected {
                 Style::default().fg(theme.success)
             } else {
@@ -370,7 +370,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
                         current.custom_edit_cursor,
                         inner.width as usize,
                     ),
-                    theme.selection_style(),
+                    Style::default().fg(theme.text).bg(theme.element_bg),
                 )));
             } else if !current.custom_text.trim().is_empty() {
                 lines.push(Line::from(Span::styled(
