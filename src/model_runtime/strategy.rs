@@ -69,18 +69,7 @@ impl ModelStrategyId {
         Ok(())
     }
 
-    pub fn validate_generation(
-        self,
-        generation: &RuntimeGenerationDefaults,
-        reasoning_capability: bool,
-        reasoning_generation: bool,
-    ) -> Result<(), String> {
-        if self == Self::Astra && reasoning_capability && !reasoning_generation {
-            return Err(
-                "strategy 'astra' requires capabilities.generation.reasoning when reasoning is enabled"
-                    .into(),
-            );
-        }
+    pub fn validate_generation(self, generation: &RuntimeGenerationDefaults) -> Result<(), String> {
         if self == Self::Astra
             && (generation.reasoning_effort.as_deref() == Some("none")
                 || generation.reasoning_effort.as_deref() == Some("minimal")

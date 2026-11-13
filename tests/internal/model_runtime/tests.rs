@@ -258,10 +258,10 @@ fn structured_output_capability_is_resolved_from_model_configuration() {
     };
     let undeclared = resolve("");
     let schema = resolve(
-        "[providers.vendor.models.model.capabilities.generation]\nstructured_output = \"json_schema\"",
+        "[providers.vendor.models.model.capabilities]\nstructured_output = \"json_schema\"",
     );
     let object = resolve(
-        "[providers.vendor.models.model.capabilities.generation]\nstructured_output = \"json_object\"",
+        "[providers.vendor.models.model.capabilities]\nstructured_output = \"json_object\"",
     );
     assert_eq!(
         undeclared

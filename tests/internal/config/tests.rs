@@ -493,17 +493,13 @@ base_url = "https://example.invalid/v1"
         .expect_err("incompatible astra flavor must fail");
     assert!(format!("{error:#}").contains("requires flavor 'standard'"));
 
-    let missing_generation_support = config(
+    let astra_reasoning = config(
         "openai",
         "gpt-6-astra",
         "[capabilities]\nreasoning = true\n",
     );
-    let error = AppConfig::load_from_path(write_temp_config(missing_generation_support))
-        .expect_err("strategy-provided effort requires generation support");
-    assert!(
-        format!("{error:#}")
-            .contains("requires capabilities.generation.reasoning when reasoning is enabled")
-    );
+    AppConfig::load_from_path(write_temp_config(astra_reasoning))
+        .expect("astra reasoning only needs the model capability");
 }
 
 #[test]
@@ -653,7 +649,16 @@ fn capabilities_default_with_tools_enabled_and_typed_cache_settings_validate() {
             ..RouteCapabilities::default()
         }
     );
-    assert_eq!(route.generation, GenerationSupport::default());
+    assert_eq!(
+        route.generation,
+        GenerationSupport {
+            temperature: true,
+            top_p: true,
+            max_output_tokens: true,
+            text_verbosity: true,
+            ..GenerationSupport::default()
+        }
+    );
     assert!(!route.cache.enabled);
 
     let partial = AppConfig::load_from_path(write_temp_config(config(
@@ -1552,11 +1557,8 @@ fn reasoning_effort_is_not_offered_when_the_route_cannot_express_it() {
 
     // Anthropic reasons only through thinking settings; without them no effort can be sent.
     assert!(efforts("protocol = \"anthropic\"\n[capabilities]\nreasoning = true").is_empty());
-    // Other protocols need the generation support flag, not just the model capability.
-    assert!(efforts("[capabilities]\nreasoning = true").is_empty());
-    assert!(
-        !efforts("[capabilities]\nreasoning = true\ngeneration = { reasoning = true }").is_empty()
-    );
+    // Other protocols need only the model reasoning capability.
+    assert!(!efforts("[capabilities]\nreasoning = true").is_empty());
 }
 
 #[test]

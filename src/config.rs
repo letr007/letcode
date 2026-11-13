@@ -1965,7 +1965,7 @@ pub struct ConfigValidationReport {
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\n{CONFIG_SCHEMA_COMMENT}\n\nactive_provider = \"openai\"\n\n[providers.openai]\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\nflavor = \"standard\"\n\n[providers.openai.auth]\ntype = \"bearer\"\ncredential = \"YOUR_API_KEY\"\n\n[providers.openai.endpoints]\nbase_url = \"https://api.openai.com/v1\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay = \"GPT-5.5\"\n\n[providers.openai.models.\"gpt-5.5\".capabilities]\ntools = true\nreasoning = true\n\n[providers.openai.models.\"gpt-5.5\".capabilities.generation]\nmax_output_tokens = true\n\n[providers.openai.models.\"gpt-5.5\".generation]\nmax_output_tokens = 4096\n",
+        "config file not found: {}\n\nCreate it with at least:\n\n{CONFIG_SCHEMA_COMMENT}\n\nactive_provider = \"openai\"\n\n[providers.openai]\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\nflavor = \"standard\"\n\n[providers.openai.auth]\ntype = \"bearer\"\ncredential = \"YOUR_API_KEY\"\n\n[providers.openai.endpoints]\nbase_url = \"https://api.openai.com/v1\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay = \"GPT-5.5\"\n\n[providers.openai.models.\"gpt-5.5\".capabilities]\ntools = true\nreasoning = true\n\n[providers.openai.models.\"gpt-5.5\".generation]\nmax_output_tokens = 4096\n",
         path.display()
     )
 }

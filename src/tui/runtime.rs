@@ -4238,6 +4238,9 @@ impl TuiRuntime {
         if path.len() == 3 && path[0] == "providers" && path[2] == "reviewer" {
             return false;
         }
+        if path.len() >= 6 && path[4] == "capabilities" && path[5] == "generation" {
+            return false;
+        }
         Self::config_field_applicable(document, path) || Self::config_path_present(document, path)
     }
 
@@ -4291,11 +4294,6 @@ impl TuiRuntime {
             }
         }
         if let Some((provider, model)) = Self::config_model_scope(path) {
-            if path.len() == 7 && path[4] == "capabilities" && path[5] == "generation" {
-                return Self::config_generation_capability_applicable(
-                    document, provider, model, &path[6],
-                );
-            }
             if path.len() == 6 && path[4] == "capabilities" {
                 return Self::config_capability_applicable(document, provider, model, &path[5]);
             }
@@ -4450,38 +4448,6 @@ impl TuiRuntime {
         }
     }
 
-    fn config_generation_capability_applicable(
-        document: &toml_edit::DocumentMut,
-        provider: &str,
-        model: &str,
-        field: &str,
-    ) -> bool {
-        let caps = |name: &str| {
-            Self::config_bool(
-                document,
-                &["providers", provider, "models", model, "capabilities", name],
-            )
-            .unwrap_or(false)
-        };
-        let protocol = Self::config_model_protocol(document, provider, model);
-        match field {
-            "reasoning" => caps("reasoning"),
-            "parallel_tool_calls" => caps("parallel_tool_calls"),
-            "reasoning_summary" => {
-                caps("reasoning")
-                    && Self::config_protocol_allows(protocol.as_deref(), &["responses"])
-            }
-            "stop_sequences" => Self::config_protocol_allows(
-                protocol.as_deref(),
-                &["completions", "anthropic", "jev"],
-            ),
-            "text_verbosity" => {
-                Self::config_protocol_allows(protocol.as_deref(), &["responses", "completions"])
-            }
-            _ => true,
-        }
-    }
-
     fn config_generation_field_applicable(
         document: &toml_edit::DocumentMut,
         provider: &str,
@@ -4495,51 +4461,17 @@ impl TuiRuntime {
             )
             .unwrap_or(false)
         };
-        let generation = |name: &str| {
-            Self::config_bool(
-                document,
-                &[
-                    "providers",
-                    provider,
-                    "models",
-                    model,
-                    "capabilities",
-                    "generation",
-                    name,
-                ],
-            )
-            .unwrap_or(false)
-        };
         let protocol = Self::config_model_protocol(document, provider, model);
         match field {
-            "temperature" => generation("temperature"),
-            "top_p" => generation("top_p"),
-            "max_output_tokens" => generation("max_output_tokens"),
-            "stop_sequences" => {
-                generation("stop_sequences")
-                    && Self::config_protocol_allows(
-                        protocol.as_deref(),
-                        &["completions", "anthropic", "jev"],
-                    )
-            }
-            "reasoning_effort" | "reasoning_efforts" => {
-                caps("reasoning") && generation("reasoning")
-            }
+            "reasoning_effort" | "reasoning_efforts" => caps("reasoning"),
             "reasoning_summary" => {
                 caps("reasoning")
-                    && generation("reasoning_summary")
                     && Self::config_protocol_allows(protocol.as_deref(), &["responses"])
             }
             "text_verbosity" => {
-                generation("text_verbosity")
-                    && Self::config_protocol_allows(
-                        protocol.as_deref(),
-                        &["responses", "completions"],
-                    )
+                Self::config_protocol_allows(protocol.as_deref(), &["responses", "completions"])
             }
-            "parallel_tool_calls" => {
-                caps("parallel_tool_calls") && generation("parallel_tool_calls")
-            }
+            "parallel_tool_calls" => caps("parallel_tool_calls"),
             "async_tools" => {
                 let strategy = Self::config_text(
                     document,

@@ -495,7 +495,7 @@
     },
     "capabilities": {
       "type": "object",
-      "description": "Declared model capabilities. Every flag defaults to false, and only flags declared here may be used under [generation].",
+      "description": "Declared model capabilities. Every flag defaults to false.",
       "additionalProperties": false,
       "properties": {
         "tools": { "description": "Allow tool definitions and tool calls.", "type": "boolean", "default": false },
@@ -504,36 +504,15 @@
         "input_images": { "description": "Accept image inputs.", "type": "boolean", "default": false },
         "tool_result_images": { "description": "Accept images returned by tools.", "type": "boolean", "default": false },
         "priority_service": { "description": "Use the provider's priority service tier.", "type": "boolean", "default": false },
-        "generation": { "$ref": "#/definitions/generationCapabilities" }
-      }
-    },
-    "generationCapabilities": {
-      "description": "Flags for the generation parameters this model accepts. A parameter under [generation] is rejected unless its flag is true.",
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "temperature": { "description": "Allow generation.temperature.", "type": "boolean", "default": false },
-        "top_p": { "description": "Allow generation.top_p.", "type": "boolean", "default": false },
-        "max_output_tokens": { "description": "Allow generation.max_output_tokens.", "type": "boolean", "default": false },
-        "stop_sequences": { "description": "Allow generation.stop_sequences.", "type": "boolean", "default": false },
-        "reasoning": {
-          "type": "boolean",
-          "default": false,
-          "description": "Must also be true when reasoning_effort or reasoning_efforts is set."
-        },
-        "reasoning_summary": { "description": "Allow generation.reasoning_summary.", "type": "boolean", "default": false },
-        "text_verbosity": { "description": "Allow generation.text_verbosity.", "type": "boolean", "default": false },
-        "parallel_tool_calls": { "description": "Allow generation.parallel_tool_calls.", "type": "boolean", "default": false },
-        "priority_service": { "description": "Allow the priority service tier for this model.", "type": "boolean", "default": false },
         "structured_output": {
           "enum": ["json_object", "json_schema"],
-          "description": "json_schema constrains JSON syntax in the decoder; json_object only states the intent."
+          "description": "JSON output contract. json_schema constrains JSON syntax in the decoder; json_object only states the intent."
         }
       }
     },
     "generation": {
       "type": "object",
-      "description": "Per-turn generation defaults. Each parameter must have its matching flag enabled under capabilities.generation first.",
+      "description": "Per-turn generation defaults. Protocol and model capabilities determine which parameters are accepted.",
       "additionalProperties": false,
       "properties": {
         "async_tools": {
@@ -541,9 +520,9 @@
           "items": { "type": "string" },
           "description": "Tool names dispatched asynchronously. Requires the Astra strategy, protocol = \"responses\" and capabilities.tools = true."
         },
-        "temperature": { "description": "Sampling temperature. Requires capabilities.generation.temperature = true.", "type": "number", "minimum": 0, "maximum": 2 },
-        "top_p": { "description": "Nucleus sampling probability. Requires capabilities.generation.top_p = true.", "type": "number", "minimum": 0, "maximum": 1 },
-        "max_output_tokens": { "description": "Maximum output tokens. Requires capabilities.generation.max_output_tokens = true.", "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "temperature": { "description": "Sampling temperature.", "type": "number", "minimum": 0, "maximum": 2 },
+        "top_p": { "description": "Nucleus sampling probability.", "type": "number", "minimum": 0, "maximum": 1 },
+        "max_output_tokens": { "description": "Maximum output tokens.", "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "reasoning_effort": {
           "type": "string",
           "description": "none, minimal, low, medium, high, xhigh, max, or a provider specific value."
@@ -553,8 +532,8 @@
           "items": { "type": "string" },
           "description": "Reasoning levels the session may switch between for this model."
         },
-        "reasoning_summary": { "description": "Reasoning summary style. Requires capabilities.generation.reasoning_summary = true.", "enum": ["auto", "concise", "detailed"] },
-        "text_verbosity": { "description": "Output verbosity. Requires capabilities.generation.text_verbosity = true.", "enum": ["low", "medium", "high"] },
+        "reasoning_summary": { "description": "Reasoning summary style. Requires responses protocol and reasoning capability.", "enum": ["auto", "concise", "detailed"] },
+        "text_verbosity": { "description": "Output verbosity. Requires responses or completions protocol.", "enum": ["low", "medium", "high"] },
         "parallel_tool_calls": {
           "type": "boolean",
           "description": "Requires capabilities.parallel_tool_calls = true."

@@ -161,7 +161,7 @@ fn targets() -> Result<Vec<Target>> {
         Target {
             pointer: &[
                 "definitions",
-                "generationCapabilities",
+                "capabilities",
                 "properties",
                 "structured_output",
             ],

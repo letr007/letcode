@@ -773,7 +773,7 @@ pub struct StructuredOutputSchema {
 }
 
 /// Structured-output contract a route advertises through
-/// `capabilities.generation.structured_output`. A route that omits it declares
+/// `capabilities.structured_output`. A route that omits it declares
 /// no structured-output support, and a request asking for one fails in prepare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1792,6 +1792,8 @@ pub struct RuntimeCapabilities {
     #[serde(default)]
     pub priority_service: bool,
     #[serde(default)]
+    pub structured_output: Option<StructuredOutputSupport>,
+    #[serde(default)]
     pub generation: RuntimeGenerationConfig,
 }
 
@@ -1804,6 +1806,7 @@ impl Default for RuntimeCapabilities {
             input_images: false,
             tool_result_images: false,
             priority_service: false,
+            structured_output: None,
             generation: RuntimeGenerationConfig::default(),
         }
     }
@@ -1881,36 +1884,21 @@ impl From<RuntimeCapabilities> for RouteCapabilities {
     }
 }
 
-impl From<RuntimeGenerationDefaults> for GenerationSupport {
-    fn from(value: RuntimeGenerationDefaults) -> Self {
+impl GenerationSupport {
+    pub fn from_capabilities(capabilities: &RuntimeCapabilities, protocol: &str) -> Self {
         Self {
-            temperature: value.temperature.is_some(),
-            top_p: value.top_p.is_some(),
-            max_output_tokens: value.max_output_tokens.is_some(),
-            stop_sequences: false,
-            reasoning: value.reasoning_effort.is_some() || !value.reasoning_efforts.is_empty(),
-            reasoning_summary: value.reasoning_summary.is_some(),
-            text_verbosity: value.text_verbosity.is_some(),
-            parallel_tool_calls: value.parallel_tool_calls.unwrap_or(false),
-            priority_service: false,
-            structured_output: None,
-        }
-    }
-}
-
-impl From<RuntimeGenerationConfig> for GenerationSupport {
-    fn from(value: RuntimeGenerationConfig) -> Self {
-        Self {
-            temperature: value.temperature,
-            top_p: value.top_p,
-            max_output_tokens: value.max_output_tokens,
-            stop_sequences: value.stop_sequences,
-            reasoning: value.reasoning,
-            reasoning_summary: value.reasoning_summary,
-            text_verbosity: value.text_verbosity,
-            parallel_tool_calls: value.parallel_tool_calls,
-            priority_service: value.priority_service,
-            structured_output: value.structured_output,
+            temperature: true,
+            top_p: true,
+            max_output_tokens: true,
+            stop_sequences: protocol != "responses",
+            reasoning: capabilities.reasoning,
+            reasoning_summary: capabilities.reasoning && protocol == "responses",
+            text_verbosity: protocol == "responses" || protocol == "completions",
+            parallel_tool_calls: capabilities.parallel_tool_calls,
+            priority_service: capabilities.priority_service,
+            structured_output: capabilities
+                .structured_output
+                .or(capabilities.generation.structured_output),
         }
     }
 }
@@ -2239,7 +2227,6 @@ impl RuntimeConfig {
             for (model_name, model) in &provider.models {
                 let strategy = resolved_model_strategy(model_name, model);
                 let protocol = resolved_model_protocol(provider, model_name, model);
-                let generation = &model.capabilities.generation;
                 let effective_flavor = resolved_model_flavor(provider, model_name, model);
                 strategy
                     .validate_binding(effective_flavor)
@@ -2247,12 +2234,7 @@ impl RuntimeConfig {
                         field: format!("providers.{provider_name}.models.{model_name}.strategy"),
                         reason,
                     })?;
-                strategy
-                    .validate_generation(
-                        &model.generation,
-                        model.capabilities.reasoning,
-                        generation.reasoning,
-                    )
+                strategy.validate_generation(&model.generation)
                     .map_err(|reason| RuntimeConfigError::InvalidValue {
                         field: format!(
                             "providers.{provider_name}.models.{model_name}.generation.reasoning_effort"
@@ -2265,30 +2247,6 @@ impl RuntimeConfig {
                         protocol: protocol.to_owned(),
                     });
                 }
-                if model.generation.temperature.is_some() && !generation.temperature {
-                    return Err(RuntimeConfigError::InvalidValue {
-                        field: format!(
-                            "providers.{provider_name}.models.{model_name}.generation.temperature"
-                        ),
-                        reason: "requires capabilities.generation.temperature = true".into(),
-                    });
-                }
-                if model.generation.top_p.is_some() && !generation.top_p {
-                    return Err(RuntimeConfigError::InvalidValue {
-                        field: format!(
-                            "providers.{provider_name}.models.{model_name}.generation.top_p"
-                        ),
-                        reason: "requires capabilities.generation.top_p = true".into(),
-                    });
-                }
-                if model.generation.max_output_tokens.is_some() && !generation.max_output_tokens {
-                    return Err(RuntimeConfigError::InvalidValue {
-                        field: format!(
-                            "providers.{provider_name}.models.{model_name}.generation.max_output_tokens"
-                        ),
-                        reason: "requires capabilities.generation.max_output_tokens = true".into(),
-                    });
-                }
                 if model.effective_input_limit_tokens == Some(0) {
                     return Err(RuntimeConfigError::InvalidValue {
                         field: format!(
@@ -2299,7 +2257,7 @@ impl RuntimeConfig {
                 }
                 if (model.generation.reasoning_effort.is_some()
                     || !model.generation.reasoning_efforts.is_empty())
-                    && (!model.capabilities.reasoning || !generation.reasoning)
+                    && !model.capabilities.reasoning
                 {
                     return Err(RuntimeConfigError::InvalidValue {
                         field: format!(
@@ -2602,7 +2560,6 @@ fn validate_generation_defaults(
     config: &RuntimeModelConfig,
 ) -> Result<(), RuntimeConfigError> {
     let path = |field: &str| format!("providers.{provider}.models.{model}.generation.{field}");
-    let generation = &config.capabilities.generation;
     if !config.generation.async_tools.is_empty() {
         if strategy != strategy::ModelStrategyId::Astra || protocol != "responses" {
             return Err(RuntimeConfigError::InvalidValue {
@@ -2633,40 +2590,34 @@ fn validate_generation_defaults(
             }
         }
     }
-    if protocol == "responses" && config.capabilities.generation.stop_sequences {
-        return Err(RuntimeConfigError::InvalidValue {
-            field: path("stop_sequences"),
-            reason: "Responses does not support stop sequences".into(),
-        });
-    }
     if let Some(value) = config.generation.temperature
-        && (!value.is_finite() || !(0.0..=2.0).contains(&value) || !generation.temperature)
+        && (!value.is_finite() || !(0.0..=2.0).contains(&value))
     {
         return Err(RuntimeConfigError::InvalidValue {
             field: path("temperature"),
-            reason: "requires capability and must be between 0 and 2".into(),
+            reason: "must be between 0 and 2".into(),
         });
     }
     if let Some(value) = config.generation.top_p
-        && (!value.is_finite() || !(0.0..=1.0).contains(&value) || !generation.top_p)
+        && (!value.is_finite() || !(0.0..=1.0).contains(&value))
     {
         return Err(RuntimeConfigError::InvalidValue {
             field: path("top_p"),
-            reason: "requires capability and must be between 0 and 1".into(),
+            reason: "must be between 0 and 1".into(),
         });
     }
     if let Some(value) = config.generation.max_output_tokens
-        && (value == 0 || value > u32::MAX as u64 || !generation.max_output_tokens)
+        && (value == 0 || value > u32::MAX as u64)
     {
         return Err(RuntimeConfigError::InvalidValue {
             field: path("max_output_tokens"),
-            reason: "requires capability and must be between 1 and u32::MAX".into(),
+            reason: "must be between 1 and u32::MAX".into(),
         });
     }
     if config.generation.reasoning_effort.is_some()
         || !config.generation.reasoning_efforts.is_empty()
     {
-        if !config.capabilities.reasoning || !generation.reasoning {
+        if !config.capabilities.reasoning {
             return Err(RuntimeConfigError::InvalidValue {
                 field: path("reasoning_effort"),
                 reason: "requires reasoning capabilities".into(),
@@ -2729,9 +2680,7 @@ fn validate_generation_defaults(
         });
     }
     if config.generation.reasoning_summary.is_some()
-        && (protocol != "responses"
-            || !config.capabilities.reasoning
-            || !generation.reasoning_summary)
+        && (protocol != "responses" || !config.capabilities.reasoning)
     {
         return Err(RuntimeConfigError::InvalidValue {
             field: path("reasoning_summary"),
@@ -2739,7 +2688,8 @@ fn validate_generation_defaults(
         });
     }
     if config.generation.text_verbosity.is_some()
-        && (protocol != "responses" && protocol != "completions" || !generation.text_verbosity)
+        && protocol != "responses"
+        && protocol != "completions"
     {
         return Err(RuntimeConfigError::InvalidValue {
             field: path("text_verbosity"),
@@ -2747,7 +2697,7 @@ fn validate_generation_defaults(
         });
     }
     if config.generation.parallel_tool_calls == Some(true)
-        && (!config.capabilities.parallel_tool_calls || !generation.parallel_tool_calls)
+        && !config.capabilities.parallel_tool_calls
     {
         return Err(RuntimeConfigError::InvalidValue {
             field: path("parallel_tool_calls"),
@@ -3243,7 +3193,10 @@ impl ResolvedProvider {
                     headers: config.headers.clone(),
                     query: merge_query(&config.query, &endpoint_query, name, model_name)?,
                     capabilities: capabilities.clone(),
-                    generation: model.capabilities.generation.clone().into(),
+                    generation: GenerationSupport::from_capabilities(
+                        &model.capabilities,
+                        protocol.as_str(),
+                    ),
                     generation_defaults: model.generation.clone(),
                     async_tools: model.generation.async_tools.iter().cloned().collect(),
                     cache: model.cache.clone(),
@@ -3278,7 +3231,10 @@ impl ResolvedProvider {
                             },
                             model.protocol_settings.clone(),
                             capabilities,
-                            model.capabilities.generation.clone().into(),
+                            GenerationSupport::from_capabilities(
+                                &model.capabilities,
+                                protocol.as_str(),
+                            ),
                         ))
                         .map_err(|error| RuntimeConfigError::InvalidValue {
                             field: format!("providers.{name}.models.{model_name}.binding"),

@@ -297,23 +297,23 @@ reasoning_efforts = ["none", "low", "medium", "high", "max"]
 - `input_images`：是否支持输入多模态图片。
 - `tool_result_images`：是否支持工具返回图片并在多轮对话中传回模型。
 - `priority_service`：是否声明优先级调度服务。
+- `structured_output`：结构化输出契约，支持 `json_schema` 或 `json_object`。
 
 ### 生成参数与默认值 `[generation]`
 
-设置常规回合的生成默认参数。**注意：每个参数生效的前提是已在 `capabilities` 中开启对应标志**。
+设置常规回合的生成默认参数。协议和模型能力决定哪些参数可用。
 
 - `temperature`：采样温度。
 - `top_p`：核采样阈值。
 - `max_output_tokens`：最大单次输出 Token 上限。
-- `stop_sequences`：停止词列表。
-- `reasoning_effort`：默认推理强度，可选 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` 或服务商自定义名称。要求 `capabilities.generation.reasoning = true`。
+- `reasoning_effort`：默认推理强度，可选 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` 或服务商自定义名称。要求 `capabilities.reasoning = true`。
 - `reasoning_efforts`：提供给当前会话选择的推理强度档位列表。
 - `reasoning_summary`：推理摘要模式，可选 `auto`、`concise` 或 `detailed`。
 - `text_verbosity`：文本详细程度，可选 `low`、`medium` 或 `high`。
 - `parallel_tool_calls`：是否开启并行工具调用。要求 `capabilities.parallel_tool_calls = true`。
 - `async_tools`：异步派发的工具名列表。需要 Astra 策略、Responses 协议且 `capabilities.tools = true`。
 
-### 结构化输出 `[capabilities.generation.structured_output]`
+### 结构化输出 `[capabilities.structured_output]`
 
 声明模型对结构化输出的支持级别：
 

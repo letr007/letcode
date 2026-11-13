@@ -6726,9 +6726,9 @@ fn config_editor_shows_the_reviewer_backend_only_on_the_reviewer_route() {
 }
 
 #[test]
-fn config_editor_links_reasoning_generation_to_both_capabilities() {
+fn config_editor_shows_reasoning_and_generation_defaults() {
     let mut runtime = runtime_with_config(
-        "[providers.alpha]\nprotocol = \"responses\"\n\n[providers.alpha.models.m]\n\n[providers.alpha.models.m.capabilities]\nreasoning = true\n\n[providers.alpha.models.m.capabilities.generation]\nreasoning = true\n\n[providers.alpha.models.m.generation]\nreasoning_effort = \"medium\"\n",
+        "[providers.alpha]\nprotocol = \"responses\"\n\n[providers.alpha.models.m]\n\n[providers.alpha.models.m.capabilities]\nreasoning = true\n\n[providers.alpha.models.m.generation]\nreasoning_effort = \"medium\"\n",
     );
     runtime.state_mut().set_input("/config");
     runtime
@@ -6749,8 +6749,8 @@ fn config_editor_links_reasoning_generation_to_both_capabilities() {
         .map(|item| item.label.as_str())
         .collect::<Vec<_>>();
     assert!(labels.contains(&"reasoning_effort"), "{labels:?}");
-    assert!(!labels.contains(&"temperature"), "{labels:?}");
-    assert!(!labels.contains(&"stop_sequences"), "{labels:?}");
+    assert!(labels.contains(&"temperature"), "{labels:?}");
+    assert!(!labels.contains(&"parallel_tool_calls"), "{labels:?}");
 }
 
 #[test]

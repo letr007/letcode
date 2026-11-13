@@ -183,17 +183,6 @@ reasoning = true
 input_images = false
 tool_result_images = false
 priority_service = false
-
-[providers.openai.models."gpt-5.5".capabilities.generation]
-temperature = true
-top_p = true
-max_output_tokens = true
-stop_sequences = false
-reasoning = true
-reasoning_summary = true
-text_verbosity = true
-parallel_tool_calls = true
-priority_service = false
 # structured_output = "json_schema"  # json_object | json_schema
 
 [providers.openai.models."gpt-5.5".generation]
@@ -266,7 +255,7 @@ namespace = "my-cache"
 - Provider 认证配置在 `[providers.<name>.auth]`。`credential_env` 可显式指定环境变量；未指定时默认读取按 provider 名生成的 `<PROVIDER>_API_KEY`，再回退到 `credential`。endpoint 不再通过 `<PROVIDER>_BASE_URL` 覆盖，必须配置在 `[providers.<name>.endpoints]`。
 - `type = "bearer"` 使用 `Authorization: Bearer ...`；`header` / `query` 必须配置合法的 `name`；`none` 不能携带 credential。
 - Provider 和 model 都可配置 `protocol` / `flavor`。`protocol` 支持 `responses`、`completions`、`anthropic`；`flavor = "deepseek"` 是显式 DeepSeek profile，不根据 provider/model 名猜测。
-- capability 与 generation capability 省略时均为 false。`.generation` 中出现某个参数时，必须先在 `.capabilities.generation` 打开对应能力；reasoning 参数还要求 `.capabilities.reasoning = true`。
+- capability 省略时均为 false。`.generation` 中出现某个参数时，由协议和模型能力校验；reasoning 参数要求 `.capabilities.reasoning = true`，并行工具调用要求 `.capabilities.parallel_tool_calls = true`。
 - `.cache.enabled = true` 是缓存的唯一开关：它同时声明该路由支持 provider-native prompt cache hint 并发送它。`.cache.retention` 仅适用于 Responses，并要求 `enabled = true`。
 - `anthropic_betas` 和 `anthropic_thinking` 位于模型的 `.protocol_settings` table，仅适用于 `protocol = "anthropic"`。beta 会按配置顺序合并为 `anthropic-beta` header；thinking 支持 `disabled`、`adaptive`、`budget`，budget 模式至少 1024 token；配置 `reasoning_effort` 或 `reasoning_efforts` 时必须为 `adaptive`。
 - `[tools.parallelism]` 只能**收窄**已声明 `Parallel` 的工具（例如强制
@@ -276,7 +265,7 @@ namespace = "my-cache"
 - 内置 expert agent 键固定为：`explorer`、`fixer`、`oracle`、`designer`、
   `librarian`、`general`、`reviewer`、`historian`。其中六个可委派 expert 是 explorer/fixer/oracle/designer/librarian/general，reviewer 仅用于权限自动审查，historian 仅用于历史整理；没有自由形式的 agent map。
 - `[agents.historian]` 发布结构化 JSON 契约：优先给它声明
-  `capabilities.generation.structured_output = "json_schema"` 的路由，由上游在解码层约束 JSON 语法。声明 `json_object` 的路由只表达“输出 JSON”的意图，模型仍可能返回语法损坏的响应，宿主只能整次拒绝。
+  `capabilities.structured_output = "json_schema"` 的路由，由上游在解码层约束 JSON 语法。声明 `json_object` 的路由只表达“输出 JSON”的意图，模型仍可能返回语法损坏的响应，宿主只能整次拒绝。
 - `agents.<expert>.allowed_models` 仅接受 `provider/model`，用于 `agent__*`
   单次委派选择；省略 `model` 时仍使用 expert 默认路由，单次选择不会写回配置。
 - `permissions.mode = "auto"` 的 Ask 矩阵与 `default` 相同，但由粘性的
@@ -284,7 +273,7 @@ namespace = "my-cache"
   走普通模型，`jev` 调用该 provider 的 Jev 接口。provider 上的
   `reviewer = "jev"` 是旧版标记，仅用于兼容已有配置。
 - `generation.async_tools` 列出异步工具名，需同时满足 Astra 策略、`protocol = "responses"` 与 `capabilities.tools = true`；Astra 只支持 `low` 及以上的 reasoning effort。
-- `capabilities.generation.structured_output` 声明该路由的强制能力（非布尔值）：`json_schema` 由上游在解码层约束 JSON 语法，`json_object` 只表达“输出 JSON”的意图。
+- `capabilities.structured_output` 声明该路由的强制能力（非布尔值）：`json_schema` 由上游在解码层约束 JSON 语法，`json_object` 只表达“输出 JSON”的意图。
 - `[fake.codex]` 与 `[fake.claude]` 省略的字段按真实主机或所模拟客户端的典型值推导；`identity.installation_id` 必须是 UUID，否则会被替换；`clock.timezone` 需为 IANA 名。
 - `[fake.codex.extra]` 的键不超过 64 字节且首字符为 ASCII 字母、只含字母数字与 `_` `.` `-`，值不超过 128 字节；不得使用 turn metadata 已占用的键（如 `session_id`、`thread_id`、`turn_id`、`agent_name`、`request_kind`）。
 - `global.submit_while_running` 控制活动回合中新输入的处理时机，适用于本地提交与跨实例消息：`insert`（默认）在当前工具批次结束时关闭回合并作为下一回合执行，没有工具批次时在回合结束时执行，`queue` 等当前回合结束后按 FIFO 执行。
