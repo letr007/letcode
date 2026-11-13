@@ -870,9 +870,9 @@ impl PendingQuestionState {
         self.show_confirm_tab() && self.active_tab == self.questions.len()
     }
 
-    pub fn active_tab_label(&self, index: usize) -> Option<&str> {
+    pub fn active_tab_label<'a>(&'a self, index: usize, confirm_label: &'a str) -> Option<&'a str> {
         if self.show_confirm_tab() && index == self.questions.len() {
-            Some("Confirm")
+            Some(confirm_label)
         } else {
             self.questions
                 .get(index)

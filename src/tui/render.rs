@@ -152,7 +152,9 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         theme.card_frame,
     );
     if let Some(question) = state.pending_question.as_ref() {
-        metrics.composer_height = question_composer_height(question, workspace, theme.card_frame);
+        let confirm_label = state.t("question.confirm");
+        metrics.composer_height =
+            question_composer_height(question, workspace, theme.card_frame, &confirm_label);
         metrics.transcript_viewport_height = workspace
             .height
             .saturating_sub(metrics.composer_height)
@@ -195,6 +197,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
     let Some(question) = state.pending_question.as_ref().cloned() else {
         return;
     };
+    let confirm_label = state.t("question.confirm");
 
     if area.is_empty() {
         return;
@@ -214,7 +217,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
     let inner = shell.content_area;
     let is_confirm = question.is_confirm_tab();
     let tab_rows = if question.show_confirm_tab() {
-        question_tab_row_count(&question, inner.width.max(1) as usize)
+        question_tab_row_count(&question, inner.width.max(1) as usize, &confirm_label)
     } else {
         0
     };
@@ -225,6 +228,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
             &question,
             inner.width.max(1) as usize,
             theme,
+            &confirm_label,
         ));
         lines.push(Line::default());
     }
@@ -251,6 +255,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
                     &question,
                     inner.width.max(1) as usize,
                     theme,
+                    &confirm_label,
                 )),
                 tabs_area,
             );
@@ -272,8 +277,8 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &mut TuiState, area: Re
         }
     } else if let Some(current) = question.current_question() {
         let content_width = inner.width.max(1) as usize;
-        let compact_options =
-            question_full_row_count(&question, content_width) > shell.content_area.height as usize;
+        let compact_options = question_full_row_count(&question, content_width, &confirm_label)
+            > shell.content_area.height as usize;
         if compact_options {
             lines = compact_question_lines(
                 &question,
@@ -490,13 +495,16 @@ fn question_tab_lines(
     question: &crate::tui::state::PendingQuestionState,
     width: usize,
     theme: Theme,
+    confirm_label: &str,
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut current = Vec::new();
     let mut current_width = 0usize;
     for index in 0..question.total_tabs() {
-        let label = question.active_tab_label(index).unwrap_or_default();
+        let label = question
+            .active_tab_label(index, confirm_label)
+            .unwrap_or_default();
         let (token, has_separator, token_width) = question_tab_token(label, width);
         if !current.is_empty() && current_width.saturating_add(token_width) > width {
             rows.push(Line::from(std::mem::take(&mut current)));
@@ -528,12 +536,15 @@ fn question_tab_lines(
 fn question_tab_row_count(
     question: &crate::tui::state::PendingQuestionState,
     width: usize,
+    confirm_label: &str,
 ) -> usize {
     let width = width.max(1);
     let mut rows = 1usize;
     let mut row_width = 0usize;
     for index in 0..question.total_tabs() {
-        let label = question.active_tab_label(index).unwrap_or_default();
+        let label = question
+            .active_tab_label(index, confirm_label)
+            .unwrap_or_default();
         let (_, _, token_width) = question_tab_token(label, width);
         if row_width > 0 && row_width.saturating_add(token_width) > width {
             rows += 1;
@@ -616,12 +627,14 @@ fn question_composer_height(
     question: &crate::tui::state::PendingQuestionState,
     workspace: Rect,
     card_frame: bool,
+    confirm_label: &str,
 ) -> u16 {
     layout::question_composer_height_for_content(
         workspace.height,
         question_full_row_count(
             question,
             question_content_width(workspace.width, card_frame),
+            confirm_label,
         ),
         card_frame,
     )
@@ -694,11 +707,12 @@ fn translate_question_detail(state: &TuiState, detail: &str) -> String {
 fn question_full_row_count(
     question: &crate::tui::state::PendingQuestionState,
     width: usize,
+    confirm_label: &str,
 ) -> usize {
     let width = width.max(1);
     let rows = |text: &str| wrapped_row_count(text, width);
     if question.is_confirm_tab() {
-        return question_tab_row_count(question, width)
+        return question_tab_row_count(question, width, confirm_label)
             + 1
             + confirm_body_row_count(
                 question,
@@ -711,7 +725,7 @@ fn question_full_row_count(
     };
     let mut total = 0;
     if question.show_confirm_tab() {
-        total += question_tab_row_count(question, width) + 1;
+        total += question_tab_row_count(question, width, confirm_label) + 1;
     }
     if let Some(origin) = &question.origin_label {
         total += rows(origin);

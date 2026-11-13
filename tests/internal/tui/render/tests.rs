@@ -476,8 +476,8 @@ fn narrow_confirm_tabs_wrap_into_multiple_rows() {
         },
         None,
     );
-    assert!(question_tab_row_count(&question, 12) > 1);
-    assert_eq!(question_tab_row_count(&question, 200), 1);
+    assert!(question_tab_row_count(&question, 12, "Confirm") > 1);
+    assert_eq!(question_tab_row_count(&question, 200, "Confirm"), 1);
 }
 
 #[test]
@@ -494,9 +494,12 @@ fn oversized_tab_label_is_truncated_without_exceeding_row_width() {
         None,
     );
     let width = 7;
-    let lines = question_tab_lines(&question, width, Theme::default());
+    let lines = question_tab_lines(&question, width, Theme::default(), "Confirm");
 
-    assert_eq!(question_tab_row_count(&question, width), lines.len());
+    assert_eq!(
+        question_tab_row_count(&question, width, "Confirm"),
+        lines.len()
+    );
     assert!(!lines.is_empty());
     assert!(
         lines
@@ -557,8 +560,17 @@ fn detailed_question_panel_grows_then_uses_compact_viewport_at_workspace_limit()
     question.questions[0].custom_edit_cursor = question.questions[0].custom_edit_text.len();
     let workspace = Rect::new(2, 0, 44, 13);
 
-    assert_eq!(question_composer_height(&question, workspace, false), 11);
-    assert!(question_full_row_count(&question, question_content_width(workspace.width, false)) > 7);
+    assert_eq!(
+        question_composer_height(&question, workspace, false, "Confirm"),
+        11
+    );
+    assert!(
+        question_full_row_count(
+            &question,
+            question_content_width(workspace.width, false),
+            "Confirm"
+        ) > 7
+    );
 
     let mut state = TuiState::default();
     state.mark_session_active();
