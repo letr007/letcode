@@ -3678,6 +3678,12 @@ impl TuiRuntime {
             ConfigTab::Advanced if dialog.config_path.is_empty() => {
                 self.config_advanced_items(document)
             }
+            ConfigTab::Providers if dialog.config_path.len() == 2 => {
+                self.config_provider_items(document, &dialog.config_path)
+            }
+            ConfigTab::Mcp if dialog.config_path.len() == 2 => {
+                self.config_mcp_items(document, &dialog.config_path)
+            }
             _ => self.config_level_items(document, &dialog.config_path),
         }
     }
@@ -3770,6 +3776,58 @@ impl TuiRuntime {
             }
         }
         (picked_items, picked_fields)
+    }
+
+    fn config_provider_items(
+        &self,
+        document: &toml_edit::DocumentMut,
+        level: &[String],
+    ) -> (Vec<DialogItem>, Vec<ConfigFieldRef>) {
+        let (items, fields) = self.config_level_items(document, level);
+        let mut rows = items.into_iter().zip(fields).collect::<Vec<_>>();
+        rows.sort_by_key(|(item, _)| Self::config_provider_field_rank(&item.id));
+        for (item, _) in &mut rows {
+            let (section, _) = Self::config_provider_field_rank(&item.id);
+            item.section = Some(self.state.t(section).to_string());
+        }
+        rows.into_iter().unzip()
+    }
+
+    fn config_mcp_items(
+        &self,
+        document: &toml_edit::DocumentMut,
+        level: &[String],
+    ) -> (Vec<DialogItem>, Vec<ConfigFieldRef>) {
+        let (items, fields) = self.config_level_items(document, level);
+        let mut rows = items.into_iter().zip(fields).collect::<Vec<_>>();
+        rows.sort_by_key(|(item, _)| Self::config_mcp_field_rank(&item.id));
+        for (item, _) in &mut rows {
+            let (section, _) = Self::config_mcp_field_rank(&item.id);
+            item.section = Some(self.state.t(section).to_string());
+        }
+        rows.into_iter().unzip()
+    }
+
+    fn config_mcp_field_rank(id: &str) -> (&'static str, u8) {
+        match id.rsplit('/').next().unwrap_or_default() {
+            "type" | "enabled" | "timeout" => ("config.section_basic", 0),
+            "local" | "remote" => ("config.section_connection", 1),
+            "command" | "environment" | "env" | "url" | "headers" | "oauth" => {
+                ("config.section_connection", 2)
+            }
+            _ => ("config.section_other", 3),
+        }
+    }
+
+    fn config_provider_field_rank(id: &str) -> (&'static str, u8) {
+        match id.rsplit('/').next().unwrap_or_default() {
+            "protocol" | "default_model" | "flavor" => ("config.section_basic", 0),
+            "auth" => ("config.section_auth", 1),
+            "endpoints" | "transport" | "headers" | "query" => ("config.section_connection", 2),
+            "models" => ("config.section_models", 3),
+            "retry" => ("config.section_retry", 4),
+            _ => ("config.section_other", 5),
+        }
     }
 
     /// Rows for what is there, plus what the schema allows to add.
@@ -4155,9 +4213,23 @@ impl TuiRuntime {
             }
             (Some("mcp"), 2) => {
                 let name = name?;
-                let kind = crate::config::config_value_in(document, &["mcp", name, "type"])
-                    .map(|(_, value)| value)
-                    .unwrap_or_else(|| "local".to_string());
+                let local = Self::config_table(
+                    document,
+                    &["mcp".to_string(), name.to_string(), "local".to_string()],
+                );
+                let remote = Self::config_table(
+                    document,
+                    &["mcp".to_string(), name.to_string(), "remote".to_string()],
+                );
+                let kind = if local.is_some() {
+                    "local".to_string()
+                } else if remote.is_some() {
+                    "remote".to_string()
+                } else {
+                    crate::config::config_value_in(document, &["mcp", name, "type"])
+                        .map(|(_, value)| value)
+                        .unwrap_or_else(|| "local".to_string())
+                };
                 let enabled = crate::config::config_value_in(document, &["mcp", name, "enabled"])
                     .map(|(_, value)| value)
                     .unwrap_or_else(|| "true".to_string());
@@ -4166,7 +4238,17 @@ impl TuiRuntime {
                 } else {
                     self.state.t("config.disabled")
                 };
-                Some(format!("{kind} · {state}"))
+                let url = if kind == "remote" {
+                    Self::config_text(document, &["mcp", name, "remote", "url"])
+                        .or_else(|| Self::config_text(document, &["mcp", name, "url"]))
+                } else {
+                    None
+                };
+                let mut parts = vec![kind, state];
+                if let Some(url) = url {
+                    parts.push(url);
+                }
+                Some(parts.join(" · "))
             }
             (Some("permissions"), 1) => {
                 crate::config::config_value_in(document, &["permissions", "mode"])
@@ -4344,11 +4426,34 @@ impl TuiRuntime {
                 _ => true,
             };
         }
-        if path.len() == 3 && path[0] == "mcp" {
+        if path[0] == "mcp" && (path.len() == 3 || path.len() == 4) {
             let kind = Self::config_text(document, &["mcp", &path[1], "type"]);
+            let local = Self::config_table(
+                document,
+                &["mcp".to_string(), path[1].clone(), "local".to_string()],
+            );
+            let remote = Self::config_table(
+                document,
+                &["mcp".to_string(), path[1].clone(), "remote".to_string()],
+            );
+            let nested = local.is_some() || remote.is_some();
+            if path.len() == 4 {
+                return match path[2].as_str() {
+                    "local" => local.is_some() && remote.is_none(),
+                    "remote" => remote.is_some() && local.is_none(),
+                    _ => true,
+                };
+            }
             match path[2].as_str() {
-                "command" | "environment" | "env" => return kind.as_deref() != Some("remote"),
-                "url" | "headers" | "oauth" => return kind.as_deref() == Some("remote"),
+                "type" => return !nested,
+                "local" => return remote.is_none() && kind.as_deref() != Some("remote"),
+                "remote" => return local.is_none() && kind.as_deref() != Some("local"),
+                "command" | "environment" | "env" => {
+                    return !nested && kind.as_deref() != Some("remote");
+                }
+                "url" | "headers" | "oauth" => {
+                    return !nested && kind.as_deref() == Some("remote");
+                }
                 _ => {}
             }
         }

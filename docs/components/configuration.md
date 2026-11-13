@@ -157,35 +157,37 @@ mode = "default" # safe | default | auto | yolo
 
 ```toml
 [mcp.local_server]
-type = "local"
-command = ["/path/to/server", "--stdio"]
-environment = { ENV_VAR = "value" }
 enabled = true
 timeout = 5000
+
+[mcp.local_server.local]
+command = ["/path/to/server", "--stdio"]
+environment = { ENV_VAR = "value" }
 ```
 
-- `type`：固定为 `"local"`。必填。
-- `command`：可执行程序路径及参数列表。必填。
-- `environment`：传递给子进程的环境变量键值对。别名为 `env`。
+- `local.command`：可执行程序路径及参数列表。必填。
+- `local.environment`：传递给子进程的环境变量键值对。别名为 `env`。
 - `enabled`：是否启用该服务，默认为 `true`。也可在会话内使用 `/mcp` 快捷切换。
 - `timeout`：服务响应与方法调用的超时毫秒数，默认为 5000 毫秒。
+- `type` 与顶层 `command`/`environment` 是旧式扁平写法，仅用于兼容已有配置。
 
 ### 远程网络服务
 
 ```toml
 [mcp.remote_server]
-type = "remote"
-url = "https://example.com/mcp"
-headers = { Authorization = "Bearer YOUR_TOKEN" }
 enabled = true
 timeout = 10000
+
+[mcp.remote_server.remote]
+url = "https://example.com/mcp"
+headers = { Authorization = "Bearer YOUR_TOKEN" }
 ```
 
-- `type`：固定为 `"remote"`。必填。
-- `url`：远程服务 HTTP/SSE 端点地址。必填。
-- `headers`：请求时附带的自定义标头。
+- `remote.url`：远程服务 HTTP/SSE 端点地址。必填。
+- `remote.headers`：请求时附带的自定义标头。
 - `timeout`：网络请求超时毫秒数。
-- `oauth`：远程 MCP 暂不支持 OAuth 授权，必须保持为 `false`。
+- `remote.oauth`：远程 MCP 暂不支持 OAuth 授权，必须保持为 `false`。
+- `type` 与顶层 `url`/`headers`/`oauth` 是旧式扁平写法，仅用于兼容已有配置。
 
 ## 服务商配置 `[providers.<name>]`
 

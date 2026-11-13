@@ -6290,6 +6290,74 @@ fn config_editor_overview_summarizes_the_active_configuration() {
 }
 
 #[test]
+fn config_editor_groups_provider_fields_by_purpose() {
+    let mut runtime = runtime_with_config(
+        "[providers.alpha]\nprotocol = \"responses\"\ndefault_model = \"m\"\n\n[providers.alpha.auth]\ntype = \"bearer\"\ncredential = \"k\"\n\n[providers.alpha.endpoints]\nbase_url = \"https://a.invalid/v1\"\n\n[providers.alpha.models.m]\n\n[providers.alpha.retry]\nenabled = true\n",
+    );
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::En));
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+    enter_config_table(&mut runtime, "providers");
+    enter_config_table(&mut runtime, "alpha");
+
+    let dialog = runtime.state().dialog().expect("config dialog");
+    let section = |label: &str| {
+        dialog
+            .items
+            .iter()
+            .find(|item| item.label == label)
+            .and_then(|item| item.section.as_deref())
+    };
+    assert_eq!(section("protocol"), Some("Basics"));
+    assert_eq!(section("auth"), Some("Authentication"));
+    assert_eq!(section("endpoints"), Some("Connection"));
+    assert_eq!(section("models"), Some("Models"));
+    assert_eq!(section("retry"), Some("Retry"));
+}
+
+#[test]
+fn config_editor_uses_mcp_local_and_remote_subtables() {
+    let mut runtime = runtime_with_config(
+        "[mcp.tool]\nenabled = true\n\n[mcp.tool.local]\ncommand = [\"echo\"]\n",
+    );
+    runtime.state_mut().set_input("/config");
+    runtime
+        .handle_input_action(InputAction::Submit)
+        .expect("config command is accepted");
+    enter_config_table(&mut runtime, "mcp");
+    enter_config_table(&mut runtime, "tool");
+
+    let labels = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"local"), "{labels:?}");
+    assert!(!labels.contains(&"remote"), "{labels:?}");
+    assert!(!labels.contains(&"type"), "{labels:?}");
+    assert!(!labels.contains(&"command"), "{labels:?}");
+
+    enter_config_table(&mut runtime, "local");
+    let labels = runtime
+        .state()
+        .dialog()
+        .expect("config dialog")
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"command"), "{labels:?}");
+    assert!(labels.contains(&"environment"), "{labels:?}");
+}
+
+#[test]
 fn config_editor_lists_grouped_fields() {
     let mut runtime = runtime_with_config(
         "active_provider = \"openai\"\n\n[providers.openai]\ndefault_model = \"gpt-5.5\"\n\n[permissions]\nmode = \"default\"\n",

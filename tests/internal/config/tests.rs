@@ -1650,6 +1650,55 @@ fn rejects_invalid_mcp_local_config() {
 }
 
 #[test]
+fn mcp_nested_tables_select_the_transport() {
+    let text = format!(
+        "{}\n\n[mcp.tool]\nenabled = true\n\n[mcp.tool.local]\ncommand = [\"echo\", \"hi\"]\n\n[mcp.tool.local.environment]\nKEY = \"value\"\n\n[mcp.docs]\n\n[mcp.docs.remote]\nurl = \"https://example.invalid/mcp\"\n\n[mcp.docs.remote.headers]\nAuthorization = \"Bearer token\"\n",
+        config("openai", "model", "")
+    );
+    let loaded =
+        AppConfig::load_from_path(write_temp_config(text)).expect("nested MCP config loads");
+    match &loaded.mcp["tool"].transport {
+        McpTransportConfig::Local(local) => {
+            assert_eq!(local.command, ["echo", "hi"]);
+            assert_eq!(
+                local.environment.get("KEY").map(String::as_str),
+                Some("value")
+            );
+        }
+        McpTransportConfig::Remote(_) => panic!("tool should be local"),
+    }
+    match &loaded.mcp["docs"].transport {
+        McpTransportConfig::Remote(remote) => {
+            assert_eq!(remote.url, "https://example.invalid/mcp");
+            assert_eq!(
+                remote.headers.get("Authorization").map(String::as_str),
+                Some("Bearer token")
+            );
+        }
+        McpTransportConfig::Local(_) => panic!("docs should be remote"),
+    }
+}
+
+#[test]
+fn mcp_nested_tables_reject_conflicting_shapes() {
+    let mismatch = format!(
+        "{}\n\n[mcp.tool]\ntype = \"remote\"\n\n[mcp.tool.local]\ncommand = [\"echo\"]",
+        config("openai", "model", "")
+    );
+    let error = AppConfig::load_from_path(write_temp_config(mismatch))
+        .expect_err("type must match the nested table");
+    assert!(format!("{error:#}").contains("does not match its local/remote table"));
+
+    let mixed = format!(
+        "{}\n\n[mcp.tool]\nurl = \"https://example.invalid/mcp\"\n\n[mcp.tool.local]\ncommand = [\"echo\"]",
+        config("openai", "model", "")
+    );
+    let error = AppConfig::load_from_path(write_temp_config(mixed))
+        .expect_err("nested and flat fields cannot be mixed");
+    assert!(format!("{error:#}").contains("cannot mix"));
+}
+
+#[test]
 fn rejects_remote_mcp_oauth_until_supported() {
     let error = AppConfig::load_from_path(write_temp_config(format!(
         "{}\n\n[mcp.docs]\ntype = \"remote\"\nurl = \"https://example.invalid/mcp\"\noauth = true",

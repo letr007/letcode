@@ -111,18 +111,20 @@ run_timeout_secs = 600           # swarm run 默认超时秒数
 # "web__fetch" = "exclusive"
 
 [mcp.example_local]
-type = "local"
-command = ["/path/to/mcp-server", "--stdio"]
-# environment = { FOO = "bar" }   # 别名：env
 # enabled = true
 # timeout = 5000                  # 毫秒
 
+[mcp.example_local.local]
+command = ["/path/to/mcp-server", "--stdio"]
+# environment = { FOO = "bar" }   # 别名：env
+
 [mcp.example_remote]
-type = "remote"
-url = "https://example.com/mcp"
-# headers = { Authorization = "Bearer ..." }
 # enabled = true
 # timeout = 10000
+
+[mcp.example_remote.remote]
+url = "https://example.com/mcp"
+# headers = { Authorization = "Bearer ..." }
 # oauth = false                   # true 会被拒绝（暂不支持 OAuth）
 
 [providers.openai]
@@ -260,8 +262,7 @@ namespace = "my-cache"
 - `anthropic_betas` 和 `anthropic_thinking` 位于模型的 `.protocol_settings` table，仅适用于 `protocol = "anthropic"`。beta 会按配置顺序合并为 `anthropic-beta` header；thinking 支持 `disabled`、`adaptive`、`budget`，budget 模式至少 1024 token；配置 `reasoning_effort` 或 `reasoning_efforts` 时必须为 `adaptive`。
 - `[tools.parallelism]` 只能**收窄**已声明 `Parallel` 的工具（例如强制
   `exclusive`）。把 exclusive 工具提成 `parallel` 会被拒绝。
-- 本地 MCP 的 `command` 必须是字符串数组，不能是单个字符串。`type` 必填。
-  remote 不能设 `command`/`environment`；local 不能设 `url`/`headers`/`oauth`。
+- MCP 使用 `local` 或 `remote` 子表，二者只能选一个。本地 `local.command` 必须是字符串数组，不能是单个字符串。旧式顶层 `type`/`command`/`url` 等字段仍可读取，但新配置应使用子表。
 - 内置 expert agent 键固定为：`explorer`、`fixer`、`oracle`、`designer`、
   `librarian`、`general`、`reviewer`、`historian`。其中六个可委派 expert 是 explorer/fixer/oracle/designer/librarian/general，reviewer 仅用于权限自动审查，historian 仅用于历史整理；没有自由形式的 agent map。
 - `[agents.historian]` 发布结构化 JSON 契约：优先给它声明

@@ -164,12 +164,11 @@
       }
     },
     "mcpServer": {
-      "description": "One MCP server. local runs a stdio command; remote connects to a URL.",
+      "description": "One MCP server. Use a local or remote subtable; the flat transport fields remain for legacy configs.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["type"],
       "properties": {
-        "type": { "description": "local runs command over stdio; remote connects to url over HTTP.", "enum": ["local", "remote"] },
+        "type": { "description": "Optional; inferred from local or remote. Legacy flat servers still require it.", "enum": ["local", "remote"] },
         "enabled": {
           "type": "boolean",
           "default": true,
@@ -185,33 +184,42 @@
           "type": "array",
           "items": { "description": "One argv element; the first element is the executable.", "type": "string", "minLength": 1 },
           "minItems": 1,
-          "description": "Executable and arguments of a local stdio server. Required for type = \"local\"."
+          "deprecated": true,
+          "description": "Legacy local command. Set mcp.<name>.local.command instead."
         },
         "environment": {
           "type": "object",
           "additionalProperties": { "description": "Value of this environment variable for a local server.", "type": "string" },
-          "description": "Environment variables passed to a local server. Aliased as `env`."
+          "deprecated": true,
+          "description": "Legacy local environment. Set mcp.<name>.local.environment instead."
         },
         "env": {
           "type": "object",
           "additionalProperties": { "description": "Value of this environment variable for a local server.", "type": "string" },
-          "description": "Alias of `environment`."
+          "deprecated": true,
+          "description": "Legacy alias of environment."
         },
         "url": {
           "type": "string",
-          "description": "Endpoint of a remote server. Required for type = \"remote\"."
+          "deprecated": true,
+          "description": "Legacy remote URL. Set mcp.<name>.remote.url instead."
         },
         "headers": {
           "type": "object",
           "additionalProperties": { "description": "Value of this request header for a remote server.", "type": "string" },
-          "description": "Extra request headers for a remote server."
+          "deprecated": true,
+          "description": "Legacy remote headers. Set mcp.<name>.remote.headers instead."
         },
         "oauth": {
           "enum": [false],
           "default": false,
-          "description": "Remote MCP OAuth is not supported; leave it false and authenticate through headers."
-        }
+          "deprecated": true,
+          "description": "Legacy remote OAuth flag. Set mcp.<name>.remote.oauth instead."
+        },
+        "local": { "$ref": "#/definitions/mcpLocal" },
+        "remote": { "$ref": "#/definitions/mcpRemote" }
       },
+      "not": { "required": ["local", "remote"] },
       "allOf": [
         {
           "if": {
@@ -219,9 +227,10 @@
             "required": ["type"]
           },
           "then": {
-            "required": ["command"],
+            "anyOf": [{ "required": ["local"] }, { "required": ["command"] }],
             "not": {
               "anyOf": [
+                { "required": ["remote"] },
                 { "required": ["url"] },
                 { "required": ["headers"] },
                 { "required": ["oauth"] }
@@ -235,9 +244,10 @@
             "required": ["type"]
           },
           "then": {
-            "required": ["url"],
+            "anyOf": [{ "required": ["remote"] }, { "required": ["url"] }],
             "not": {
               "anyOf": [
+                { "required": ["local"] },
                 { "required": ["command"] },
                 { "required": ["environment"] },
                 { "required": ["env"] }
@@ -246,6 +256,52 @@
           }
         }
       ]
+    },
+    "mcpLocal": {
+      "description": "Local stdio transport for one MCP server.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": {
+          "type": "array",
+          "items": { "description": "One argv element; the first element is the executable.", "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "description": "Executable and arguments of the local stdio server."
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": { "description": "Value of this environment variable for the local server.", "type": "string" },
+          "description": "Environment variables passed to the local server."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "description": "Value of this environment variable for the local server.", "type": "string" },
+          "description": "Alias of environment."
+        }
+      }
+    },
+    "mcpRemote": {
+      "description": "Remote HTTP transport for one MCP server.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url"],
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "Endpoint of the remote server."
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "description": "Value of this request header for the remote server.", "type": "string" },
+          "description": "Extra request headers for the remote server."
+        },
+        "oauth": {
+          "enum": [false],
+          "default": false,
+          "description": "Remote MCP OAuth is not supported; leave it false and authenticate through headers."
+        }
+      }
     },
     "subagents": {
       "type": "object",

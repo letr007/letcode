@@ -1040,8 +1040,8 @@ struct RawToolsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMcpServerConfig {
-    #[serde(rename = "type")]
-    kind: RawMcpServerKind,
+    #[serde(rename = "type", default)]
+    kind: Option<RawMcpServerKind>,
     enabled: Option<bool>,
     timeout: Option<u64>,
     command: Option<Vec<String>>,
@@ -1051,9 +1051,28 @@ struct RawMcpServerConfig {
     #[serde(default)]
     headers: IndexMap<String, String>,
     oauth: Option<bool>,
+    local: Option<RawMcpLocalConfig>,
+    remote: Option<RawMcpRemoteConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpLocalConfig {
+    command: Option<Vec<String>>,
+    #[serde(default, alias = "env")]
+    environment: IndexMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpRemoteConfig {
+    url: Option<String>,
+    #[serde(default)]
+    headers: IndexMap<String, String>,
+    oauth: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum RawMcpServerKind {
     Local,
@@ -1577,14 +1596,55 @@ fn build_mcp_server_config(
         &format!("mcp.{name}.timeout"),
         raw.timeout.unwrap_or(DEFAULT_MCP_TIMEOUT_MS),
     )?;
+    let RawMcpServerConfig {
+        kind,
+        command,
+        environment,
+        url,
+        headers,
+        oauth,
+        local,
+        remote,
+        ..
+    } = raw;
+    if local.is_some() && remote.is_some() {
+        bail!("mcp.{name} must set exactly one of local or remote");
+    }
+    let nested_local = local.is_some();
+    let nested_remote = remote.is_some();
+    if (nested_local || nested_remote)
+        && (command.is_some()
+            || !environment.is_empty()
+            || url.is_some()
+            || !headers.is_empty()
+            || oauth.is_some())
+    {
+        bail!("mcp.{name} cannot mix a local/remote table with top-level transport fields");
+    }
+    let kind = match (kind, nested_local, nested_remote) {
+        (Some(RawMcpServerKind::Local), false, true)
+        | (Some(RawMcpServerKind::Remote), true, false) => {
+            bail!("mcp.{name}.type does not match its local/remote table");
+        }
+        (Some(kind), _, _) => kind,
+        (None, true, false) => RawMcpServerKind::Local,
+        (None, false, true) => RawMcpServerKind::Remote,
+        (None, false, false) => {
+            bail!("mcp.{name}.type is required when local or remote table is absent");
+        }
+        (None, true, true) => unreachable!("both nested tables were rejected above"),
+    };
 
-    let transport = match raw.kind {
+    let transport = match kind {
         RawMcpServerKind::Local => {
-            if raw.url.is_some() || !raw.headers.is_empty() || raw.oauth.is_some() {
+            if !nested_local && (url.is_some() || !headers.is_empty() || oauth.is_some()) {
                 bail!("mcp.{name} local server must not set remote-only fields");
             }
-            let command = raw
-                .command
+            let (command, environment) = match local {
+                Some(local) => (local.command, local.environment),
+                None => (command, environment),
+            };
+            let command = command
                 .ok_or_else(|| anyhow!("mcp.{name}.command is required for local servers"))?;
             if command.is_empty() {
                 bail!("mcp.{name}.command cannot be empty");
@@ -1598,26 +1658,29 @@ fn build_mcp_server_config(
                 .collect::<Result<Vec<_>>>()?;
             McpTransportConfig::Local(McpLocalServerConfig {
                 command,
-                environment: raw.environment,
+                environment,
             })
         }
         RawMcpServerKind::Remote => {
-            if raw.command.is_some() || !raw.environment.is_empty() {
+            if !nested_remote && (command.is_some() || !environment.is_empty()) {
                 bail!("mcp.{name} remote server must not set local-only fields");
             }
+            let (url, headers, oauth) = match remote {
+                Some(remote) => (remote.url, remote.headers, remote.oauth),
+                None => (url, headers, oauth),
+            };
             let url = required_non_empty(
                 &format!("mcp.{name}.url"),
-                raw.url
-                    .ok_or_else(|| anyhow!("mcp.{name}.url is required for remote servers"))?,
+                url.ok_or_else(|| anyhow!("mcp.{name}.url is required for remote servers"))?,
             )?;
-            if raw.oauth.unwrap_or(false) {
+            if oauth.unwrap_or(false) {
                 bail!(
                     "mcp.{name}.oauth is enabled, but remote MCP OAuth is not supported yet; set oauth = false and provide headers"
                 );
             }
             McpTransportConfig::Remote(McpRemoteServerConfig {
                 url,
-                headers: raw.headers,
+                headers,
                 oauth: false,
             })
         }
