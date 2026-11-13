@@ -5,8 +5,9 @@ use crate::context_history::{
     HistoryApplication, HistoryCompartment, HistoryFact, HistoryFactCategory, HistoryPublication,
     HistorySelection, HistoryTier,
 };
-use crate::request_builder::HistoryItem;
+use crate::request_builder::{HistoryItem, HistoryToolCall};
 use crate::tool::ToolResult;
+use crate::transcript::{InternalContinuationSource, TranscriptAssistantTurn};
 use serde_json::json;
 
 fn entry(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
@@ -356,4 +357,105 @@ fn history_snapshot_places_a_completion_recorded_while_a_tool_call_was_open() {
     assert!(output < notice, "{history:?}");
     crate::protocol_frames::validate_history_items_complete(&history, None)
         .expect("a following turn is accepted");
+}
+
+#[test]
+fn history_application_retires_published_sources_recorded_inside_a_tool_group() {
+    let call = HistoryToolCall {
+        call_id: "call-1".into(),
+        name: "shell__exec".into(),
+        arguments_json: "{}".into(),
+    };
+    let sources = ["raw:1", "raw:4", "raw:2"].map(String::from).to_vec();
+    let records = vec![
+        entry(
+            1,
+            TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text: None,
+                reasoning_content: None,
+                replay: None,
+                calls: vec![call.clone()],
+            }),
+        ),
+        entry(
+            2,
+            TranscriptEvent::InternalContinuation {
+                text: "first".into(),
+                source: InternalContinuationSource::SubagentCompletion,
+            },
+        ),
+        entry(
+            3,
+            TranscriptEvent::InternalContinuation {
+                text: "second".into(),
+                source: InternalContinuationSource::SubagentCompletion,
+            },
+        ),
+        entry(
+            4,
+            TranscriptEvent::ToolCallFinished {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                ok: true,
+                output: ToolResult::ok("shell__exec", json!({"status": 0})),
+            },
+        ),
+        entry(
+            5,
+            TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text: Some("continue".into()),
+                reasoning_content: None,
+                replay: None,
+                calls: vec![],
+            }),
+        ),
+        entry(
+            6,
+            TranscriptEvent::HistoryPublished(HistoryPublication {
+                id: "p".into(),
+                project_path: None,
+                external_fact_ids: vec![],
+                source_ids: sources.clone(),
+                compartments: vec![HistoryCompartment {
+                    id: "p-c".into(),
+                    title: "episode".into(),
+                    source_ids: sources.clone(),
+                    importance: 50,
+                    detailed: "detail".into(),
+                    compact: "compact".into(),
+                    anchor: "anchor".into(),
+                }],
+                facts: vec![],
+                withdrawn_fact_ids: vec![],
+            }),
+        ),
+        entry(
+            7,
+            TranscriptEvent::HistoryApplied(HistoryApplication {
+                publication_ids: vec!["p".into()],
+                baseline: vec![HistorySelection {
+                    compartment_id: "p-c".into(),
+                    tier: HistoryTier::Detailed,
+                }],
+                delta: vec![],
+                baseline_fact_ids: vec![],
+                delta_fact_ids: vec![],
+                withdrawn_fact_ids: vec![],
+                first_kept_entry_id: Some("raw:3".into()),
+                legacy_summary: None,
+            }),
+        ),
+    ];
+
+    validate_context_projection_events(&records).expect("the writer accepts the retired prefix");
+    let history = restore_session_history_projection(&records);
+    match history.as_slice() {
+        [HistoryItem::ContextSummary { .. }, continuation, assistant] => {
+            assert_eq!(continuation, &HistoryItem::internal_continuation("second"));
+            assert!(matches!(assistant, HistoryItem::AssistantTurn { .. }));
+        }
+        other => panic!("unexpected replay: {other:?}"),
+    }
+    crate::protocol_frames::validate_history_items_complete(&history, None)
+        .expect("the retained tail replays as a complete protocol prefix");
 }

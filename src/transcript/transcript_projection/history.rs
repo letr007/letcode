@@ -103,22 +103,38 @@ impl HistoryProjectionState {
                 archive
                     .apply(application.clone())
                     .expect("validated history application");
-                let tail_start = application
-                    .first_kept_entry_id
-                    .as_ref()
+                // The retired prefix is contiguous in provider order, not in record order.
+                let covered: BTreeSet<String> = application
+                    .publication_ids
+                    .iter()
                     .map(|id| {
-                        history
-                            .iter()
-                            .position(|entry| &entry.stable_key == id)
-                            .expect("validated history retained boundary")
+                        archive
+                            .publications
+                            .get(id)
+                            .expect("validated history publication")
                     })
-                    .unwrap_or(history.len());
+                    .flat_map(|publication| publication.source_ids.iter().cloned())
+                    .collect();
+                // Prior summaries are superseded by the re-rendered baseline and legacy_summary.
+                let is_retired = |entry: &HistoryProjectionEntry| {
+                    matches!(entry.item, HistoryItem::ContextSummary { .. })
+                        || covered.contains(&entry.stable_key)
+                };
                 let retired_spans = merge_source_spans(
                     history
                         .iter()
-                        .take(tail_start)
+                        .filter(|entry| is_retired(entry))
                         .flat_map(|entry| entry.source_spans.iter().copied()),
                 );
+                assert_eq!(
+                    history
+                        .iter()
+                        .filter(|entry| covered.contains(&entry.stable_key))
+                        .count(),
+                    covered.len(),
+                    "validated history coverage"
+                );
+                history.retain(|entry| !is_retired(entry));
                 let mut baseline = archive.render(&application.baseline);
                 if let Some(legacy) = &application.legacy_summary {
                     baseline = format!("{legacy}\n\n{baseline}");
@@ -169,7 +185,7 @@ impl HistoryProjectionState {
                         origin: HistoryProjectionOrigin::CompactionSummary,
                     });
                 }
-                compacted.extend(history.drain(tail_start..));
+                compacted.append(&mut history);
                 history = compacted;
             }
             TranscriptEvent::ContextCompaction(event) => {
