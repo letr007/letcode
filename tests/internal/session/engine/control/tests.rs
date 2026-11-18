@@ -167,3 +167,54 @@ fn queued_inputs_keep_fifo_order_across_flush_and_local_cancellation() {
         .collect();
     assert_eq!(labels, ["first", "second", "fourth", "fifth"]);
 }
+
+#[test]
+fn active_turn_rename_records_the_title_without_parking() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-engine-control-rename-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time ok")
+            .as_nanos()
+    ));
+    let transcript = Arc::new(StdMutex::new(
+        crate::transcript::TranscriptRecorder::create(&base_dir).expect("create transcript"),
+    ));
+    let session_id = transcript
+        .lock()
+        .expect("recorder")
+        .session_id()
+        .to_string();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut parked = VecDeque::new();
+    let mut background_deliveries = HashMap::new();
+    let mut change_notice_sent = false;
+
+    handle_active_turn_command(
+        SessionEngineCommand::RenameSession("Renamed mid-turn".into()),
+        &mut parked,
+        &tx,
+        &transcript,
+        &SubagentPool::default(),
+        &mut background_deliveries,
+        &mut change_notice_sent,
+    );
+
+    assert!(parked.is_empty());
+    assert!(!change_notice_sent);
+    assert!(matches!(
+        rx.try_recv().expect("title event"),
+        SessionTransportEvent::SessionTitleUpdated { session_id: id, title }
+            if id == session_id && title == "Renamed mid-turn"
+    ));
+    assert!(rx.try_recv().is_err());
+
+    let records = {
+        let recorder = transcript.lock().expect("recorder");
+        crate::transcript::read_records(recorder.path()).expect("read records")
+    };
+    assert!(matches!(
+        records.last().map(|record| &record.event),
+        Some(crate::transcript::TranscriptEvent::SessionTitle { title }) if title == "Renamed mid-turn"
+    ));
+}

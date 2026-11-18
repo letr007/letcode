@@ -71,8 +71,8 @@ impl SessionCommand {
             Self::SetPermissionMode(_)
             | Self::ToggleFastMode
             | Self::SetReasoningEffort(_)
-            | Self::SetFakeClient(_)
-            | Self::RenameSession(_) => (true, ActiveTurnCommandDisposition::Defer),
+            | Self::SetFakeClient(_) => (true, ActiveTurnCommandDisposition::Defer),
+            Self::RenameSession(_) => (true, ActiveTurnCommandDisposition::Immediate),
             Self::SetModel(_) | Self::SetExpertAllowedModels { .. } | Self::ToggleMcpServer(_) => {
                 (false, ActiveTurnCommandDisposition::Defer)
             }

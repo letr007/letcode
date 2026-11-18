@@ -232,6 +232,32 @@ pub(crate) fn handle_active_turn_command(
         return;
     }
 
+    if let SessionEngineCommand::RenameSession(title) = &command {
+        let recorded = transcript
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))
+            .and_then(|mut recorder| {
+                let session_id = recorder.session_id().to_string();
+                recorder
+                    .record_session_title(title.clone())
+                    .map(|()| session_id)
+            });
+        match recorded {
+            Ok(session_id) => {
+                let _ = session_transport_tx.send(SessionTransportEvent::SessionTitleUpdated {
+                    session_id,
+                    title: title.clone(),
+                });
+            }
+            Err(error) => {
+                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                    format!("failed to rename session: {error}"),
+                )));
+            }
+        }
+        return;
+    }
+
     // Reading a transcript does not touch the agent, but history navigation
     // rewrites it, so it waits for the turn in every phase that parks commands.
     match &command {

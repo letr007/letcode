@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn rename_maps_to_backend_idle_work() {
+fn rename_maps_to_backend_and_applies_during_an_active_turn() {
     assert_eq!(
         SessionCommand::from_command_intent(crate::command::CommandIntent::Rename(Some(
             "Fix the parser".into()
@@ -16,7 +16,7 @@ fn rename_maps_to_backend_idle_work() {
     assert!(command.schedule().idle);
     assert_eq!(
         command.active_turn_disposition(),
-        crate::session::ActiveTurnCommandDisposition::Defer
+        crate::session::ActiveTurnCommandDisposition::Immediate
     );
 }
 
