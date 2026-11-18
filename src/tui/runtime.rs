@@ -1529,14 +1529,8 @@ impl TuiRuntime {
                 }
                 suppress_session_event = true;
             }
-            SessionTransportEvent::BackgroundShellCompleted {
-                task_id,
-                session_id,
-            } => {
-                if session_id.is_none() || session_id.as_deref() == self.state.session_id.as_deref()
-                {
-                    self.state.remove_background_shell(task_id);
-                }
+            SessionTransportEvent::BackgroundShellCompleted { task_id, .. } => {
+                self.state.remove_background_shell(task_id);
                 suppress_session_event = true;
             }
             SessionTransportEvent::SettingChangeFailed { command } => {

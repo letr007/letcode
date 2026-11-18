@@ -17,7 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::assistant_fade::ASSISTANT_FADE_DURATION;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
@@ -512,6 +512,7 @@ pub struct Timeline {
     subagent_run_by_child: HashMap<String, String>,
     foreground_waits: HashMap<String, String>,
     settled_subagent_waits: HashMap<String, SettledSubagentWait>,
+    settled_runs: HashSet<String>,
     pending_subagent_starts: Vec<SubagentToolBinding>,
 }
 
@@ -539,6 +540,7 @@ impl Default for Timeline {
             subagent_run_by_child: HashMap::new(),
             foreground_waits: HashMap::new(),
             settled_subagent_waits: HashMap::new(),
+            settled_runs: HashSet::new(),
             pending_subagent_starts: Vec::new(),
         }
     }
@@ -1265,19 +1267,16 @@ impl Timeline {
                     });
                 self.subagent_run_by_child
                     .insert(result.child_session_id.clone(), result.run_id.clone());
-                self.subagent_tools_by_run.insert(
-                    result.run_id.clone(),
-                    SubagentToolBinding {
-                        call_id: event.call_id.clone(),
-                        run_id: result.run_id.clone(),
-                        child_session_id: result.child_session_id.clone(),
-                        agent_name: result.agent_name.clone(),
-                        task,
-                        title,
-                        background: false,
-                        finished: false,
-                    },
-                );
+                self.bind_subagent(SubagentToolBinding {
+                    call_id: event.call_id.clone(),
+                    run_id: result.run_id.clone(),
+                    child_session_id: result.child_session_id.clone(),
+                    agent_name: result.agent_name.clone(),
+                    task,
+                    title,
+                    background: false,
+                    finished: false,
+                });
             }
             return self.finish_subagent_tool(&result, false);
         }
@@ -1342,19 +1341,16 @@ impl Timeline {
                 });
             self.subagent_run_by_child
                 .insert(child_session_id.clone(), run_id.clone());
-            self.subagent_tools_by_run.insert(
-                run_id.clone(),
-                SubagentToolBinding {
-                    call_id: call_id.clone(),
-                    run_id,
-                    child_session_id,
-                    agent_name,
-                    task,
-                    title,
-                    background,
-                    finished: false,
-                },
-            );
+            self.bind_subagent(SubagentToolBinding {
+                call_id: call_id.clone(),
+                run_id,
+                child_session_id,
+                agent_name,
+                task,
+                title,
+                background,
+                finished: false,
+            });
         }
 
         true
@@ -1903,8 +1899,7 @@ impl Timeline {
         binding.child_session_id = child_session_id.to_string();
         self.subagent_run_by_child
             .insert(child_session_id.to_string(), run_id.to_string());
-        self.subagent_tools_by_run
-            .insert(run_id.to_string(), binding);
+        self.bind_subagent(binding);
         true
     }
 
@@ -1993,7 +1988,7 @@ impl Timeline {
 
     pub fn finish_background_subagent_tool(
         &mut self,
-        parent_tool_call_id: &str,
+        parent_tool_call_id: Option<&str>,
         result: &crate::subagent::SubagentRunSummary,
     ) -> bool {
         if self.foreground_waits.contains_key(&result.run_id)
@@ -2022,32 +2017,71 @@ impl Timeline {
             return false;
         }
         if !self.subagent_tools_by_run.contains_key(&result.run_id) {
+            let Some(parent_tool_call_id) = parent_tool_call_id else {
+                self.settled_runs.insert(result.run_id.clone());
+                return false;
+            };
             let Some(index) = self.find_tool_index(parent_tool_call_id) else {
+                self.settled_runs.insert(result.run_id.clone());
                 return false;
             };
-            let Some(TimelineItem::Tool(tool)) = self.items.get(index) else {
-                return false;
+            let (task, title) = {
+                let Some(TimelineItem::Tool(tool)) = self.items.get(index) else {
+                    return false;
+                };
+                if !is_subagent_tool_name(&tool.name) {
+                    return false;
+                }
+                (
+                    tool.summary.clone(),
+                    argument_title(tool.arguments.as_deref()),
+                )
             };
-            if !is_subagent_tool_name(&tool.name) {
-                return false;
-            }
-            self.subagent_tools_by_run.insert(
-                result.run_id.clone(),
-                SubagentToolBinding {
-                    call_id: parent_tool_call_id.to_string(),
-                    run_id: result.run_id.clone(),
-                    child_session_id: result.child_session_id.clone(),
-                    agent_name: result.agent_name.clone(),
-                    task: tool.summary.clone(),
-                    title: argument_title(tool.arguments.as_deref()),
-                    background: true,
-                    finished: false,
-                },
-            );
+            self.bind_subagent(SubagentToolBinding {
+                call_id: parent_tool_call_id.to_string(),
+                run_id: result.run_id.clone(),
+                child_session_id: result.child_session_id.clone(),
+                agent_name: result.agent_name.clone(),
+                task,
+                title,
+                background: true,
+                finished: false,
+            });
             self.subagent_run_by_child
                 .insert(result.child_session_id.clone(), result.run_id.clone());
         }
         self.finish_subagent_tool(result, true)
+    }
+
+    fn bind_subagent(&mut self, binding: SubagentToolBinding) {
+        let finished = self.settled_runs.contains(&binding.run_id);
+        self.subagent_tools_by_run.insert(
+            binding.run_id.clone(),
+            SubagentToolBinding {
+                finished,
+                ..binding
+            },
+        );
+    }
+
+    pub fn settle_subagent_run(&mut self, run_id: &str) -> bool {
+        let Some(binding) = self.subagent_tools_by_run.get(run_id) else {
+            self.settled_runs.insert(run_id.to_string());
+            return false;
+        };
+        if binding.finished {
+            return true;
+        }
+        let call_id = binding.call_id.clone();
+        let Some(index) = self.find_tool_index(&call_id) else {
+            self.settled_runs.insert(run_id.to_string());
+            return false;
+        };
+        if let Some(binding) = self.subagent_tools_by_run.get_mut(run_id) {
+            binding.finished = true;
+        }
+        self.bump_revision(index);
+        true
     }
 
     fn finish_subagent_tool(
@@ -2056,6 +2090,7 @@ impl Timeline {
         background: bool,
     ) -> bool {
         let Some(binding) = self.subagent_tools_by_run.get(&result.run_id).cloned() else {
+            self.settled_runs.insert(result.run_id.clone());
             return false;
         };
         self.finish_subagent_tool_by_call_id(&binding.call_id, result, background)
@@ -2068,6 +2103,7 @@ impl Timeline {
         background: bool,
     ) -> bool {
         let Some(index) = self.find_tool_index(call_id) else {
+            self.settled_runs.insert(result.run_id.clone());
             return false;
         };
         let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {

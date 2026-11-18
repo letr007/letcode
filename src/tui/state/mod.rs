@@ -3822,9 +3822,6 @@ impl TuiState {
         parent_tool_call_id: Option<&str>,
         result: &crate::subagent::SubagentRunSummary,
     ) {
-        let Some(parent_tool_call_id) = parent_tool_call_id else {
-            return;
-        };
         if self
             .timeline
             .finish_background_subagent_tool(parent_tool_call_id, result)

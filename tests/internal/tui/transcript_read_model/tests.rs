@@ -629,3 +629,63 @@ fn restored_user_messages_keep_image_attachments() {
         Some(TimelineItem::User(message)) if message.text == "inspect this"
             && message.attachments.first().is_some_and(|attachment| attachment.label == "screen.png")));
 }
+
+#[test]
+fn restored_subagent_results_close_background_cards() {
+    let timeline = timeline_from_transcript_records(&[
+        record(
+            1,
+            TranscriptEvent::ToolCallStarted {
+                call_id: "background-call".into(),
+                name: "agent__explore".into(),
+                args: json!({"task": "restore background", "background": true}),
+            },
+        ),
+        record(
+            2,
+            TranscriptEvent::SubagentStarted {
+                run_id: "run-restored".into(),
+                parent_session_id: "s".into(),
+                parent_run_id: "turn-1".into(),
+                child_session_id: "child-restored".into(),
+                agent_name: "explorer".into(),
+                summary: "restore background".into(),
+                pool_ordinal: 1,
+            },
+        ),
+        record(
+            3,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "background-call".into(),
+                name: "agent__explore".into(),
+                ok: true,
+                output: crate::tool::ToolResult::ok(
+                    "agent__explore",
+                    json!({
+                        "run_id": "run-restored",
+                        "child_session_id": "child-restored",
+                        "agent_name": "explorer",
+                        "status": "running",
+                        "summary": "restore background",
+                        "active": true,
+                        "background": true
+                    }),
+                ),
+            },
+        ),
+        record(
+            4,
+            TranscriptEvent::SubagentResult {
+                run_id: "run-restored".into(),
+                parent_session_id: "s".into(),
+                parent_run_id: "turn-1".into(),
+                child_session_id: "child-restored".into(),
+                agent_name: "explorer".into(),
+                status: "completed".into(),
+                summary: "restore finished".into(),
+            },
+        ),
+    ]);
+
+    assert!(timeline.active_subagents().is_empty());
+}

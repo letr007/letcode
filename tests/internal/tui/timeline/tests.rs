@@ -615,7 +615,7 @@ fn cancelled_background_subagent_leaves_the_task_section() {
         },
     };
 
-    assert!(timeline.finish_background_subagent_tool("background-call", &result));
+    assert!(timeline.finish_background_subagent_tool(Some("background-call"), &result));
     assert!(timeline.active_subagents().is_empty());
     assert!(matches!(
         timeline.items().first(),
@@ -1090,7 +1090,7 @@ fn late_background_completion_does_not_overwrite_a_completed_wait_clone() {
     };
 
     assert!(timeline.finish_subagent_wait("wait-call", &result));
-    assert!(!timeline.finish_background_subagent_tool("background-call", &result));
+    assert!(!timeline.finish_background_subagent_tool(Some("background-call"), &result));
     assert!(matches!(
         timeline.items(),
         [TimelineItem::Tool(background), TimelineItem::Tool(waiting)]
@@ -1264,7 +1264,7 @@ fn waiting_run_uses_its_terminal_result_when_completion_events_race() {
             raw_excerpt: None,
         },
     };
-    assert!(!timeline.finish_background_subagent_tool("background-call", &result));
+    assert!(!timeline.finish_background_subagent_tool(Some("background-call"), &result));
     assert!(timeline.finish_subagent_wait("wait-call", &result));
     assert!(matches!(
         timeline.items(),
@@ -1316,7 +1316,7 @@ fn background_completion_replaces_running_receipt_on_parent_tool() {
         },
     };
 
-    assert!(timeline.finish_background_subagent_tool("background-call", &result));
+    assert!(timeline.finish_background_subagent_tool(Some("background-call"), &result));
     assert!(matches!(
         timeline.items().first(),
         Some(TimelineItem::Tool(tool))
@@ -1477,4 +1477,95 @@ fn restored_text_never_fades() {
     };
     assert!(message.reveal_tail.is_empty());
     assert!(!message.is_fading(std::time::Instant::now()));
+}
+
+fn completed_run(run_id: &str, child_session_id: &str) -> crate::subagent::SubagentRunSummary {
+    crate::subagent::SubagentRunSummary {
+        run_id: run_id.into(),
+        child_session_id: child_session_id.into(),
+        agent_name: "explorer".into(),
+        status: crate::subagent::SubagentStatus::Completed,
+        failure_kind: None,
+        summary: "explorer finished".into(),
+        structured_result: crate::subagent::StructuredSubagentResult {
+            status: "completed".into(),
+            summary: "explorer finished".into(),
+            malformed: false,
+            findings: Vec::new(),
+            files_read: Vec::new(),
+            files_changed: Vec::new(),
+            commands_run: Vec::new(),
+            validation: Vec::new(),
+            blockers: Vec::new(),
+            next_steps: Vec::new(),
+            run_id: run_id.into(),
+            child_session_id: child_session_id.into(),
+            raw_excerpt: None,
+        },
+    }
+}
+
+#[test]
+fn a_settled_run_stays_hidden_when_its_binding_arrives_later() {
+    let mut timeline = Timeline::new();
+    assert!(!timeline.settle_subagent_run("run-late"));
+
+    timeline.push_tool_started(ToolStartedEvent {
+        call_id: "late-call".into(),
+        name: "agent__explore".into(),
+        summary: "explore".into(),
+        arguments: Some(json!({"task": "inspect ordering", "background": true}).to_string()),
+    });
+    assert!(timeline.register_subagent_started(
+        "run-late",
+        "child-late",
+        "explorer",
+        "inspect ordering"
+    ));
+
+    assert!(timeline.active_subagents().is_empty());
+}
+
+#[test]
+fn a_background_completion_closes_its_run_without_a_parent_call_id() {
+    let mut timeline = Timeline::new();
+    timeline.push_tool_started(ToolStartedEvent {
+        call_id: "detached-call".into(),
+        name: "agent__explore".into(),
+        summary: "explore in background".into(),
+        arguments: Some(json!({"task": "inspect detachment", "background": true}).to_string()),
+    });
+    assert!(
+        timeline.push_tool_finished(ToolFinishedEvent {
+            call_id: "detached-call".into(),
+            name: "agent__explore".into(),
+            summary: "explorer running".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "ok": true,
+                    "tool": "agent__explore",
+                    "data": {
+                        "run_id": "run-detached",
+                        "child_session_id": "child-detached",
+                        "agent_name": "explorer",
+                        "status": "running",
+                        "summary": "inspect detachment",
+                        "active": true,
+                        "background": true
+                    }
+                })
+                .to_string(),
+            ),
+        })
+    );
+    assert_eq!(timeline.active_subagents().len(), 1);
+
+    assert!(
+        timeline.finish_background_subagent_tool(
+            None,
+            &completed_run("run-detached", "child-detached")
+        )
+    );
+    assert!(timeline.active_subagents().is_empty());
 }

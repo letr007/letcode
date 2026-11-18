@@ -531,13 +531,6 @@ mod integration_tests {
                 &result,
             );
             assert_eq!(deliverable, deliverable_expected, "{status:?}");
-            if terminal_expected {
-                assert_eq!(
-                    child_interrupted(rx.try_recv().expect("terminal")),
-                    Some(child),
-                    "{status:?}"
-                );
-            }
             let SessionTransportEvent::BackgroundSubagentCompleted {
                 parent_tool_call_id,
                 result: summary,
@@ -547,8 +540,46 @@ mod integration_tests {
             };
             assert_eq!(parent_tool_call_id.as_deref(), call_id, "{status:?}");
             assert_eq!(summary.status, status, "{status:?}");
+            if terminal_expected {
+                assert_eq!(
+                    child_interrupted(rx.try_recv().expect("terminal")),
+                    Some(child),
+                    "{status:?}"
+                );
+            }
             assert!(rx.try_recv().is_err(), "{status:?}");
         }
+    }
+
+    #[test]
+    fn background_completion_reaches_the_ui_when_delivery_is_rejected() {
+        let runtime = SubagentPool::new();
+        let transcript = parent_transcript(&temp_sessions_dir());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notified = std::collections::HashMap::new();
+        let result = Ok(run_summary(
+            "run-elsewhere",
+            "child-elsewhere",
+            "explorer",
+            SubagentStatus::Completed,
+        ));
+
+        let deliverable = observe_background_subagent_completion(
+            &transcript,
+            &runtime,
+            &mut notified,
+            &tx,
+            "another-session",
+            Some("call-elsewhere".into()),
+            &result,
+        );
+
+        assert!(!deliverable);
+        assert!(matches!(
+            rx.try_recv().expect("ui terminal"),
+            SessionTransportEvent::BackgroundSubagentCompleted { .. }
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

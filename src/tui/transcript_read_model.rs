@@ -235,8 +235,10 @@ impl TranscriptTimelineProjection {
                     target_child_session_id: input.target_child_session_id.clone(),
                 });
             }
-            TranscriptEvent::SubagentResult { .. }
-            | TranscriptEvent::SubagentActivated { .. }
+            TranscriptEvent::SubagentResult { run_id, .. } => {
+                self.timeline.settle_subagent_run(run_id);
+            }
+            TranscriptEvent::SubagentActivated { .. }
             | TranscriptEvent::SubagentLifecycle { .. }
             | TranscriptEvent::LlmRequestTelemetry { .. }
             | TranscriptEvent::SessionStarted { .. }

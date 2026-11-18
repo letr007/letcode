@@ -202,7 +202,6 @@ pub(crate) enum SessionTransportEvent {
     },
     BackgroundShellCompleted {
         task_id: String,
-        session_id: Option<String>,
     },
     ModelCatalogUpdated(ModelCatalogUpdatedEvent),
     SettingChangeFailed {

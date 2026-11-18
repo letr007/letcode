@@ -263,7 +263,6 @@ impl SessionEngine {
                 crate::tool::background::BackgroundEvent::Completed(outcome) => {
                     let _ = event_tx.send(SessionTransportEvent::BackgroundShellCompleted {
                         task_id: outcome.task_id.clone(),
-                        session_id: outcome.session_id.clone(),
                     });
                     let _ = control_tx.send(SessionEngineControl::Command(
                         SessionEngineCommand::BackgroundShellCompleted { outcome },
@@ -3138,13 +3137,22 @@ pub(crate) fn observe_background_subagent_completion(
     parent_tool_call_id: Option<String>,
     result: &Result<crate::subagent::SubagentRunSummary, String>,
 ) -> bool {
-    if subagent_runtime.member_scope_stopped(parent_session_id) {
-        return false;
-    }
     let Ok(summary) = result else {
-        return true;
+        return !subagent_runtime.member_scope_stopped(parent_session_id);
     };
-    if subagent_runtime.is_foregrounded(&summary.run_id) {
+    // The UI terminal belongs to the run; model delivery conditions do not apply to it.
+    let foregrounded = subagent_runtime.is_foregrounded(&summary.run_id);
+    let first_notification = background_deliveries
+        .entry(summary.run_id.clone())
+        .or_default()
+        .mark_notified();
+    if first_notification {
+        let _ = session_transport_tx.send(SessionTransportEvent::BackgroundSubagentCompleted {
+            parent_tool_call_id,
+            result: summary.clone(),
+        });
+    }
+    if subagent_runtime.member_scope_stopped(parent_session_id) || foregrounded {
         return false;
     }
     let current_session_id = transcript
@@ -3156,34 +3164,16 @@ pub(crate) fn observe_background_subagent_completion(
     }
     // A cancelled background run still needs the terminal its dropped executor never published.
     if summary.status == SubagentStatus::Cancelled {
-        if background_deliveries
-            .entry(summary.run_id.clone())
-            .or_default()
-            .mark_notified()
-        {
+        if first_notification {
             emit_child_terminal(session_transport_tx, &summary.child_session_id);
-            let _ = session_transport_tx.send(SessionTransportEvent::BackgroundSubagentCompleted {
-                parent_tool_call_id,
-                result: summary.clone(),
-            });
         }
         return false;
     }
     if subagent_runtime.member_scope_stopped(&summary.child_session_id) {
         return false;
     }
-    if background_deliveries
-        .entry(summary.run_id.clone())
-        .or_default()
-        .mark_notified()
-    {
-        if summary.status == SubagentStatus::TimedOut {
-            emit_child_terminal(session_transport_tx, &summary.child_session_id);
-        }
-        let _ = session_transport_tx.send(SessionTransportEvent::BackgroundSubagentCompleted {
-            parent_tool_call_id,
-            result: summary.clone(),
-        });
+    if first_notification && summary.status == SubagentStatus::TimedOut {
+        emit_child_terminal(session_transport_tx, &summary.child_session_id);
     }
     true
 }
