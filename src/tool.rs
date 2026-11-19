@@ -46,6 +46,7 @@ mod git;
 mod memory;
 mod paths;
 pub(crate) mod peer;
+pub(crate) mod process_tree;
 mod question;
 mod registry;
 mod search;

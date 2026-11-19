@@ -550,7 +550,7 @@ max_output_tokens=4096
         let observed = recorder.clone();
         let mut events = move |event| {
             std::future::ready(
-                crate::agent_event_journal::persist_agent_event(
+                crate::session::agent_event_journal::persist_agent_event(
                     &mut observed.lock().unwrap(),
                     &event,
                 )
@@ -651,7 +651,7 @@ max_output_tokens=4096
         let mut events = Vec::new();
         {
             let mut on_event = |event: AgentEvent| {
-                let result = crate::agent_event_journal::persist_agent_event(
+                let result = crate::session::agent_event_journal::persist_agent_event(
                     &mut recorder.lock().unwrap(),
                     &event,
                 )

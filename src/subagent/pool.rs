@@ -9,9 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant, timeout_at};
 
+use super::events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::agent::{Agent, AgentFactory, AgentTemplate, SubagentInvocation};
 use crate::config::ModelRoute;
-use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::tool::{NormalizedSubagentInput, SubagentPathScope};
 use crate::transcript::transcript_projection;
 use crate::transcript::{

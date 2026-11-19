@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
-use crate::process_tree::ManagedChild;
+use super::process_tree::ManagedChild;
 
 use super::args::{optional_bool, optional_string, optional_usize, required_string};
 use super::background::{self, OutputSink, TERMINAL_PREVIEW_BYTES};

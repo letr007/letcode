@@ -14,10 +14,10 @@ use crate::config::{
     McpLocalServerConfig, McpRemoteServerConfig, McpServerConfig, McpTransportConfig,
 };
 use crate::permission::ToolPermissionClass;
-use crate::process_tree::ManagedChild;
 #[cfg(test)]
 use crate::request_builder::ToolSpec;
 use crate::tool::ToolHandler;
+use crate::tool::process_tree::ManagedChild;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_DISCOVERY_CONCURRENCY: usize = 4;

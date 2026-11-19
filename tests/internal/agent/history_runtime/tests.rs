@@ -132,7 +132,7 @@ max_output_tokens=4096
             recorder.lock().unwrap().record_user_message("New work during history preparation").unwrap();
             let observed=recorder.clone();
             let mut events=move |event| {
-                let result=crate::agent_event_journal::persist_agent_event(&mut observed.lock().unwrap(),&event).map(|_|());
+                let result=crate::session::agent_event_journal::persist_agent_event(&mut observed.lock().unwrap(),&event).map(|_|());
                 std::future::ready(result)
             };
             assert!(advance(&mut agent,true,true,&mut events).await.unwrap());
@@ -192,7 +192,7 @@ max_output_tokens=4096
             let second_work_id = second_work.id.clone();
             let observed = recorder.clone();
             let mut events = move |event| {
-                let result = crate::agent_event_journal::persist_agent_event(
+                let result = crate::session::agent_event_journal::persist_agent_event(
                     &mut observed.lock().unwrap(),
                     &event,
                 )
@@ -223,7 +223,7 @@ max_output_tokens=4096
             assert_eq!(retry_work.id, second_work_id);
             let observed = recorder.clone();
             let mut events = move |event| {
-                let result = crate::agent_event_journal::persist_agent_event(
+                let result = crate::session::agent_event_journal::persist_agent_event(
                     &mut observed.lock().unwrap(),
                     &event,
                 )

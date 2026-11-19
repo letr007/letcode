@@ -93,5 +93,5 @@ fn error_chain_has_transient_message(error: &(dyn Error + 'static)) -> bool {
 }
 
 #[cfg(test)]
-#[path = "../tests/internal/retry/tests.rs"]
+#[path = "../../tests/internal/retry/tests.rs"]
 mod tests;

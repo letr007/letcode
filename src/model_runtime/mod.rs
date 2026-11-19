@@ -2958,7 +2958,7 @@ impl ProviderTransport {
             } else {
                 FailureKind::Http
             };
-            let retry_hint = if crate::retry::is_retryable_reqwest_error(&error) {
+            let retry_hint = if crate::model_runtime::retry::is_retryable_reqwest_error(&error) {
                 RetryHint::Retryable
             } else {
                 RetryHint::Never
@@ -3581,6 +3581,8 @@ pub fn retry_hint_from_headers(headers: &reqwest::header::HeaderMap) -> RetryHin
     }
     RetryHint::Retryable
 }
+
+pub(crate) mod retry;
 
 #[cfg(test)]
 #[path = "../../tests/internal/model_runtime/tests.rs"]

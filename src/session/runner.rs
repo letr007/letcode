@@ -5,12 +5,12 @@ use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
 use tracing::warn;
 
+use super::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::agent::{Agent, AgentEvent, SubagentDelegate};
-use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::permission::PermissionApproval;
 use crate::session::child_view::ChildLiveText;
 use crate::subagent::SubagentPool;
-use crate::subagent_events::SubagentEventSender;
+use crate::subagent::events::SubagentEventSender;
 use crate::transcript::{
     TranscriptRecorder, any_record_where, read_records, record_is_session_title,
     record_is_user_message,

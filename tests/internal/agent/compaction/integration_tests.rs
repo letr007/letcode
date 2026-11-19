@@ -96,7 +96,7 @@ max_output_tokens=128
             assert!(pressure_successor_request(&mut agent, ApiProtocol::Responses, &[], &[]).is_err());
             let observed = recorder.clone();
             let mut events = move |event| {
-                let result = crate::agent_event_journal::persist_agent_event(&mut observed.lock().unwrap(), &event).map(|_| ());
+                let result = crate::session::agent_event_journal::persist_agent_event(&mut observed.lock().unwrap(), &event).map(|_| ());
                 Box::pin(std::future::ready(result)) as BoxFuture<'_, Result<()>>
             };
             let successor = compact_for_request_pressure_with_callback(&mut agent, ApiProtocol::Responses, &[], &[], &mut events).await;

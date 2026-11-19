@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 
 use crate::agent::{Agent, AgentEvent};
-use crate::agent_event_journal::persist_agent_event;
 use crate::permission::{PermissionApproval, PermissionRequest};
+use crate::session::agent_event_journal::persist_agent_event;
 use crate::transcript::{TranscriptRecorder, read_records_allow_partial_tail};
 
 type SubagentPromptFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;

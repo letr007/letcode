@@ -228,7 +228,7 @@ parallel_tool_calls = true
                                             },
                                         ));
                                     }
-                                    crate::subagent_events::run_child_prompt(
+                                    crate::subagent::events::run_child_prompt(
                                         agent,
                                         prompt,
                                         transcript,

@@ -24,8 +24,8 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::json;
 use tokio::task::JoinHandle;
 
+use super::agent_event_journal::persist_agent_event;
 use crate::agent::{Agent, AgentEvent, ConfiguredPrimaryRouteFactory, ManualCompactionOutcome};
-use crate::agent_event_journal::persist_agent_event;
 use crate::config::{AppConfig, ModelRoute, ProviderConfig, SubmitWhileRunning};
 use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;

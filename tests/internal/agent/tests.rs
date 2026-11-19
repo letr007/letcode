@@ -1,5 +1,4 @@
 use super::*;
-use crate::agent_event_journal::persist_agent_event;
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{ContextBlockId, ContextViewProjection};
 use crate::protocol_frames::ProtocolFrameItem;
@@ -9,6 +8,7 @@ use crate::runtime_context::{
     RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance, RuntimeSource,
     SourceSpan,
 };
+use crate::session::agent_event_journal::persist_agent_event;
 use crate::transcript::transcript_projection::{
     SessionContextCursor, project_context_tree, project_context_view,
     project_runtime_restore_snapshot,

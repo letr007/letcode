@@ -1,3 +1,4 @@
+pub(crate) mod events;
 mod pool;
 mod result;
 mod route_factory;

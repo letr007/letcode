@@ -197,5 +197,5 @@ pub fn persist_agent_event(
 }
 
 #[cfg(test)]
-#[path = "../tests/internal/agent_event_journal/integration_tests.rs"]
+#[path = "../../tests/internal/agent_event_journal/integration_tests.rs"]
 mod integration_tests;

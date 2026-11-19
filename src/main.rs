@@ -12,7 +12,6 @@
 
 mod acp;
 mod agent;
-mod agent_event_journal;
 mod cli;
 mod code_analysis;
 mod command;
@@ -31,16 +30,13 @@ mod memory;
 pub(crate) mod model_runtime;
 mod peer;
 mod permission;
-mod process_tree;
 mod project_memory;
 mod protocol_frames;
 mod request_builder;
-mod retry;
 mod runtime_context;
 mod session;
 mod skills;
 mod subagent;
-mod subagent_events;
 mod tagged_text;
 mod tool;
 mod tool_format;

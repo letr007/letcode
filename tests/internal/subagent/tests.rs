@@ -165,7 +165,7 @@ fn install_delegate(
         .install_subagent_delegate_for_test(parent);
 }
 
-fn no_event_sender() -> Option<crate::subagent_events::SubagentEventSender> {
+fn no_event_sender() -> Option<crate::subagent::events::SubagentEventSender> {
     None
 }
 

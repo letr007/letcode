@@ -1494,7 +1494,7 @@ fn http_status_failure(status: u16, retry_hint: RetryHint) -> ModelFailure {
     };
     let retryable = reqwest::StatusCode::from_u16(status)
         .ok()
-        .is_some_and(crate::retry::is_retryable_http_status);
+        .is_some_and(crate::model_runtime::retry::is_retryable_http_status);
     ModelFailure::new(FailurePhase::Transport, kind)
         .with_status(status)
         .with_code("http_status")
