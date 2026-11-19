@@ -1221,14 +1221,78 @@ fn completions_adapter_rejects_done_and_invalid_terminal_contracts() {
             .is_err());
 
     let mut invalid_choice = binding.new_decoder();
-    assert!(
-        invalid_choice
+    let failure = invalid_choice
+        .push(&sse(
+            "message",
+            r#"{"choices":[{"index":1,"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+        ))
+        .unwrap_err();
+    assert_eq!(failure.retry_hint, RetryHint::Retryable);
+}
+
+#[test]
+fn completions_accepts_changing_response_ids() {
+    let binding = completions_binding("standard");
+    let mut decoder = binding.new_decoder();
+    let mut events = decoder
+        .push(&sse(
+            "message",
+            r#"{"id":"chatcmpl-a","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        ))
+        .unwrap();
+    events.extend(
+        decoder
             .push(&sse(
                 "message",
-                r#"{"choices":[{"index":1,"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+                r#"{"id":"chatcmpl-b","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}"#,
             ))
-            .is_err()
+            .unwrap(),
     );
+    events.extend(decoder.push(b"data: [DONE]\n\n").unwrap());
+    let ids = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelEvent::ResponseMetadata { response_id } => Some(response_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["chatcmpl-a"]);
+    assert!(matches!(events.last(), Some(ModelEvent::Terminal { .. })));
+}
+
+#[test]
+fn completions_accepts_tool_id_change_before_started() {
+    let binding = completions_binding("standard");
+    let mut decoder = binding.new_decoder();
+    let mut events = decoder
+        .push(&sse(
+            "message",
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
+        ))
+        .unwrap();
+    events.extend(
+        decoder
+            .push(&sse(
+                "message",
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-2","function":{"name":"search","arguments":"\"rust\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ))
+            .unwrap(),
+    );
+    events.extend(decoder.push(b"data: [DONE]\n\n").unwrap());
+    let started = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelEvent::ToolStarted { id, name } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(started, vec![("call-2", "search")]);
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Terminal {
+            status: TerminalStatus::ToolUse
+        })
+    ));
 }
 
 fn structured_schema() -> super::super::StructuredOutputSchema {

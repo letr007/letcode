@@ -1544,16 +1544,11 @@ impl CompletionsDecoder {
                         .with_code("malformed_json")
                         .with_detail(error.to_string())
                 })?;
-            if let Some(id) = parsed.id.filter(|id| !id.is_empty()) {
-                if let Some(previous) = &self.response_id
-                    && previous != &id
-                {
-                    return Err(completions_invalid("response id changed"));
-                }
-                if self.response_id.is_none() {
-                    self.response_id = Some(id.clone());
-                    output.push(ModelEvent::ResponseMetadata { response_id: id });
-                }
+            if let Some(id) = parsed.id.filter(|id| !id.is_empty())
+                && self.response_id.is_none()
+            {
+                self.response_id = Some(id.clone());
+                output.push(ModelEvent::ResponseMetadata { response_id: id });
             }
             if parsed.choices.iter().any(|choice| choice.index != 0) {
                 return Err(completions_invalid("only choice index 0 is supported"));
@@ -1628,13 +1623,13 @@ impl CompletionsDecoder {
                 emitted: false,
             });
         if let Some(id) = id {
-            if !state.id.is_empty() && state.id != id {
+            if state.emitted && !state.id.is_empty() && state.id != id {
                 return Err(completions_invalid("tool call id changed"));
             }
             state.id = id;
         }
         if let Some(name) = name {
-            if !state.name.is_empty() && state.name != name {
+            if state.emitted && !state.name.is_empty() && state.name != name {
                 return Err(completions_invalid("tool call name changed"));
             }
             state.name = name;
@@ -1797,6 +1792,7 @@ impl ModelStreamDecoder for CompletionsDecoder {
 fn completions_invalid(detail: &str) -> ModelFailure {
     ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
         .with_code("invalid_completions_event")
+        .with_retry_hint(RetryHint::Retryable)
         .with_detail(detail)
 }
 
