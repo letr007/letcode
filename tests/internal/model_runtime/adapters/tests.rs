@@ -1265,11 +1265,14 @@ fn completions_adapter_rejects_done_and_invalid_terminal_contracts() {
                 b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
             )
             .unwrap();
-    assert!(post_done
+    assert!(
+        post_done
             .push(
                 b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\n",
             )
-            .is_err());
+            .unwrap()
+            .is_empty()
+    );
 
     let mut invalid_choice = binding.new_decoder();
     let failure = invalid_choice

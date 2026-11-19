@@ -1529,7 +1529,7 @@ impl CompletionsDecoder {
         let mut output = Vec::new();
         for event in events {
             if self.done {
-                return Err(completions_invalid("event received after terminal"));
+                continue;
             }
             if event.data == "[DONE]" {
                 if self.finish_reason.is_none() {
