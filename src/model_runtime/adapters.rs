@@ -2783,7 +2783,8 @@ impl ProtocolBinding for ResponsesBinding {
 
     fn new_websocket_decoder(&self) -> Box<dyn ModelStreamDecoder> {
         Box::new(ResponsesWebSocketDecoder {
-            inner: ResponsesDecoder::new(self.identity.clone(), self.profile, self.replay_scope()),
+            inner: ResponsesDecoder::new(self.identity.clone(), self.profile, self.replay_scope())
+                .with_enforced_response_id(),
         })
     }
 }
@@ -3775,6 +3776,7 @@ struct ResponsesDecoder {
     tools: BTreeMap<String, ToolState>,
     response_id: Option<String>,
     terminal: bool,
+    enforce_response_id: bool,
 }
 
 impl ResponsesDecoder {
@@ -3791,7 +3793,13 @@ impl ResponsesDecoder {
             tools: BTreeMap::new(),
             response_id: None,
             terminal: false,
+            enforce_response_id: false,
         }
+    }
+
+    fn with_enforced_response_id(mut self) -> Self {
+        self.enforce_response_id = true;
+        self
     }
 
     fn consume(&mut self, events: Vec<SseEvent>) -> Result<Vec<ModelEvent>, ModelFailure> {
@@ -3822,16 +3830,13 @@ impl ResponsesDecoder {
         if let Some(response) = event.response.as_ref()
             && let Some(id) = response.id.as_ref().filter(|id| !id.is_empty())
         {
-            if let Some(previous) = &self.response_id
-                && previous != id
-            {
-                return Err(decode_invalid("response id changed"));
-            }
             if self.response_id.is_none() {
                 self.response_id = Some(id.clone());
                 output.push(ModelEvent::ResponseMetadata {
                     response_id: id.clone(),
                 });
+            } else if self.enforce_response_id && self.response_id.as_deref() != Some(id.as_str()) {
+                return Err(decode_invalid("response id changed"));
             }
         }
         match event.event_type.as_str() {

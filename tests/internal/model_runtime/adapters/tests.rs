@@ -294,6 +294,44 @@ fn responses_websocket_close_before_terminal_is_typed() {
 }
 
 #[test]
+fn responses_sse_ignores_changing_response_ids() {
+    let (capabilities, generation) = all_support();
+    let binding = binding("standard", capabilities, generation);
+    let mut decoder = binding.new_decoder();
+    let mut events = decoder
+        .push(&sse(
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","response":{"id":"resp-a"},"delta":"a"}"#,
+        ))
+        .unwrap();
+    events.extend(
+        decoder
+            .push(&sse(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","response":{"id":"resp-b"},"delta":"b"}"#,
+            ))
+            .unwrap(),
+    );
+    let ids = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelEvent::ResponseMetadata { response_id } => Some(response_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["resp-a"]);
+
+    let mut websocket = binding.new_websocket_decoder();
+    websocket
+        .push(br#"{"type":"response.output_text.delta","response":{"id":"resp-a"},"delta":"a"}"#)
+        .unwrap();
+    let failure = websocket
+        .push(br#"{"type":"response.output_text.delta","response":{"id":"resp-b"},"delta":"b"}"#)
+        .unwrap_err();
+    assert_eq!(failure.code.as_deref(), Some("invalid_event"));
+}
+
+#[test]
 fn registry_uses_real_responses_and_validation_only_placeholders() {
     let registry = crate::model_runtime::ProtocolRegistry::builtins();
     let responses = registry.lookup_str("responses").unwrap();
