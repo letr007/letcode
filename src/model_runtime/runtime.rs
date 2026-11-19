@@ -1009,8 +1009,7 @@ impl AttemptAccumulator {
                     partial: Box::new(snapshot),
                 });
             }
-            TerminalStatus::Length
-            | TerminalStatus::ContentFilter
+            TerminalStatus::ContentFilter
             | TerminalStatus::Refusal
             | TerminalStatus::Pause
             | TerminalStatus::Incomplete => {
@@ -1021,7 +1020,9 @@ impl AttemptAccumulator {
                     partial: Box::new(snapshot),
                 });
             }
-            TerminalStatus::Completed | TerminalStatus::ToolUse => terminal,
+            TerminalStatus::Completed | TerminalStatus::ToolUse | TerminalStatus::Length => {
+                terminal
+            }
         };
         Ok(ModelAttemptResult { snapshot, terminal })
     }

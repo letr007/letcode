@@ -4,7 +4,9 @@ use crate::model_runtime::runtime::{
     AttemptOutcome, CompletedToolCall, ModelAttemptResult, ModelAttemptSnapshot, ModelRuntime,
     TurnContinuationDecision, TurnDriver, TurnLimits, TurnOrchestrator, failure_with_cleanup,
 };
-use crate::model_runtime::{ModelEvent, ModelFailure, ModelMessage, ModelRequestInput};
+use crate::model_runtime::{
+    ModelEvent, ModelFailure, ModelMessage, ModelRequestInput, TerminalStatus,
+};
 use crate::user_content::UserMessageContent;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1459,8 +1461,17 @@ where
 
     async fn after_assistant_persisted(
         &mut self,
-        _result: &ModelAttemptResult,
+        result: &ModelAttemptResult,
     ) -> std::result::Result<TurnContinuationDecision, ModelFailure> {
+        if result.terminal == TerminalStatus::Length {
+            (self.on_event)(AgentEvent::ModelStreamIssue {
+                message: "Model output reached the length limit".into(),
+                detail: Some("Partial output was preserved.".into()),
+                action: "Continue the turn to generate the remainder.".into(),
+            })
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        }
         (self.on_event)(AgentEvent::TurnContinuationBoundary)
             .await
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;

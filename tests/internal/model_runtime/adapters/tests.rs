@@ -1237,13 +1237,27 @@ fn completions_adapter_rejects_done_and_invalid_terminal_contracts() {
             .unwrap();
     assert!(missing_done.finish().is_err());
 
-    for reason in ["length", "content_filter"] {
-        let mut decoder = binding.new_decoder();
-        let body = format!(
-            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: [DONE]\n\n"
-        );
-        assert!(decoder.push(body.as_bytes()).is_err());
-    }
+    let mut length = binding.new_decoder();
+    let events = length
+        .push(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .unwrap();
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Terminal {
+            status: TerminalStatus::Length
+        })
+    ));
+
+    let mut content_filter = binding.new_decoder();
+    assert!(
+        content_filter
+            .push(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n",
+            )
+            .is_err()
+    );
 
     let mut post_done = binding.new_decoder();
     post_done

@@ -1687,7 +1687,7 @@ impl CompletionsDecoder {
                     status: TerminalStatus::Completed,
                 });
             }
-            "tool_calls" | "function_call" => {
+            "tool_calls" | "function_call" | "length" => {
                 if self.calls.values().any(|call| {
                     call.id.is_empty()
                         || call.name.is_empty()
@@ -1716,11 +1716,14 @@ impl CompletionsDecoder {
                         replay: None,
                     });
                 }
-                output.push(ModelEvent::Terminal {
-                    status: TerminalStatus::ToolUse,
-                });
+                let status = if reason == "length" && self.calls.is_empty() {
+                    TerminalStatus::Length
+                } else {
+                    TerminalStatus::ToolUse
+                };
+                output.push(ModelEvent::Terminal { status });
             }
-            "length" | "content_filter" | "refusal" => {
+            "content_filter" | "refusal" => {
                 return Err(completions_invalid("non-success finish reason"));
             }
             _ => return Err(completions_invalid("unknown finish reason")),

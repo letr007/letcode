@@ -250,6 +250,23 @@ fn accumulator_preserves_mixed_reasoning_parts_before_done() {
 }
 
 #[test]
+fn accumulator_accepts_length_terminal() {
+    let mut accumulator = AttemptAccumulator::default();
+    accumulator
+        .consume_observed(ModelEvent::TextDelta {
+            text: "partial".into(),
+        })
+        .unwrap();
+    accumulator
+        .consume_observed(ModelEvent::Terminal {
+            status: TerminalStatus::Length,
+        })
+        .unwrap();
+    let result = accumulator.finish().unwrap();
+    assert_eq!(result.terminal, TerminalStatus::Length);
+}
+
+#[test]
 fn accumulator_preserves_tool_order_and_normalizes_completed_with_tools() {
     let mut accumulator = AttemptAccumulator::default();
     for (id, name) in [("b", "second"), ("a", "first")] {
