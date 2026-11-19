@@ -1340,6 +1340,7 @@ impl ModelStreamDecoder for AnthropicDecoder {
 fn anthropic_invalid(detail: &str) -> ModelFailure {
     ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
         .with_code("invalid_anthropic_event")
+        .with_retry_hint(RetryHint::Retryable)
         .with_detail(detail)
 }
 
@@ -4361,6 +4362,7 @@ fn terminal_status(status: &str) -> Option<TerminalStatus> {
 fn decode_invalid(detail: &str) -> ModelFailure {
     ModelFailure::new(FailurePhase::Decode, FailureKind::MalformedResponse)
         .with_code("invalid_event")
+        .with_retry_hint(RetryHint::Retryable)
         .with_detail(detail)
 }
 

@@ -854,14 +854,13 @@ fn anthropic_adapter_terminal_error_and_order_guards() {
     assert!(missing.finish().is_err());
 
     let mut early_delta = binding.new_decoder();
-    assert!(
-        early_delta
-            .push(&sse(
-                "message_delta",
-                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
-            ))
-            .is_err()
-    );
+    let failure = early_delta
+        .push(&sse(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        ))
+        .unwrap_err();
+    assert_eq!(failure.retry_hint, RetryHint::Retryable);
 
     let adaptive = anthropic_binding(r#"anthropic_thinking = { mode = "adaptive" }"#).unwrap();
     let mut adaptive_request = ModelRequestInput::new("claude", Vec::new());
@@ -1857,6 +1856,7 @@ fn decoder_rejects_incomplete_or_contradictory_output_items() {
             ))
             .unwrap_err();
     assert!(error.detail().contains("arguments changed"));
+    assert_eq!(error.retry_hint, RetryHint::Retryable);
 }
 
 #[test]
