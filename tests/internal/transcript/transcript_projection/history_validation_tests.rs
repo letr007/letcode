@@ -459,3 +459,74 @@ fn history_application_retires_published_sources_recorded_inside_a_tool_group() 
     crate::protocol_frames::validate_history_items_complete(&history, None)
         .expect("the retained tail replays as a complete protocol prefix");
 }
+
+#[test]
+fn history_application_retires_a_prefix_containing_a_synthesized_source() {
+    let sources = ["raw:1", "cancelled:call-1"].map(String::from).to_vec();
+    let records = vec![
+        entry(
+            1,
+            TranscriptEvent::AssistantTurn(TranscriptAssistantTurn {
+                text: None,
+                reasoning_content: None,
+                replay: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    arguments_json: "{}".into(),
+                }],
+            }),
+        ),
+        entry(
+            2,
+            TranscriptEvent::ToolCallCancelled {
+                call_id: "call-1".into(),
+                name: "shell__exec".into(),
+            },
+        ),
+        entry(
+            3,
+            TranscriptEvent::HistoryPublished(HistoryPublication {
+                id: "p".into(),
+                project_path: None,
+                external_fact_ids: vec![],
+                source_ids: sources.clone(),
+                compartments: vec![HistoryCompartment {
+                    id: "p-c".into(),
+                    title: "episode".into(),
+                    source_ids: sources,
+                    importance: 50,
+                    detailed: "detail".into(),
+                    compact: "compact".into(),
+                    anchor: "anchor".into(),
+                }],
+                facts: vec![],
+                withdrawn_fact_ids: vec![],
+            }),
+        ),
+        entry(
+            4,
+            TranscriptEvent::HistoryApplied(HistoryApplication {
+                publication_ids: vec!["p".into()],
+                baseline: vec![HistorySelection {
+                    compartment_id: "p-c".into(),
+                    tier: HistoryTier::Detailed,
+                }],
+                delta: vec![],
+                baseline_fact_ids: vec![],
+                delta_fact_ids: vec![],
+                withdrawn_fact_ids: vec![],
+                first_kept_entry_id: None,
+                legacy_summary: None,
+            }),
+        ),
+    ];
+
+    validate_context_projection_events(&records)
+        .expect("the writer accepts the synthesized source");
+    let history = restore_session_history_projection(&records);
+    assert!(matches!(
+        history.as_slice(),
+        [HistoryItem::ContextSummary { .. }]
+    ));
+}

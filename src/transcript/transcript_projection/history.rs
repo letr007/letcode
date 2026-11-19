@@ -126,14 +126,6 @@ impl HistoryProjectionState {
                         .filter(|entry| is_retired(entry))
                         .flat_map(|entry| entry.source_spans.iter().copied()),
                 );
-                assert_eq!(
-                    history
-                        .iter()
-                        .filter(|entry| covered.contains(&entry.stable_key))
-                        .count(),
-                    covered.len(),
-                    "validated history coverage"
-                );
                 history.retain(|entry| !is_retired(entry));
                 let mut baseline = archive.render(&application.baseline);
                 if let Some(legacy) = &application.legacy_summary {
