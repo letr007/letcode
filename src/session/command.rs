@@ -4,6 +4,7 @@
 //! and future GUI should all map user intent onto these variants.
 
 use crate::command::ChildNavigation;
+use crate::fast_mode::FastModeTier;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::user_content::UserMessageSubmission;
@@ -45,6 +46,7 @@ pub enum SessionCommand {
         model_ids: Vec<String>,
     },
     ToggleFastMode,
+    SetFastMode(FastModeTier),
     SetReasoningEffort(ModelReasoningEffort),
     SetFakeClient(Option<crate::fake::FakeClient>),
     ResumeSession(String),
@@ -70,6 +72,7 @@ impl SessionCommand {
             Self::CancelQueuedPrompt(_) => (false, ActiveTurnCommandDisposition::Immediate),
             Self::SetPermissionMode(_)
             | Self::ToggleFastMode
+            | Self::SetFastMode(_)
             | Self::SetReasoningEffort(_)
             | Self::SetFakeClient(_) => (true, ActiveTurnCommandDisposition::Defer),
             Self::RenameSession(_) => (true, ActiveTurnCommandDisposition::Immediate),
@@ -124,7 +127,7 @@ impl SessionCommand {
             }),
             CommandIntent::PermissionSet(mode) => Some(Self::SetPermissionMode(mode)),
             CommandIntent::ModelSet(model) => Some(Self::SetModel(model)),
-            CommandIntent::FastToggle => Some(Self::ToggleFastMode),
+            CommandIntent::FastSet(tier) => Some(Self::SetFastMode(tier)),
             CommandIntent::ReasoningSet(effort) => Some(Self::SetReasoningEffort(effort)),
             CommandIntent::Fake(crate::command::FakeCommand::Set(client)) => {
                 Some(Self::SetFakeClient(client))
@@ -138,6 +141,7 @@ impl SessionCommand {
             | CommandIntent::PermissionShow
             | CommandIntent::ModelShow
             | CommandIntent::AgentsShow
+            | CommandIntent::FastShow
             | CommandIntent::ReasoningShow
             | CommandIntent::ThoughtsShow
             | CommandIntent::ThoughtsSet(_)

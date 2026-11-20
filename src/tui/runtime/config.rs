@@ -650,9 +650,26 @@ impl TuiRuntime {
     pub(super) fn persist_fast_mode(&self, enabled: bool) {
         if let Err(error) = crate::tui::preferences::TuiPreferences::update_in_dir(
             &self.preferences_dir,
-            |preferences| preferences.fast_mode = enabled,
+            |preferences| {
+                preferences.fast_mode = enabled;
+                if !enabled {
+                    preferences.fast_mode_tier = None;
+                }
+            },
         ) {
             tracing::warn!(%error, "failed to persist fast mode");
+        }
+    }
+
+    pub(super) fn persist_fast_mode_tier(&self, tier: Option<String>) {
+        if let Err(error) = crate::tui::preferences::TuiPreferences::update_in_dir(
+            &self.preferences_dir,
+            |preferences| {
+                preferences.fast_mode = tier.is_some();
+                preferences.fast_mode_tier = tier;
+            },
+        ) {
+            tracing::warn!(%error, "failed to persist fast mode tier");
         }
     }
 

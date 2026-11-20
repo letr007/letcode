@@ -91,7 +91,7 @@ fn all_support() -> (RouteCapabilities, GenerationSupport) {
             reasoning: true,
             input_images: true,
             tool_result_images: true,
-            priority_service: true,
+            service_tier: true,
         },
         GenerationSupport {
             temperature: true,
@@ -102,7 +102,7 @@ fn all_support() -> (RouteCapabilities, GenerationSupport) {
             reasoning_summary: true,
             text_verbosity: true,
             parallel_tool_calls: true,
-            priority_service: true,
+            service_tier: true,
             structured_output: None,
         },
     )
@@ -1044,7 +1044,7 @@ fn completions_adapter_standard_and_deepseek_request_goldens() {
         },
         verbosity: Some(Verbosity::Low),
         parallel_tool_calls: Some(true),
-        priority_service: Some(true),
+        service_tier: Some(crate::fast_mode::FastModeTier::Fast),
         ..GenerationSettings::default()
     };
     request.cache = CacheIntent {
@@ -1068,7 +1068,7 @@ fn completions_adapter_standard_and_deepseek_request_goldens() {
             .as_str()
             .is_some_and(|key| key.starts_with("chat:standard:route:"))
     );
-    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(body["service_tier"], "fast");
 
     let deepseek = completions_binding("deepseek");
     let mut request = ModelRequestInput::new("deepseek", Vec::new());
@@ -1486,7 +1486,7 @@ fn standard_request_golden_maps_controls_messages_generation_and_cache() {
         summary: Some(ReasoningSummary::Concise),
         verbosity: Some(Verbosity::Low),
         parallel_tool_calls: Some(true),
-        priority_service: Some(true),
+        service_tier: Some(crate::fast_mode::FastModeTier::Fast),
         structured_output: None,
     };
     request.cache = CacheIntent {
@@ -1499,7 +1499,7 @@ fn standard_request_golden_maps_controls_messages_generation_and_cache() {
         serde_json::from_slice(&binding.prepare_request(&request).unwrap().body).unwrap();
     assert_eq!(body["instructions"], "system one\n\nsystem two");
     assert_eq!(body["input"][0]["role"], "developer");
-    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(body["service_tier"], "fast");
     assert_eq!(body["prompt_cache_key"], "golden:standard:route");
     assert_eq!(body["prompt_cache_retention"], "24h");
     assert_eq!(body["reasoning"]["effort"], "high");

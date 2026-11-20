@@ -453,6 +453,7 @@ pub enum DialogKind {
     ToolsPicker,
     ThemePicker,
     FakePicker,
+    FastPicker,
     LanguagePicker,
     SessionPicker,
     SessionRename,
@@ -1422,6 +1423,7 @@ pub struct TuiState {
     pub model_id: String,
     pub model_label: String,
     pub fast_mode_enabled: bool,
+    pub fast_mode_tier: Option<String>,
     pub language: Option<crate::tui::i18n::Language>,
     pub model_token_usage: Option<ModelTokenUsage>,
     pub sidebar_model_token_usage: Option<ModelTokenUsage>,
@@ -1537,6 +1539,7 @@ impl Default for TuiState {
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
             fast_mode_enabled: false,
+            fast_mode_tier: None,
             language: None,
             model_token_usage: None,
             sidebar_model_token_usage: None,
@@ -1684,6 +1687,14 @@ impl TuiState {
 
     pub fn set_fast_mode_enabled(&mut self, enabled: bool) {
         self.fast_mode_enabled = enabled;
+        if !enabled {
+            self.fast_mode_tier = None;
+        }
+    }
+
+    pub fn set_fast_mode_tier(&mut self, tier: Option<String>) {
+        self.fast_mode_enabled = tier.is_some();
+        self.fast_mode_tier = tier;
     }
 
     pub fn set_model_context_window(&mut self, context_window_tokens: Option<u64>) {

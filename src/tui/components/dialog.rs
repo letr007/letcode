@@ -48,6 +48,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
             | DialogKind::ToolsPicker
             | DialogKind::ThemePicker
             | DialogKind::FakePicker
+            | DialogKind::FastPicker
             | DialogKind::McpPicker
             | DialogKind::McpToolsPicker
             | DialogKind::SkillPicker

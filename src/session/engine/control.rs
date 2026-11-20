@@ -45,6 +45,7 @@ pub(crate) enum SessionEngineCommand {
         model_ids: Vec<String>,
     },
     ToggleFastMode,
+    SetFastMode(crate::fast_mode::FastModeTier),
     SetReasoningEffort(crate::request_builder::ModelReasoningEffort),
     SetFakeClient(Option<crate::fake::FakeClient>),
     ResumeSession(String),
@@ -85,6 +86,7 @@ impl SessionEngineCommand {
                 model_ids,
             },
             SessionCommand::ToggleFastMode => Self::ToggleFastMode,
+            SessionCommand::SetFastMode(tier) => Self::SetFastMode(tier),
             SessionCommand::SetReasoningEffort(effort) => Self::SetReasoningEffort(effort),
             SessionCommand::SetFakeClient(client) => Self::SetFakeClient(client),
             SessionCommand::ResumeSession(session_id) => Self::ResumeSession(session_id),
@@ -124,6 +126,9 @@ pub(crate) fn session_engine_command_as_session_command(
         }
         SessionEngineCommand::ToggleFastMode => {
             Some(crate::session::SessionCommand::ToggleFastMode)
+        }
+        SessionEngineCommand::SetFastMode(tier) => {
+            Some(crate::session::SessionCommand::SetFastMode(*tier))
         }
         SessionEngineCommand::SetReasoningEffort(effort) => Some(
             crate::session::SessionCommand::SetReasoningEffort(effort.clone()),
@@ -365,6 +370,7 @@ fn deferred_command_key(command: &SessionEngineCommand) -> Option<DeferredComman
         | SessionEngineCommand::ViewChild { .. }
         | SessionEngineCommand::ViewParent
         | SessionEngineCommand::ToggleFastMode
+        | SessionEngineCommand::SetFastMode(_)
         | SessionEngineCommand::ResumeSession(_)
         | SessionEngineCommand::RenameSession(_)
         | SessionEngineCommand::NewSession

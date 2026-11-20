@@ -1,9 +1,32 @@
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastModeTier {
+    Fast,
+    Ultrafast,
+}
+
+impl FastModeTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Ultrafast => "ultrafast",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" => Some(Self::Fast),
+            "ultrafast" => Some(Self::Ultrafast),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FastMode {
-    state: Mutex<bool>,
+    state: Mutex<Option<FastModeTier>>,
 }
 
 pub(crate) struct PreparedFastModeDisable {
@@ -13,27 +36,39 @@ pub(crate) struct PreparedFastModeDisable {
 impl FastMode {
     pub fn load(_config_path: impl Into<std::path::PathBuf>, enabled: bool) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(enabled),
+            state: Mutex::new(enabled.then_some(FastModeTier::Fast)),
         })
     }
 
     pub(crate) fn fork(&self) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(self.enabled()),
+            state: Mutex::new(self.tier()),
         })
     }
 
     pub fn enabled(&self) -> bool {
+        self.tier().is_some()
+    }
+
+    pub fn tier(&self) -> Option<FastModeTier> {
         *self.state.lock().expect("Fast Mode state poisoned")
+    }
+
+    pub fn set(&self, model_id: &str, tier: FastModeTier) -> Result<bool> {
+        if !is_tier_capable_model(model_id, tier) {
+            return Ok(false);
+        }
+        *self.state.lock().expect("Fast Mode state poisoned") = Some(tier);
+        Ok(true)
     }
 
     pub fn toggle(&self, model_id: &str) -> Result<FastModeToggle> {
         let mut state = self.state.lock().expect("Fast Mode state poisoned");
-        let enabled = !*state;
+        let enabled = state.is_none();
         if enabled && !is_fast_capable_model(model_id) {
             return Ok(FastModeToggle::Unavailable);
         }
-        *state = enabled;
+        *state = enabled.then_some(FastModeTier::Fast);
         Ok(if enabled {
             FastModeToggle::Enabled
         } else {
@@ -43,8 +78,8 @@ impl FastMode {
 
     pub fn auto_disable_for_model(&self, model_id: &str) -> Result<bool> {
         let mut state = self.state.lock().expect("Fast Mode state poisoned");
-        if *state && !is_fast_capable_model(model_id) {
-            *state = false;
+        if state.is_some_and(|tier| !is_tier_capable_model(model_id, tier)) {
+            *state = None;
             return Ok(true);
         }
         Ok(false)
@@ -55,7 +90,7 @@ impl FastMode {
         model_id: &str,
     ) -> Result<Option<PreparedFastModeDisable>> {
         let state = self.state.lock().expect("Fast Mode state poisoned");
-        if !*state || is_fast_capable_model(model_id) {
+        if state.is_none_or(|tier| is_tier_capable_model(model_id, tier)) {
             return Ok(None);
         }
         Ok(Some(PreparedFastModeDisable {
@@ -67,7 +102,7 @@ impl FastMode {
 impl PreparedFastModeDisable {
     pub(crate) fn commit(self) {
         let mut state = self.mode.state.lock().expect("Fast Mode state poisoned");
-        *state = false;
+        *state = None;
     }
 }
 
@@ -76,6 +111,20 @@ pub enum FastModeToggle {
     Enabled,
     Disabled,
     Unavailable,
+}
+
+fn is_tier_capable_model(model_id: &str, tier: FastModeTier) -> bool {
+    match tier {
+        FastModeTier::Fast => is_fast_capable_model(model_id),
+        FastModeTier::Ultrafast => is_ultrafast_capable_model(model_id),
+    }
+}
+
+pub fn is_ultrafast_capable_model(model_id: &str) -> bool {
+    matches!(
+        model_id.trim().to_ascii_lowercase().as_str(),
+        "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6-astra" | "gpt-6.1-sol"
+    )
 }
 
 pub fn is_fast_capable_model(model_id: &str) -> bool {

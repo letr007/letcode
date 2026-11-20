@@ -177,7 +177,7 @@ fn response_shape_preserves_prompt_and_tools() {
         "tools": [{"name": "fs__read"}],
         "reasoning": {"effort": "minimal", "summary": "concise"},
         "temperature": 0.2,
-        "service_tier": "priority"
+        "service_tier": "fast"
     });
     let context = context();
     apply_codex_response_shape(&mut request, &context);

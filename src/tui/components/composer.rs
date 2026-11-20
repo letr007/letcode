@@ -965,7 +965,10 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
     ]);
     if state.fast_mode_enabled {
         spans.push(Span::styled(" · ", dim));
-        spans.push(Span::styled("fast", accent));
+        spans.push(Span::styled(
+            state.fast_mode_tier.as_deref().unwrap_or("fast"),
+            accent,
+        ));
     }
     if let Some(client) = state.fake_client {
         let fake_style = Style::default()

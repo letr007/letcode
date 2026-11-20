@@ -851,7 +851,7 @@ impl ModelConfig {
             top_p: self.top_p,
             prompt_cache: self.prompt_cache.clone(),
             parallel_tool_calls: self.parallel_tool_calls,
-            fast_mode: false,
+            service_tier: None,
             anthropic_thinking: self.anthropic_thinking,
             anthropic_betas: self.anthropic_betas.clone(),
         }

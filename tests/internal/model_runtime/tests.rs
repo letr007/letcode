@@ -28,7 +28,18 @@ fn default_route_capabilities_are_all_off() {
     assert!(!capabilities.reasoning);
     assert!(!capabilities.input_images);
     assert!(!capabilities.tool_result_images);
-    assert!(!capabilities.priority_service);
+    assert!(!capabilities.service_tier);
+}
+
+#[test]
+fn legacy_priority_service_capability_alias_is_accepted() {
+    let legacy: RuntimeCapabilities =
+        toml::from_str("priority_service = true").expect("legacy capability");
+    assert!(legacy.service_tier);
+
+    let current: RuntimeCapabilities =
+        toml::from_str("service_tier = true").expect("current capability");
+    assert!(current.service_tier);
 }
 
 #[test]

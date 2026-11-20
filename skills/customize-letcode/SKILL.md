@@ -184,7 +184,8 @@ parallel_tool_calls = true
 reasoning = true
 input_images = false
 tool_result_images = false
-priority_service = false
+service_tier = false
+# 旧配置也可使用 priority_service = true
 # structured_output = "json_schema"  # json_object | json_schema
 
 [providers.openai.models."gpt-5.5".generation]

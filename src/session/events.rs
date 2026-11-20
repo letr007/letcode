@@ -174,6 +174,9 @@ pub(crate) enum SessionTransportEvent {
     FastModeChanged {
         enabled: bool,
     },
+    FastModeTierChanged {
+        tier: Option<crate::fast_mode::FastModeTier>,
+    },
     ModelChanged {
         model_id: String,
     },
@@ -363,6 +366,7 @@ impl SessionTransportEvent {
             Self::RetryStarted(event) => Some(SessionEvent::RetryStarted(event.clone())),
             Self::HistorianStatus { .. }
             | Self::FastModeChanged { .. }
+            | Self::FastModeTierChanged { .. }
             | Self::ModelChanged { .. }
             | Self::ExpertAllowedModelsChanged { .. }
             | Self::PermissionModeChanged { .. }
@@ -571,6 +575,7 @@ pub(super) fn wrap_child_session_transport_event(
         }
         SessionTransportEvent::HistorianStatus { .. }
         | SessionTransportEvent::FastModeChanged { .. }
+        | SessionTransportEvent::FastModeTierChanged { .. }
         | SessionTransportEvent::ModelChanged { .. }
         | SessionTransportEvent::ExpertAllowedModelsChanged { .. }
         | SessionTransportEvent::PermissionModeChanged { .. }

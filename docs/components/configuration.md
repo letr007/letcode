@@ -298,7 +298,7 @@ reasoning_efforts = ["none", "low", "medium", "high", "max"]
 - `reasoning`：是否支持输出思考推导过程。
 - `input_images`：是否支持输入多模态图片。
 - `tool_result_images`：是否支持工具返回图片并在多轮对话中传回模型。
-- `priority_service`：是否声明优先级调度服务。
+- `service_tier`：是否声明支持服务等级请求字段。`priority_service` 仍可作为旧配置别名。
 - `structured_output`：结构化输出契约，支持 `json_schema` 或 `json_object`。
 
 ### 生成参数与默认值 `[generation]`

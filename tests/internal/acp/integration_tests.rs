@@ -500,7 +500,7 @@ async fn handshake_dispatches_the_slash_commands_it_advertises() {
                         .all(|command| command.input.is_some()
                             == matches!(
                                 command.name.as_str(),
-                                "permission" | "model" | "reasoning" | "resume"
+                                "permission" | "model" | "reasoning" | "fast" | "resume"
                             )),
                     "an advertised command names the value it takes, and only a command taking one does"
                 );
@@ -562,8 +562,8 @@ async fn handshake_dispatches_the_slash_commands_it_advertises() {
                 // arrive.
                 let error = send_prompt(&connection, &session_id, "/fast")
                     .await
-                    .expect_err("a session without fast mode refuses the toggle");
-                assert_eq!(error.message, "Fast mode unavailable");
+                    .expect_err("a service tier value is required");
+                assert_eq!(error.message, "Usage: /fast [fast|ultrafast]");
                 for (prompt, message) in [
                     ("/undo", "no session history entry to undo"),
                     ("/redo", "no history entry available to redo"),

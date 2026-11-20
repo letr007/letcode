@@ -559,7 +559,8 @@
         "reasoning": { "description": "Allow reasoning output; required for reasoning_effort settings.", "type": "boolean", "default": false },
         "input_images": { "description": "Accept image inputs.", "type": "boolean", "default": false },
         "tool_result_images": { "description": "Accept images returned by tools.", "type": "boolean", "default": false },
-        "priority_service": { "description": "Use the provider's priority service tier.", "type": "boolean", "default": false },
+        "service_tier": { "description": "Declare support for the provider's service_tier request field.", "type": "boolean", "default": false },
+        "priority_service": { "description": "Legacy alias for service_tier.", "type": "boolean", "default": false },
         "structured_output": {
           "enum": ["json_object", "json_schema"],
           "description": "JSON output contract. json_schema constrains JSON syntax in the decoder; json_object only states the intent."

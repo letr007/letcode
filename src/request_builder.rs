@@ -72,7 +72,7 @@ pub struct ModelRequestMetadata {
     pub top_p: Option<f32>,
     pub prompt_cache: PromptCacheConfig,
     pub parallel_tool_calls: bool,
-    pub fast_mode: bool,
+    pub service_tier: Option<crate::fast_mode::FastModeTier>,
     pub anthropic_thinking: AnthropicThinkingConfig,
     pub anthropic_betas: Vec<String>,
 }

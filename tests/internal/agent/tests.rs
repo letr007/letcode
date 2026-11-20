@@ -744,7 +744,7 @@ base_url = "https://test.example.invalid/v1"
 [providers.test.models.gpt-test.capabilities]
 tools = true
 parallel_tool_calls = true
-priority_service = true
+service_tier = true
 "#,
     )
     .unwrap()
@@ -770,7 +770,7 @@ priority_service = true
             .inspect_prepared_request(&request, None)
             .unwrap();
         let shape: Value = serde_json::from_slice(&inspection.request_shape).unwrap();
-        assert_eq!(shape["service_tier"], "priority");
+        assert_eq!(shape["service_tier"], "fast");
         crate::request_builder::observe_prepared_model_request(
             &inspection,
             &preview.build.prompt_plan,

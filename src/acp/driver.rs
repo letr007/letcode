@@ -1277,7 +1277,9 @@ fn command_outcome(command: &SessionCommand) -> Option<CommandOutcome> {
         SessionCommand::SetPermissionMode(_) => Some(CommandOutcome::Mode),
         SessionCommand::SetModel(_) => Some(CommandOutcome::Model),
         SessionCommand::SetReasoningEffort(_) => Some(CommandOutcome::ReasoningEffort),
-        SessionCommand::ToggleFastMode => Some(CommandOutcome::FastMode),
+        SessionCommand::ToggleFastMode | SessionCommand::SetFastMode(_) => {
+            Some(CommandOutcome::FastMode)
+        }
         SessionCommand::Compact => Some(CommandOutcome::Compaction),
         SessionCommand::NewSession | SessionCommand::ResumeSession(_) => {
             Some(CommandOutcome::Session)

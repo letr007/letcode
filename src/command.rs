@@ -1,3 +1,4 @@
+use crate::fast_mode::FastModeTier;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use serde::{Deserialize, Serialize};
@@ -154,7 +155,8 @@ pub enum CommandIntent {
     ModelShow,
     ModelSet(String),
     AgentsShow,
-    FastToggle,
+    FastShow,
+    FastSet(FastModeTier),
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
     ThoughtsShow,
@@ -334,7 +336,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/fast",
         insert_text: "/fast",
         description_key: "command.fast",
-        usage: "/fast",
+        usage: "/fast [fast|ultrafast]",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -566,7 +568,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/permission" | "/perm" => parse_permission(&parts),
         "/model" => parse_model(&parts),
         "/agents" => expect_no_extra_args(&parts, "/agents", CommandIntent::AgentsShow),
-        "/fast" => expect_no_extra_args(&parts, "/fast", CommandIntent::FastToggle),
+        "/fast" => parse_fast(&parts),
         "/reasoning" | "/think" => parse_reasoning(&parts),
         "/thoughts" => parse_thoughts(&parts),
         "/tools" | "/tool-output" => parse_tools(&parts),
@@ -638,6 +640,23 @@ fn parse_model(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
         ["/model"] => Ok(CommandIntent::ModelShow),
         ["/model", model_id] => Ok(CommandIntent::ModelSet((*model_id).to_string())),
         ["/model", ..] => Err(CommandParseError::new("Usage: /model <id>")),
+        _ => unreachable!(),
+    }
+}
+
+fn parse_fast(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/fast"] => Ok(CommandIntent::FastShow),
+        ["/fast", value] => FastModeTier::parse(value).map_or_else(
+            || {
+                Err(CommandParseError::with_args(
+                    "parse.unknown_fast_tier",
+                    [("tier", value)],
+                ))
+            },
+            |tier| Ok(CommandIntent::FastSet(tier)),
+        ),
+        ["/fast", ..] => Err(CommandParseError::new("Usage: /fast [fast|ultrafast]")),
         _ => unreachable!(),
     }
 }

@@ -1034,7 +1034,8 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::Prompt(_)
         | CommandIntent::PermissionSet(_)
         | CommandIntent::ModelSet(_)
-        | CommandIntent::FastToggle
+        | CommandIntent::FastShow
+        | CommandIntent::FastSet(_)
         | CommandIntent::ReasoningSet(_)
         | CommandIntent::Compact
         | CommandIntent::Tree
@@ -1064,6 +1065,10 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
             "CLI does not support expert model selection yet; use the TUI.".into(),
         ),
         SessionCommand::ToggleFastMode => ReplCommand::ToggleFastMode,
+        SessionCommand::SetFastMode(tier) => ReplCommand::Unsupported(format!(
+            "selected Fast service tier: {} (use the TUI picker)",
+            tier.as_str()
+        )),
         SessionCommand::SetReasoningEffort(effort) => ReplCommand::ReasoningSet(effort),
         SessionCommand::SetFakeClient(_) => ReplCommand::Unsupported(
             "CLI does not support /fake; use the TUI to select a fake client.".into(),

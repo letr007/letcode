@@ -248,8 +248,8 @@ fn generation_settings(
             }
             _ => None,
         },
-        priority_service: match route.protocol_id.as_str() {
-            "responses" | "completions" if metadata.fast_mode => Some(true),
+        service_tier: match route.protocol_id.as_str() {
+            "responses" | "completions" => metadata.service_tier,
             _ => None,
         },
     })

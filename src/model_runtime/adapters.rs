@@ -395,7 +395,7 @@ impl ProtocolBinding for AnthropicBinding {
             ));
         }
         if input.generation.parallel_tool_calls.is_some()
-            || input.generation.priority_service.is_some()
+            || input.generation.service_tier.is_some()
             || input.generation.summary.is_some()
             || input.generation.verbosity.is_some()
         {
@@ -2458,13 +2458,13 @@ impl CompletionsRequest {
                 "Completions does not support prompt cache retention",
             ));
         }
-        if g.priority_service.is_some()
+        if g.service_tier.is_some()
             && (binding.flavor == CompletionsFlavor::DeepSeek
-                || !binding.capabilities.priority_service
-                || !binding.generation_support.priority_service)
+                || !binding.capabilities.service_tier
+                || !binding.generation_support.service_tier)
         {
             return Err(unsupported(
-                "priority_service",
+                "service_tier",
                 "priority service capability is disabled",
             ));
         }
@@ -2505,9 +2505,9 @@ impl CompletionsRequest {
                 .then(|| g.verbosity.map(text_verbosity))
                 .flatten(),
             parallel_tool_calls: parallel,
-            service_tier: (binding.flavor == CompletionsFlavor::Standard
-                && g.priority_service == Some(true))
-            .then_some("priority"),
+            service_tier: (binding.flavor == CompletionsFlavor::Standard)
+                .then(|| g.service_tier.map(|tier| tier.as_str()))
+                .flatten(),
             thinking: (binding.flavor == CompletionsFlavor::DeepSeek && reasoning_requested)
                 .then_some(DeepSeekThinking {
                     mode: if matches!(g.reasoning.effort, Some(super::ReasoningEffort::None)) {
@@ -3034,9 +3034,9 @@ impl ResponsesRequest {
             "parallel_tool_calls",
         )?;
         require_generation(
-            generation.priority_service == Some(true),
-            binding.capabilities.priority_service && binding.generation_support.priority_service,
-            "priority_service",
+            generation.service_tier.is_some(),
+            binding.capabilities.service_tier && binding.generation_support.service_tier,
+            "service_tier",
         )?;
         if input.cache.retention.is_some() && !input.cache.enabled {
             return Err(unsupported(
@@ -3079,7 +3079,7 @@ impl ResponsesRequest {
             reasoning,
             text,
             parallel_tool_calls: generation.parallel_tool_calls,
-            service_tier: (generation.priority_service == Some(true)).then_some("priority"),
+            service_tier: generation.service_tier.map(|tier| tier.as_str()),
             prompt_cache_key,
             prompt_cache_retention,
         })

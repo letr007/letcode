@@ -73,6 +73,7 @@ fn custom_theme_id_round_trips() {
         language: None,
         fake_installation_id: None,
         fast_mode: false,
+        fast_mode_tier: None,
     };
     let json = serde_json::to_string(&prefs).expect("serialize");
     let loaded: TuiPreferences = serde_json::from_str(&json).expect("deserialize");
@@ -103,6 +104,7 @@ mod integration_tests {
             language: Some("zh-CN".into()),
             fake_installation_id: Some("fake-installation".into()),
             fast_mode: true,
+            fast_mode_tier: Some("fast".into()),
         };
         TuiPreferences::update_in_dir(&base, |current| *current = prefs.clone())
             .expect("save preferences");

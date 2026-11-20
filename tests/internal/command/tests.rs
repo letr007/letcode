@@ -59,6 +59,21 @@ fn parses_config_command() {
 }
 
 #[test]
+fn fast_command_selects_a_service_tier() {
+    assert_eq!(parse_command("/fast"), Ok(CommandIntent::FastShow));
+    assert_eq!(
+        parse_command("/fast fast"),
+        Ok(CommandIntent::FastSet(crate::fast_mode::FastModeTier::Fast))
+    );
+    assert_eq!(
+        parse_command("/fast ultrafast"),
+        Ok(CommandIntent::FastSet(
+            crate::fast_mode::FastModeTier::Ultrafast
+        ))
+    );
+}
+
+#[test]
 fn rejects_unknown_and_invalid_commands_locally() {
     assert_eq!(
         parse_command("/bogus"),
@@ -78,7 +93,10 @@ fn rejects_unknown_and_invalid_commands_locally() {
     );
     assert_eq!(
         parse_command("/fast now"),
-        Err(CommandParseError::new("Usage: /fast"))
+        Err(CommandParseError::with_args(
+            "parse.unknown_fast_tier",
+            [("tier", "now")],
+        ))
     );
     assert_eq!(
         parse_command("/compact now"),

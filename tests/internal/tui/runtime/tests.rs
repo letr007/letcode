@@ -8657,6 +8657,38 @@ mod integration_tests {
     }
 
     #[test]
+    fn fast_command_opens_picker_and_dispatches_selected_tier() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/fast");
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("fast picker opens"),
+            None
+        );
+        assert!(matches!(
+            runtime.state().dialog(),
+            Some(dialog)
+                if dialog.kind == DialogKind::FastPicker
+                    && dialog.selected_item().map(|item| item.id.as_str()) == Some("fast")
+        ));
+
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("select ultrafast");
+        assert!(matches!(
+            runtime
+                .handle_input_action(InputAction::DialogAccept)
+                .expect("accept fast tier"),
+            Some(crate::session::SessionCommand::SetFastMode(
+                crate::fast_mode::FastModeTier::Ultrafast
+            ))
+        ));
+        assert!(!runtime.state().dialog_is_open());
+    }
+
+    #[test]
     fn thoughts_numeric_alias_persists_and_loads_for_a_new_runtime() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/thoughts 1");

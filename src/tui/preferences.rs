@@ -52,6 +52,8 @@ pub struct TuiPreferences {
     pub fake_installation_id: Option<String>,
     #[serde(default)]
     pub fast_mode: bool,
+    #[serde(default)]
+    pub fast_mode_tier: Option<String>,
 }
 
 impl Default for TuiPreferences {
@@ -67,6 +69,7 @@ impl Default for TuiPreferences {
             language: None,
             fake_installation_id: None,
             fast_mode: false,
+            fast_mode_tier: None,
         }
     }
 }

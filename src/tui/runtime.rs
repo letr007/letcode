@@ -1079,6 +1079,11 @@ impl TuiRuntime {
                 self.state.set_fast_mode_enabled(*enabled);
                 self.persist_fast_mode(*enabled);
             }
+            SessionTransportEvent::FastModeTierChanged { tier } => {
+                self.state
+                    .set_fast_mode_tier(tier.map(|value| value.as_str().to_string()));
+                self.persist_fast_mode_tier(tier.map(|value| value.as_str().to_string()));
+            }
             SessionTransportEvent::ModelChanged { model_id } => {
                 self.apply_restored_model(model_id.clone());
                 self.state.set_provider_label_from_model_route(model_id);
@@ -2368,6 +2373,7 @@ impl TuiRuntime {
                 }
             }
             crate::session::SessionCommand::ToggleFastMode
+            | crate::session::SessionCommand::SetFastMode(_)
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
             | crate::session::SessionCommand::Compact
@@ -2415,6 +2421,7 @@ impl TuiRuntime {
                 self.refresh_open_agent_picker();
             }
             crate::session::SessionCommand::ToggleFastMode
+            | crate::session::SessionCommand::SetFastMode(_)
             | crate::session::SessionCommand::ToggleMcpServer(_)
             | crate::session::SessionCommand::SubmitPrompt(_)
             | crate::session::SessionCommand::Compact
@@ -2773,6 +2780,10 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             CommandIntent::ModelShow => self.show_model_dialog(),
+            CommandIntent::FastShow => {
+                self.show_fast_dialog();
+                Ok(Some(SubmittedCommand::LocalOnly))
+            }
             CommandIntent::AgentsShow => self.show_agents_dialog(),
             CommandIntent::ReasoningShow => self.show_reasoning_dialog(),
             CommandIntent::ThoughtsShow => self.show_thoughts_dialog(),
@@ -2794,7 +2805,7 @@ impl TuiRuntime {
             CommandIntent::ConfigShow => self.show_config_dialog(),
             CommandIntent::PermissionSet(_)
             | CommandIntent::ModelSet(_)
-            | CommandIntent::FastToggle
+            | CommandIntent::FastSet(_)
             | CommandIntent::ReasoningSet(_)
             | CommandIntent::Compact
             | CommandIntent::Tree
@@ -2829,6 +2840,9 @@ impl TuiRuntime {
             ))),
             SessionCommand::ToggleFastMode => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ToggleFastMode,
+            ))),
+            SessionCommand::SetFastMode(tier) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::SetFastMode(tier),
             ))),
             SessionCommand::SetReasoningEffort(effort) => {
                 Ok(Some(self.set_reasoning_effort_command(effort)))
@@ -3040,6 +3054,34 @@ impl TuiRuntime {
             }
             FakeCommand::Set(client) => self.apply_fake_selection(client),
         }
+    }
+
+    fn show_fast_dialog(&mut self) {
+        let current = self.state.fast_mode_tier.as_deref().unwrap_or("");
+        let items = vec![
+            DialogItem::new(
+                "fast",
+                self.state.t("runtime.fast_mode_fast"),
+                Some(self.state.t("runtime.fast_mode_fast_desc")),
+            ),
+            DialogItem::new(
+                "ultrafast",
+                self.state.t("runtime.fast_mode_ultrafast"),
+                Some(self.state.t("runtime.fast_mode_ultrafast_desc")),
+            ),
+        ];
+        let mut dialog = DialogState::new(
+            DialogKind::FastPicker,
+            self.state.t("runtime.select_fast_mode"),
+            Some(self.state.t("runtime.choose_fast_mode")),
+            items,
+        );
+        dialog.selected = dialog
+            .items
+            .iter()
+            .position(|item| item.id == current)
+            .unwrap_or_default();
+        self.state.open_dialog(dialog);
     }
 
     fn show_fake_dialog(&mut self) {
@@ -3411,6 +3453,13 @@ impl TuiRuntime {
                 self.state.close_dialog();
                 self.apply_theme_selection(&selected.id);
                 Ok(None)
+            }
+            DialogKind::FastPicker => {
+                self.state.close_dialog();
+                let Some(tier) = crate::fast_mode::FastModeTier::parse(&selected.id) else {
+                    return Ok(None);
+                };
+                Ok(Some(RuntimeCommand::SetFastMode(tier)))
             }
             DialogKind::FakePicker => {
                 self.state.close_dialog();
@@ -4454,7 +4503,11 @@ pub async fn run_tui(
     state.set_fake_client(None);
     state.fake_installation_id = preferences.fake_installation_id;
     state.set_provider_label(provider_label);
-    state.set_fast_mode_enabled(projection.fast_mode_enabled);
+    state.set_fast_mode_tier(
+        preferences
+            .fast_mode_tier
+            .or_else(|| projection.fast_mode_enabled.then(|| "fast".to_string())),
+    );
 
     if let Some(active_model) = available_models
         .iter()

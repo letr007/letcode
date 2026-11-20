@@ -2002,6 +2002,7 @@ async fn run_engine_loop(
                     | SessionEngineCommand::SetPermissionMode(_)
                     | SessionEngineCommand::SetModel(_)
                     | SessionEngineCommand::SetExpertAllowedModels { .. }
+                    | SessionEngineCommand::SetFastMode(_)
                     | SessionEngineCommand::ToggleFastMode
                     | SessionEngineCommand::SetReasoningEffort(_)
                     | SessionEngineCommand::SetFakeClient(_)

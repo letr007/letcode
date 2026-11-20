@@ -482,6 +482,14 @@ fn render_picker_body(
                                 .map(|client| client.as_str())
                                 .unwrap_or("off"),
                     ),
+                    DialogKind::FastPicker => render_permission_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        state.fast_mode_tier.as_deref() == Some(item.id.as_str()),
+                    ),
                     DialogKind::LanguagePicker => render_permission_row(
                         frame,
                         row,

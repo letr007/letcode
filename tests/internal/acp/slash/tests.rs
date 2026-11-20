@@ -24,7 +24,13 @@ fn advertised_commands_dispatch_the_commands_the_engine_confirms() {
     );
     assert_eq!(
         request("/fast"),
-        SlashRequest::Command(SessionCommand::ToggleFastMode)
+        SlashRequest::Rejected("Usage: /fast [fast|ultrafast]".into())
+    );
+    assert_eq!(
+        request("/fast fast"),
+        SlashRequest::Command(SessionCommand::SetFastMode(
+            crate::fast_mode::FastModeTier::Fast
+        ))
     );
     assert_eq!(
         request("/new"),

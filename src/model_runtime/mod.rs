@@ -370,7 +370,7 @@ pub struct RouteCapabilities {
     pub reasoning: bool,
     pub input_images: bool,
     pub tool_result_images: bool,
-    pub priority_service: bool,
+    pub service_tier: bool,
 }
 
 /// Generation features supported by a route.
@@ -384,7 +384,7 @@ pub struct GenerationSupport {
     pub reasoning_summary: bool,
     pub text_verbosity: bool,
     pub parallel_tool_calls: bool,
-    pub priority_service: bool,
+    pub service_tier: bool,
     pub structured_output: Option<StructuredOutputSupport>,
 }
 
@@ -743,7 +743,7 @@ pub struct GenerationSettings {
     pub summary: Option<ReasoningSummary>,
     pub verbosity: Option<Verbosity>,
     pub parallel_tool_calls: Option<bool>,
-    pub priority_service: Option<bool>,
+    pub service_tier: Option<crate::fast_mode::FastModeTier>,
     pub structured_output: Option<StructuredOutput>,
 }
 
@@ -1789,8 +1789,8 @@ pub struct RuntimeCapabilities {
     pub input_images: bool,
     #[serde(default)]
     pub tool_result_images: bool,
-    #[serde(default)]
-    pub priority_service: bool,
+    #[serde(default, alias = "priority_service")]
+    pub service_tier: bool,
     #[serde(default)]
     pub structured_output: Option<StructuredOutputSupport>,
     #[serde(default)]
@@ -1805,7 +1805,7 @@ impl Default for RuntimeCapabilities {
             reasoning: false,
             input_images: false,
             tool_result_images: false,
-            priority_service: false,
+            service_tier: false,
             structured_output: None,
             generation: RuntimeGenerationConfig::default(),
         }
@@ -1831,8 +1831,8 @@ pub struct RuntimeGenerationConfig {
     pub text_verbosity: bool,
     #[serde(default)]
     pub parallel_tool_calls: bool,
-    #[serde(default)]
-    pub priority_service: bool,
+    #[serde(default, alias = "priority_service")]
+    pub service_tier: bool,
     #[serde(default)]
     pub structured_output: Option<StructuredOutputSupport>,
 }
@@ -1879,7 +1879,7 @@ impl From<RuntimeCapabilities> for RouteCapabilities {
             reasoning: value.reasoning,
             input_images: value.input_images,
             tool_result_images: value.tool_result_images,
-            priority_service: value.priority_service,
+            service_tier: value.service_tier,
         }
     }
 }
@@ -1895,7 +1895,7 @@ impl GenerationSupport {
             reasoning_summary: capabilities.reasoning && protocol == "responses",
             text_verbosity: protocol == "responses" || protocol == "completions",
             parallel_tool_calls: capabilities.parallel_tool_calls,
-            priority_service: capabilities.priority_service,
+            service_tier: capabilities.service_tier,
             structured_output: capabilities
                 .structured_output
                 .or(capabilities.generation.structured_output),

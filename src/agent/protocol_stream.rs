@@ -1835,7 +1835,7 @@ pub(super) fn prepare_resolved_oneshot_request(
     model.reasoning_summary = None;
     model.supports_tools = false;
     model.parallel_tool_calls = false;
-    model.fast_mode = false;
+    model.service_tier = None;
     model.supports_input_images = route.capabilities.input_images;
     model.supports_tool_result_images = route.capabilities.tool_result_images;
     let build = build_oneshot_request(&route.model_override, model.clone(), prelude, user_content)?;
@@ -1926,7 +1926,7 @@ pub(super) fn prepare_oneshot_http_request(
     model.reasoning_summary = None;
     model.supports_tools = false;
     model.parallel_tool_calls = false;
-    model.fast_mode = false;
+    model.service_tier = None;
     model.supports_input_images = route.capabilities.input_images;
     model.supports_tool_result_images = route.capabilities.tool_result_images;
     let build = build_oneshot_request(

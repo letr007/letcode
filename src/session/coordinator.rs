@@ -186,6 +186,35 @@ impl SessionCoordinator {
             SessionCommand::SetModel(_) | SessionCommand::SetExpertAllowedModels { .. } => {
                 Ok(IdleDispatch::NotIdle)
             }
+            SessionCommand::SetFastMode(tier) => {
+                let Some(fast_mode) = agent.fast_mode() else {
+                    let _ = event_tx.send(SessionTransportEvent::Notice(
+                        NoticeEvent::info("Fast mode unavailable")
+                            .with_message_id(NoticeId::FastModeUnavailable),
+                    ));
+                    return Ok(IdleDispatch::Handled);
+                };
+                match fast_mode.set(agent.model(), tier) {
+                    Ok(true) => {
+                        let _ =
+                            event_tx.send(SessionTransportEvent::FastModeChanged { enabled: true });
+                        let _ = event_tx
+                            .send(SessionTransportEvent::FastModeTierChanged { tier: Some(tier) });
+                    }
+                    Ok(false) => {
+                        let _ = event_tx.send(SessionTransportEvent::Notice(
+                            NoticeEvent::info("Fast mode unavailable for current model")
+                                .with_message_id(NoticeId::FastModeUnavailableForModel),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                            format!("failed to set fast mode: {error}"),
+                        )));
+                    }
+                }
+                Ok(IdleDispatch::Handled)
+            }
             SessionCommand::ToggleFastMode => {
                 let Some(fast_mode) = agent.fast_mode() else {
                     let _ = event_tx.send(SessionTransportEvent::Notice(
@@ -813,6 +842,7 @@ impl SessionCoordinator {
             | SessionCommand::NavigateHistory { .. }
             | SessionCommand::SetPermissionMode(_)
             | SessionCommand::ToggleFastMode
+            | SessionCommand::SetFastMode(_)
             | SessionCommand::SetReasoningEffort(_)
             | SessionCommand::SetFakeClient(_)
             | SessionCommand::ViewParent

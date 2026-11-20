@@ -1855,7 +1855,7 @@ impl Agent {
             metadata.supports_tool_result_images = route.capabilities.tool_result_images;
             route.strategy.normalize_request_metadata(&mut metadata);
         }
-        metadata.fast_mode = self.fast_mode_enabled();
+        metadata.service_tier = self.fast_mode.as_ref().and_then(|mode| mode.tier());
         metadata
     }
 
