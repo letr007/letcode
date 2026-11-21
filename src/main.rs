@@ -32,6 +32,8 @@ mod peer;
 mod permission;
 mod project_memory;
 mod protocol_frames;
+#[allow(dead_code)]
+mod redact;
 mod request_builder;
 mod runtime_context;
 mod session;

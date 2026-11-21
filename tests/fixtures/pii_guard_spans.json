@@ -1,0 +1,224 @@
+[
+ {
+  "text": "请联系张伟，手机 13812345678，邮箱 zhangwei@example.com，收货地址：北京市海淀区中关村大街 27 号。",
+  "spans": [
+   {
+    "kind": "private_person",
+    "text": "张伟",
+    "score": 0.9951
+   },
+   {
+    "kind": "phone",
+    "text": "13812345678",
+    "score": 0.9951
+   },
+   {
+    "kind": "email",
+    "text": "zhangwei@example.com",
+    "score": 0.9962
+   },
+   {
+    "kind": "private_address",
+    "text": "北京市海淀区中关村大街 27 号",
+    "score": 0.9939
+   }
+  ]
+ },
+ {
+  "text": "Contact Jane Doe at jane.doe@example.org or +1 415-555-0132, server 10.0.3.17.",
+  "spans": [
+   {
+    "kind": "private_person",
+    "text": "Jane Doe",
+    "score": 0.9948
+   },
+   {
+    "kind": "email",
+    "text": "jane.doe@example.org",
+    "score": 0.9967
+   },
+   {
+    "kind": "phone",
+    "text": "+1 415-555-0132",
+    "score": 0.9946
+   },
+   {
+    "kind": "ip_address",
+    "text": "10.0.3.17",
+    "score": 0.9937
+   }
+  ]
+ },
+ {
+  "text": "DB_HOST=localhost\nDB_PASSWORD=hunter2-not-real\nOPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789\n",
+  "spans": [
+   {
+    "kind": "common_secret",
+    "text": "hunter2-not-real",
+    "score": 0.9914
+   },
+   {
+    "kind": "common_secret",
+    "text": "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+    "score": 0.9954
+   }
+  ]
+ },
+ {
+  "text": "订单号 202409301234567890，金额 128.00 元，版本 1.2.3，commit 3f9a1c2。",
+  "spans": []
+ },
+ {
+  "text": "[2026-09-30 14:05:12] INFO request served in 35 ms",
+  "spans": []
+ },
+ {
+  "text": "def scale(xs, factor=0.5):\n    return sorted(xs, key=lambda v: v['id'])\n",
+  "spans": []
+ },
+ {
+  "text": "王芳的生日是 1992 年 7 月 8 日，护照有效期至 2031-05-01。",
+  "spans": [
+   {
+    "kind": "private_person",
+    "text": "王芳",
+    "score": 0.994
+   },
+   {
+    "kind": "private_date",
+    "text": "1992 年 7 月 8 日",
+    "score": 0.9843
+   },
+   {
+    "kind": "private_date",
+    "text": "2031-05-01",
+    "score": 0.9618
+   }
+  ]
+ },
+ {
+  "text": "把下面的工单转给同事。客户姓名 李静，电话 13900001111，邮箱 lijing@example.net。服务器 192.168.10.23 的日志显示 cache hit ratio 0.91，构建版本 4.8.2。登录口令是 Zx7!qwe-not-real。把下面的工单转给同事。客户姓名 李静，电话 13900001111，邮箱 lijing@example.net。服务器 192.168.10.23 的日志显示 cache hit ratio 0.91，构建版本 4.8.2。登录口令是 Zx7!qwe-not-real。把下面的工单转给同事。客户姓名 李静，电话 13900001111，邮箱 lijing@example.net。服务器 192.168.10.23 的日志显示 cache hit ratio 0.91，构建版本 4.8.2。登录口令是 Zx7!qwe-not-real。把下面的工单转给同事。客户姓名 李静，电话 13900001111，邮箱 lijing@example.net。服务器 192.168.10.23 的日志显示 cache hit ratio 0.91，构建版本 4.8.2。登录口令是 Zx7!qwe-not-real。把下面的工单转给同事。客户姓名 李静，电话 13900001111，邮箱 lijing@example.net。服务器 192.168.10.23 的日志显示 cache hit ratio 0.91，构建版本 4.8.2。登录口令是 Zx7!qwe-not-real。把下面的工单转给同事。客户姓名 李静，电话 13900001111，邮箱 lijing@example.net。服务器 192.168.10.23 的日志显示 cache hit ratio 0.91，构建版本 4.8.2。登录口令是 Zx7!qwe-not-real。",
+  "spans": [
+   {
+    "kind": "private_person",
+    "text": "李静",
+    "score": 0.9952
+   },
+   {
+    "kind": "phone",
+    "text": "13900001111",
+    "score": 0.9848
+   },
+   {
+    "kind": "email",
+    "text": "lijing@example.net",
+    "score": 0.9963
+   },
+   {
+    "kind": "ip_address",
+    "text": "192.168.10.23",
+    "score": 0.9934
+   },
+   {
+    "kind": "private_person",
+    "text": "李静",
+    "score": 0.9953
+   },
+   {
+    "kind": "phone",
+    "text": "13900001111",
+    "score": 0.9898
+   },
+   {
+    "kind": "email",
+    "text": "lijing@example.net",
+    "score": 0.9961
+   },
+   {
+    "kind": "ip_address",
+    "text": "192.168.10.23",
+    "score": 0.9932
+   },
+   {
+    "kind": "private_person",
+    "text": "李静",
+    "score": 0.995
+   },
+   {
+    "kind": "phone",
+    "text": "13900001111",
+    "score": 0.9739
+   },
+   {
+    "kind": "email",
+    "text": "lijing@example.net",
+    "score": 0.9963
+   },
+   {
+    "kind": "ip_address",
+    "text": "192.168.10.23",
+    "score": 0.9934
+   },
+   {
+    "kind": "private_person",
+    "text": "李静",
+    "score": 0.9951
+   },
+   {
+    "kind": "phone",
+    "text": "13900001111",
+    "score": 0.9866
+   },
+   {
+    "kind": "email",
+    "text": "lijing@example.net",
+    "score": 0.9961
+   },
+   {
+    "kind": "ip_address",
+    "text": "192.168.10.23",
+    "score": 0.9932
+   },
+   {
+    "kind": "private_person",
+    "text": "李静",
+    "score": 0.9952
+   },
+   {
+    "kind": "phone",
+    "text": "13900001111",
+    "score": 0.9891
+   },
+   {
+    "kind": "email",
+    "text": "lijing@example.net",
+    "score": 0.9964
+   },
+   {
+    "kind": "ip_address",
+    "text": "192.168.10.23",
+    "score": 0.9929
+   },
+   {
+    "kind": "private_person",
+    "text": "李静",
+    "score": 0.9951
+   },
+   {
+    "kind": "phone",
+    "text": "13900001111",
+    "score": 0.9909
+   },
+   {
+    "kind": "email",
+    "text": "lijing@example.net",
+    "score": 0.9963
+   },
+   {
+    "kind": "ip_address",
+    "text": "192.168.10.23",
+    "score": 0.993
+   }
+  ]
+ }
+]
