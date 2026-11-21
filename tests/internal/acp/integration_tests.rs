@@ -563,7 +563,7 @@ async fn handshake_dispatches_the_slash_commands_it_advertises() {
                 let error = send_prompt(&connection, &session_id, "/fast")
                     .await
                     .expect_err("a service tier value is required");
-                assert_eq!(error.message, "Usage: /fast [fast|ultrafast]");
+                assert_eq!(error.message, "Usage: /fast [fast|ultrafast|off]");
                 for (prompt, message) in [
                     ("/undo", "no session history entry to undo"),
                     ("/redo", "no history entry available to redo"),

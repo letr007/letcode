@@ -1730,6 +1730,7 @@ impl Agent {
         self.fast_mode.as_ref()
     }
 
+    #[cfg(test)]
     pub fn fast_mode_enabled(&self) -> bool {
         self.fast_mode
             .as_ref()

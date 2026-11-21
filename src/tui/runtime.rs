@@ -3057,19 +3057,34 @@ impl TuiRuntime {
     }
 
     fn show_fast_dialog(&mut self) {
-        let current = self.state.fast_mode_tier.as_deref().unwrap_or("");
-        let items = vec![
-            DialogItem::new(
+        let current = self.state.fast_mode_tier.as_deref().unwrap_or("off");
+        let model_id = self
+            .state
+            .model_id
+            .split_once('/')
+            .map_or(self.state.model_id.as_str(), |(_, model)| model);
+        let mut items = vec![DialogItem::new(
+            "off",
+            self.state.t("runtime.fast_mode_off"),
+            Some(self.state.t("runtime.fast_mode_off_desc")),
+        )];
+        if crate::fast_mode::is_tier_capable_model(model_id, crate::fast_mode::FastModeTier::Fast) {
+            items.push(DialogItem::new(
                 "fast",
                 self.state.t("runtime.fast_mode_fast"),
                 Some(self.state.t("runtime.fast_mode_fast_desc")),
-            ),
-            DialogItem::new(
+            ));
+        }
+        if crate::fast_mode::is_tier_capable_model(
+            model_id,
+            crate::fast_mode::FastModeTier::Ultrafast,
+        ) {
+            items.push(DialogItem::new(
                 "ultrafast",
                 self.state.t("runtime.fast_mode_ultrafast"),
                 Some(self.state.t("runtime.fast_mode_ultrafast_desc")),
-            ),
-        ];
+            ));
+        }
         let mut dialog = DialogState::new(
             DialogKind::FastPicker,
             self.state.t("runtime.select_fast_mode"),
@@ -3456,7 +3471,12 @@ impl TuiRuntime {
             }
             DialogKind::FastPicker => {
                 self.state.close_dialog();
-                let Some(tier) = crate::fast_mode::FastModeTier::parse(&selected.id) else {
+                let tier = if selected.id == "off" {
+                    Some(None)
+                } else {
+                    crate::fast_mode::FastModeTier::parse(&selected.id).map(Some)
+                };
+                let Some(tier) = tier else {
                     return Ok(None);
                 };
                 Ok(Some(RuntimeCommand::SetFastMode(tier)))
@@ -4504,9 +4524,9 @@ pub async fn run_tui(
     state.fake_installation_id = preferences.fake_installation_id;
     state.set_provider_label(provider_label);
     state.set_fast_mode_tier(
-        preferences
+        projection
             .fast_mode_tier
-            .or_else(|| projection.fast_mode_enabled.then(|| "fast".to_string())),
+            .map(|tier| tier.as_str().to_string()),
     );
 
     if let Some(active_model) = available_models

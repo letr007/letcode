@@ -196,10 +196,10 @@ impl SessionCoordinator {
                 };
                 match fast_mode.set(agent.model(), tier) {
                     Ok(true) => {
-                        let _ =
-                            event_tx.send(SessionTransportEvent::FastModeChanged { enabled: true });
-                        let _ = event_tx
-                            .send(SessionTransportEvent::FastModeTierChanged { tier: Some(tier) });
+                        let _ = event_tx.send(SessionTransportEvent::FastModeChanged {
+                            enabled: tier.is_some(),
+                        });
+                        let _ = event_tx.send(SessionTransportEvent::FastModeTierChanged { tier });
                     }
                     Ok(false) => {
                         let _ = event_tx.send(SessionTransportEvent::Notice(

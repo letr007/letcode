@@ -156,7 +156,7 @@ pub enum CommandIntent {
     ModelSet(String),
     AgentsShow,
     FastShow,
-    FastSet(FastModeTier),
+    FastSet(Option<FastModeTier>),
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
     ThoughtsShow,
@@ -336,7 +336,7 @@ const COMMANDS: &[CommandMetadata] = &[
         name: "/fast",
         insert_text: "/fast",
         description_key: "command.fast",
-        usage: "/fast [fast|ultrafast]",
+        usage: "/fast [fast|ultrafast|off]",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -647,16 +647,19 @@ fn parse_model(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
 fn parse_fast(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     match parts {
         ["/fast"] => Ok(CommandIntent::FastShow),
-        ["/fast", value] => FastModeTier::parse(value).map_or_else(
-            || {
-                Err(CommandParseError::with_args(
-                    "parse.unknown_fast_tier",
-                    [("tier", value)],
-                ))
-            },
-            |tier| Ok(CommandIntent::FastSet(tier)),
-        ),
-        ["/fast", ..] => Err(CommandParseError::new("Usage: /fast [fast|ultrafast]")),
+        ["/fast", value] => match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(CommandIntent::FastSet(None)),
+            _ => FastModeTier::parse(value).map_or_else(
+                || {
+                    Err(CommandParseError::with_args(
+                        "parse.unknown_fast_tier",
+                        [("tier", value)],
+                    ))
+                },
+                |tier| Ok(CommandIntent::FastSet(Some(tier))),
+            ),
+        },
+        ["/fast", ..] => Err(CommandParseError::new("Usage: /fast [fast|ultrafast|off]")),
         _ => unreachable!(),
     }
 }

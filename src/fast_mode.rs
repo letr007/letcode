@@ -46,6 +46,7 @@ impl FastMode {
         })
     }
 
+    #[cfg(test)]
     pub fn enabled(&self) -> bool {
         self.tier().is_some()
     }
@@ -54,11 +55,13 @@ impl FastMode {
         *self.state.lock().expect("Fast Mode state poisoned")
     }
 
-    pub fn set(&self, model_id: &str, tier: FastModeTier) -> Result<bool> {
-        if !is_tier_capable_model(model_id, tier) {
+    pub fn set(&self, model_id: &str, tier: Option<FastModeTier>) -> Result<bool> {
+        if let Some(tier) = tier
+            && !is_tier_capable_model(model_id, tier)
+        {
             return Ok(false);
         }
-        *self.state.lock().expect("Fast Mode state poisoned") = Some(tier);
+        *self.state.lock().expect("Fast Mode state poisoned") = tier;
         Ok(true)
     }
 
@@ -113,7 +116,7 @@ pub enum FastModeToggle {
     Unavailable,
 }
 
-fn is_tier_capable_model(model_id: &str, tier: FastModeTier) -> bool {
+pub fn is_tier_capable_model(model_id: &str, tier: FastModeTier) -> bool {
     match tier {
         FastModeTier::Fast => is_fast_capable_model(model_id),
         FastModeTier::Ultrafast => is_ultrafast_capable_model(model_id),

@@ -52,8 +52,8 @@ const COMMANDS: [SlashCommand; 9] = [
     },
     SlashCommand {
         name: "fast",
-        description: "Choose the Fast or Ultrafast service tier",
-        hint: Some("fast|ultrafast"),
+        description: "Set the Fast service tier",
+        hint: Some("fast|ultrafast|off"),
     },
     SlashCommand {
         name: "new",

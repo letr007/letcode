@@ -22,11 +22,11 @@ fn ultrafast_is_limited_to_supported_models() {
     let mode = FastMode::load("letcode.toml", false);
     assert!(
         !mode
-            .set("gpt-5.5", FastModeTier::Ultrafast)
+            .set("gpt-5.5", Some(FastModeTier::Ultrafast))
             .expect("set tier")
     );
     assert!(
-        mode.set("gpt-6-astra", FastModeTier::Ultrafast)
+        mode.set("gpt-6-astra", Some(FastModeTier::Ultrafast))
             .expect("set tier")
     );
     assert_eq!(mode.tier(), Some(FastModeTier::Ultrafast));
@@ -34,5 +34,12 @@ fn ultrafast_is_limited_to_supported_models() {
         mode.auto_disable_for_model("gpt-5.5")
             .expect("disable unsupported tier")
     );
+    assert_eq!(mode.tier(), None);
+}
+
+#[test]
+fn set_none_disables_fast_mode_regardless_of_model() {
+    let mode = FastMode::load("letcode.toml", true);
+    assert!(mode.set("claude-4", None).expect("disable fast mode"));
     assert_eq!(mode.tier(), None);
 }

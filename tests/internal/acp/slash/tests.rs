@@ -24,13 +24,13 @@ fn advertised_commands_dispatch_the_commands_the_engine_confirms() {
     );
     assert_eq!(
         request("/fast"),
-        SlashRequest::Rejected("Usage: /fast [fast|ultrafast]".into())
+        SlashRequest::Rejected("Usage: /fast [fast|ultrafast|off]".into())
     );
     assert_eq!(
         request("/fast fast"),
-        SlashRequest::Command(SessionCommand::SetFastMode(
+        SlashRequest::Command(SessionCommand::SetFastMode(Some(
             crate::fast_mode::FastModeTier::Fast
-        ))
+        )))
     );
     assert_eq!(
         request("/new"),

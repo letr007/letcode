@@ -190,7 +190,7 @@ pub struct SessionEngineProjection {
     pub model_id: String,
     pub model_label: String,
     pub permission_mode_label: String,
-    pub fast_mode_enabled: bool,
+    pub fast_mode_tier: Option<crate::fast_mode::FastModeTier>,
     pub api_key_configured: bool,
 }
 
@@ -230,7 +230,7 @@ impl SessionEngine {
         let model_id = agent.route_display_name();
         let api_key_configured = route_has_api_key(&config.route_api_key_configured, &model_id);
         let permission_mode_label = agent.permission_mode().to_string();
-        let fast_mode_enabled = agent.fast_mode_enabled();
+        let fast_mode_tier = agent.fast_mode().and_then(|mode| mode.tier());
         let (session_id, session_title) = initial_session_metadata(&transcript)?;
         let projection = SessionEngineProjection {
             session_id,
@@ -238,7 +238,7 @@ impl SessionEngine {
             model_id,
             model_label,
             permission_mode_label,
-            fast_mode_enabled,
+            fast_mode_tier,
             api_key_configured,
         };
         let (control_tx, control_rx) = mpsc::unbounded_channel();

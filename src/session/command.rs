@@ -46,7 +46,7 @@ pub enum SessionCommand {
         model_ids: Vec<String>,
     },
     ToggleFastMode,
-    SetFastMode(FastModeTier),
+    SetFastMode(Option<FastModeTier>),
     SetReasoningEffort(ModelReasoningEffort),
     SetFakeClient(Option<crate::fake::FakeClient>),
     ResumeSession(String),

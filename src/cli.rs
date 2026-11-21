@@ -223,6 +223,18 @@ pub async fn run_repl(
                     }
                 }
             }
+            ReplCommand::SetFastMode(tier) => {
+                submit_and_wait(
+                    &ingress,
+                    &mut events,
+                    &mut view,
+                    SessionCommand::SetFastMode(tier),
+                    CommandWait::UntilFastMode,
+                    OutputMode::Streaming,
+                    Some(&input_reader),
+                )
+                .await?;
+            }
             ReplCommand::ToggleFastMode => {
                 submit_and_wait(
                     &ingress,
@@ -954,6 +966,7 @@ enum ReplCommand {
     ModelShow,
     ModelSet(String),
     ToggleFastMode,
+    SetFastMode(Option<crate::fast_mode::FastModeTier>),
     Sessions,
     ResumeShow,
     Resume(String),
@@ -1000,6 +1013,7 @@ fn parse_repl_command(input: &str) -> ReplCommand {
             "CLI does not support /thoughts; use the TUI to switch thinking display.".into(),
         ),
         CommandIntent::ResumeShow => ReplCommand::ResumeShow,
+        CommandIntent::FastShow => ReplCommand::ToggleFastMode,
         CommandIntent::ToolsShow | CommandIntent::ToolsSet(_) => ReplCommand::Unsupported(
             "CLI does not support /tools; use the TUI to switch tool display.".into(),
         ),
@@ -1034,7 +1048,6 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::Prompt(_)
         | CommandIntent::PermissionSet(_)
         | CommandIntent::ModelSet(_)
-        | CommandIntent::FastShow
         | CommandIntent::FastSet(_)
         | CommandIntent::ReasoningSet(_)
         | CommandIntent::Compact
@@ -1065,10 +1078,7 @@ fn repl_command_from_session_command(command: SessionCommand) -> ReplCommand {
             "CLI does not support expert model selection yet; use the TUI.".into(),
         ),
         SessionCommand::ToggleFastMode => ReplCommand::ToggleFastMode,
-        SessionCommand::SetFastMode(tier) => ReplCommand::Unsupported(format!(
-            "selected Fast service tier: {} (use the TUI picker)",
-            tier.as_str()
-        )),
+        SessionCommand::SetFastMode(tier) => ReplCommand::SetFastMode(tier),
         SessionCommand::SetReasoningEffort(effort) => ReplCommand::ReasoningSet(effort),
         SessionCommand::SetFakeClient(_) => ReplCommand::Unsupported(
             "CLI does not support /fake; use the TUI to select a fake client.".into(),

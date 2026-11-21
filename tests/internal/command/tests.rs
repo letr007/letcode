@@ -63,13 +63,16 @@ fn fast_command_selects_a_service_tier() {
     assert_eq!(parse_command("/fast"), Ok(CommandIntent::FastShow));
     assert_eq!(
         parse_command("/fast fast"),
-        Ok(CommandIntent::FastSet(crate::fast_mode::FastModeTier::Fast))
+        Ok(CommandIntent::FastSet(Some(
+            crate::fast_mode::FastModeTier::Fast
+        )))
     );
+    assert_eq!(parse_command("/fast off"), Ok(CommandIntent::FastSet(None)));
     assert_eq!(
         parse_command("/fast ultrafast"),
-        Ok(CommandIntent::FastSet(
+        Ok(CommandIntent::FastSet(Some(
             crate::fast_mode::FastModeTier::Ultrafast
-        ))
+        )))
     );
 }
 

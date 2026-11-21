@@ -8657,6 +8657,25 @@ mod integration_tests {
     }
 
     #[test]
+    fn fast_picker_off_disables_fast_mode() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_fast_mode_tier(Some("fast".into()));
+        runtime.state_mut().set_input("/fast");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("fast picker opens");
+        runtime
+            .handle_input_action(InputAction::DialogPrev)
+            .expect("select off");
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::DialogAccept)
+                .expect("accept off"),
+            Some(crate::session::SessionCommand::SetFastMode(None))
+        );
+    }
+
+    #[test]
     fn fast_command_opens_picker_and_dispatches_selected_tier() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/fast");
@@ -8671,19 +8690,24 @@ mod integration_tests {
             runtime.state().dialog(),
             Some(dialog)
                 if dialog.kind == DialogKind::FastPicker
-                    && dialog.selected_item().map(|item| item.id.as_str()) == Some("fast")
+                    && dialog
+                        .items
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .eq(["off", "fast"])
+                    && dialog.selected_item().map(|item| item.id.as_str()) == Some("off")
         ));
 
         runtime
             .handle_input_action(InputAction::DialogNext)
-            .expect("select ultrafast");
+            .expect("select fast");
         assert!(matches!(
             runtime
                 .handle_input_action(InputAction::DialogAccept)
                 .expect("accept fast tier"),
-            Some(crate::session::SessionCommand::SetFastMode(
-                crate::fast_mode::FastModeTier::Ultrafast
-            ))
+            Some(crate::session::SessionCommand::SetFastMode(Some(
+                crate::fast_mode::FastModeTier::Fast
+            )))
         ));
         assert!(!runtime.state().dialog_is_open());
     }

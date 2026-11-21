@@ -162,10 +162,20 @@ async fn main() -> Result<()> {
     );
     let mut startup_preferences =
         tui::preferences::TuiPreferences::load_from_dir(&config.config_dir);
-    agent.set_fast_mode(FastMode::load(
+    let fast_mode = FastMode::load(
         &config.config_path,
-        startup_preferences.fast_mode || config.fast_mode_enabled,
-    ));
+        startup_preferences.fast_mode
+            || config.fast_mode_enabled
+            || startup_preferences.fast_mode_tier.is_some(),
+    );
+    if let Some(tier) = startup_preferences
+        .fast_mode_tier
+        .as_deref()
+        .and_then(fast_mode::FastModeTier::parse)
+    {
+        let _ = fast_mode.set(&active_route.model, Some(tier));
+    }
+    agent.set_fast_mode(fast_mode);
     agent.auto_disable_fast_mode_for_model(agent.model())?;
     let workspace_dir = env::current_dir()?;
     project_memory::configure(&config.config_dir.join("memory"), &workspace_dir)?;
