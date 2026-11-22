@@ -49,10 +49,40 @@ pub(crate) struct Span {
     pub(crate) score: f32,
 }
 
+#[derive(Default)]
+struct SpanCache {
+    spans: std::collections::HashMap<[u8; 32], Vec<Span>>,
+    order: std::collections::VecDeque<([u8; 32], usize)>,
+    bytes: usize,
+}
+
+impl SpanCache {
+    fn get(&self, key: &[u8; 32]) -> Option<&Vec<Span>> {
+        self.spans.get(key)
+    }
+
+    fn insert(&mut self, key: [u8; 32], spans: Vec<Span>, len: usize) {
+        if self.spans.insert(key, spans).is_none() {
+            self.order.push_back((key, len));
+            self.bytes += len;
+        }
+        while self.bytes > CACHE_BUDGET {
+            let Some((old, len)) = self.order.pop_front() else {
+                break;
+            };
+            if self.spans.remove(&old).is_some() {
+                self.bytes -= len;
+            }
+        }
+    }
+}
+
+const CACHE_BUDGET: usize = 8 << 20;
+
 pub(crate) struct Model {
     weights: forward::Weights,
     tokenizer: Tokenizer,
-    cache: std::sync::Mutex<std::collections::HashMap<[u8; 32], Vec<Span>>>,
+    cache: std::sync::Mutex<SpanCache>,
 }
 
 impl Model {
@@ -64,7 +94,7 @@ impl Model {
         Ok(Self {
             weights,
             tokenizer,
-            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cache: std::sync::Mutex::new(SpanCache::default()),
         })
     }
 
@@ -80,10 +110,7 @@ impl Model {
         spans.extend(rules::scan(text));
         let spans = merge(spans);
         if let Ok(mut cache) = self.cache.lock() {
-            if cache.len() >= 256 {
-                cache.clear();
-            }
-            cache.insert(digest, spans.clone());
+            cache.insert(digest, spans.clone(), text.len());
         }
         Ok(spans)
     }
