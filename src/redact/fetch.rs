@@ -38,18 +38,18 @@ pub(crate) fn fetch_missing(dir: &Path) -> Result<Vec<String>> {
     let mut written = Vec::new();
     let total: u64 = FILES.iter().map(|(_, size, _)| size).sum();
     let mut done = 0u64;
-    super::set_preparing(Some((0, total, true)));
+    let progress = super::Progress::start(true, total);
     for (name, size, digest) in FILES {
         let target = dir.join(Path::new(name).file_name().context("a file name")?);
         if target.is_file() && digest_of(&target)? == digest {
             done += size;
-            super::set_preparing(Some((done, total, true)));
+            progress.advance(done);
             continue;
         }
         let mut last: Option<anyhow::Error> = None;
         for host in HOSTS {
             let url = format!("{host}/QuantumNous/astrlink-guard/resolve/{REVISION}/{name}");
-            match download(&agent, &url, &target, size, digest, &mut done, total) {
+            match download(&agent, &url, &target, size, digest, &mut done, &progress) {
                 Ok(()) => {
                     written.push(target.display().to_string());
                     last = None;
@@ -80,7 +80,7 @@ fn download(
     size: u64,
     digest: &str,
     done: &mut u64,
-    total: u64,
+    progress: &super::Progress,
 ) -> Result<()> {
     let response = agent.get(url).send().context("sending the request")?;
     if !response.status().is_success() {
@@ -106,7 +106,7 @@ fn download(
         hasher.update(&buffer[..read]);
         std::io::Write::write_all(&mut file, &buffer[..read])?;
         *done += read as u64;
-        super::set_preparing(Some((*done, total, true)));
+        progress.advance(*done);
     }
     drop(file);
     let actual = format!("{:x}", hasher.finalize());

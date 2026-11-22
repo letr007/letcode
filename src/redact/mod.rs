@@ -393,9 +393,7 @@ impl Redactor {
             return Ok(());
         }
         if !fetch::present(&self.dir) {
-            let fetched = fetch::fetch_missing(&self.dir);
-            set_preparing(None);
-            fetched?;
+            fetch::fetch_missing(&self.dir)?;
         }
         let masker = Masker::open(&self.dir, &self.key)?;
         *self
@@ -406,15 +404,49 @@ impl Redactor {
     }
 }
 
-static PREPARING: Mutex<Option<(u64, u64, bool)>> = Mutex::new(None);
+/// Progress belongs to the work that started it: the token is compared on
+/// every write and on release, so a cancelled turn cannot leave a stale
+/// percentage behind or clear somebody else's.
+static PREPARING: Mutex<Option<(u64, u64, u64, bool)>> = Mutex::new(None);
+static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) fn preparing() -> Option<(u64, u64, bool)> {
-    PREPARING.lock().ok().and_then(|state| *state)
+    PREPARING
+        .lock()
+        .ok()
+        .and_then(|state| state.map(|(_, done, total, downloading)| (done, total, downloading)))
 }
 
-pub(crate) fn set_preparing(value: Option<(u64, u64, bool)>) {
-    if let Ok(mut state) = PREPARING.lock() {
-        *state = value;
+pub(crate) struct Progress {
+    token: u64,
+}
+
+impl Progress {
+    pub(crate) fn start(downloading: bool, total: u64) -> Self {
+        let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut state) = PREPARING.lock() {
+            *state = Some((token, 0, total, downloading));
+        }
+        Self { token }
+    }
+
+    pub(crate) fn advance(&self, done: u64) {
+        if let Ok(mut state) = PREPARING.lock()
+            && let Some((token, _, total, downloading)) = *state
+            && token == self.token
+        {
+            *state = Some((token, done, total, downloading));
+        }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if let Ok(mut state) = PREPARING.lock()
+            && state.is_some_and(|(token, ..)| token == self.token)
+        {
+            *state = None;
+        }
     }
 }
 
@@ -444,19 +476,18 @@ pub(crate) fn active() -> Option<Arc<Redactor>> {
 
 pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) -> Result<()> {
     let total = (input.segments.len() + input.messages.len()) as u64;
+    let progress = Progress::start(false, total);
     let mut done = 0;
-    set_preparing(Some((0, total, false)));
     for segment in &mut input.segments {
         segment.text = redactor.mask(&segment.text)?;
         done += 1;
-        set_preparing(Some((done, total, false)));
+        progress.advance(done);
     }
     for message in &mut input.messages {
         mask_parts(redactor, &mut message.content)?;
         done += 1;
-        set_preparing(Some((done, total, false)));
+        progress.advance(done);
     }
-    set_preparing(None);
     Ok(())
 }
 
