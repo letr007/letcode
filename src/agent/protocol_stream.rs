@@ -1941,8 +1941,11 @@ pub(super) fn prepare_oneshot_http_request(
         prelude,
         &crate::user_content::UserMessageContent::new(user_text, vec![]),
     )?;
-    let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
+    let mut input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
+    if let Some(redactor) = crate::redact::active() {
+        crate::redact::mask_input(redactor, &mut input);
+    }
     decorate_oneshot_request(route, &input, decorator)
 }
 
