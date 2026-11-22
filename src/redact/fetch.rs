@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const REVISION: &str = "7216b6a3b897ef903d4b1ba367ae6fb95b0fa5e4";
 
-const HOSTS: [&str; 2] = ["https://huggingface.co", "https://hf-mirror.com"];
+const HOSTS: [&str; 2] = ["https://hf-mirror.com", "https://huggingface.co"];
 
 const FILES: [(&str, u64, &str); 3] = [
     (

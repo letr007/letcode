@@ -271,7 +271,6 @@ mod tests {
 }
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::model_runtime::{ContentPart, ModelRequestInput};
@@ -281,7 +280,7 @@ pub(crate) struct Redactor {
     dir: PathBuf,
     key: PathBuf,
     masker: Mutex<Option<Masker>>,
-    fetching: AtomicBool,
+    init: Mutex<()>,
 }
 
 impl Redactor {
@@ -290,20 +289,27 @@ impl Redactor {
             dir: config_dir.join("models").join("astrlink-guard"),
             key: masker::key_path(config_dir),
             masker: Mutex::new(None),
-            fetching: AtomicBool::new(false),
+            init: Mutex::new(()),
         });
         let worker = Arc::clone(&redactor);
-        std::thread::spawn(move || worker.ensure());
+        std::thread::spawn(move || {
+            if let Err(error) = worker.ensure() {
+                tracing::warn!("masking model unavailable: {error}");
+            }
+        });
         redactor
     }
 
-    pub(crate) fn mask(&self, text: &str) -> String {
-        let Ok(mut slot) = self.masker.lock() else {
-            return text.to_string();
-        };
+    /// Waits for the model rather than letting a request leave unmasked.
+    pub(crate) fn mask(&self, text: &str) -> Result<String> {
+        self.ensure()?;
+        let mut slot = self
+            .masker
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))?;
         match slot.as_mut() {
-            Some(masker) => masker.mask(text).unwrap_or_else(|_| text.to_string()),
-            None => text.to_string(),
+            Some(masker) => masker.mask(text),
+            None => Ok(text.to_string()),
         }
     }
 
@@ -316,35 +322,30 @@ impl Redactor {
         }
     }
 
-    fn ready(&self) -> Option<()> {
-        self.masker
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|_| ()))
+    fn ready(&self) -> bool {
+        self.masker.lock().is_ok_and(|slot| slot.is_some())
     }
 
-    fn ensure(&self) {
-        if self.ready().is_some() {
-            return;
+    fn ensure(&self) -> Result<()> {
+        if self.ready() {
+            return Ok(());
+        }
+        let _guard = self
+            .init
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))?;
+        if self.ready() {
+            return Ok(());
         }
         if !fetch::present(&self.dir) {
-            if self.fetching.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            if let Err(error) = fetch::fetch_missing(&self.dir) {
-                tracing::warn!("masking model unavailable: {error}");
-            }
-            self.fetching.store(false, Ordering::SeqCst);
+            fetch::fetch_missing(&self.dir)?;
         }
-        let Ok(mut slot) = self.masker.lock() else {
-            return;
-        };
-        if slot.is_none() {
-            match Masker::open(&self.dir, &self.key) {
-                Ok(masker) => *slot = Some(masker),
-                Err(error) => tracing::warn!("masking model did not load: {error}"),
-            }
-        }
+        let masker = Masker::open(&self.dir, &self.key)?;
+        *self
+            .masker
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))? = Some(masker);
+        Ok(())
     }
 }
 
@@ -358,42 +359,45 @@ pub(crate) fn active() -> Option<&'static Arc<Redactor>> {
     ACTIVE.get().and_then(Option::as_ref)
 }
 
-pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) {
+pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) -> Result<()> {
     for segment in &mut input.segments {
-        segment.text = redactor.mask(&segment.text);
+        segment.text = redactor.mask(&segment.text)?;
     }
     for message in &mut input.messages {
-        mask_parts(redactor, &mut message.content);
+        mask_parts(redactor, &mut message.content)?;
     }
+    Ok(())
 }
 
-fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart]) {
+fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart]) -> Result<()> {
     for part in parts {
         match part {
-            ContentPart::Text(text) => *text = redactor.mask(text),
-            ContentPart::Reasoning { text, .. } => *text = redactor.mask(text),
-            ContentPart::ToolCall { arguments, .. } => mask_value(redactor, arguments),
-            ContentPart::ToolResult { content, .. } => mask_parts(redactor, content),
+            ContentPart::Text(text) => *text = redactor.mask(text)?,
+            ContentPart::Reasoning { text, .. } => *text = redactor.mask(text)?,
+            ContentPart::ToolCall { arguments, .. } => mask_value(redactor, arguments)?,
+            ContentPart::ToolResult { content, .. } => mask_parts(redactor, content)?,
             ContentPart::Image { .. } => {}
         }
     }
+    Ok(())
 }
 
-pub(crate) fn mask_value(redactor: &Redactor, value: &mut serde_json::Value) {
+pub(crate) fn mask_value(redactor: &Redactor, value: &mut serde_json::Value) -> Result<()> {
     match value {
-        serde_json::Value::String(text) => *text = redactor.mask(text),
+        serde_json::Value::String(text) => *text = redactor.mask(text)?,
         serde_json::Value::Array(items) => {
             for item in items {
-                mask_value(redactor, item);
+                mask_value(redactor, item)?;
             }
         }
         serde_json::Value::Object(map) => {
             for item in map.values_mut() {
-                mask_value(redactor, item);
+                mask_value(redactor, item)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 pub(crate) fn restore_value(redactor: &Redactor, value: &mut serde_json::Value) {

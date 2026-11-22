@@ -727,9 +727,9 @@ where
         )
         .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
         if let Some(redactor) = crate::redact::active().cloned() {
-            input = tokio::task::spawn_blocking(move || {
-                crate::redact::mask_input(&redactor, &mut input);
-                input
+            let masked = tokio::task::spawn_blocking(move || {
+                crate::redact::mask_input(&redactor, &mut input)?;
+                Ok::<_, anyhow::Error>(input)
             })
             .await
             .map_err(|error| {
@@ -737,6 +737,9 @@ where
                     crate::model_runtime::FailurePhase::Prepare,
                     anyhow::anyhow!("masking task failed: {error}"),
                 )
+            })?;
+            input = masked.map_err(|error| {
+                runtime_failure(crate::model_runtime::FailurePhase::Prepare, error)
             })?;
         }
         let planned_observation = self.agent.preview_final_logical_request(&prepared.build);
@@ -1858,7 +1861,7 @@ pub(super) fn prepare_resolved_oneshot_request(
     // that will actually be sent.
     input.generation.structured_output = structured_output.cloned();
     if let Some(redactor) = crate::redact::active() {
-        crate::redact::mask_input(redactor, &mut input);
+        crate::redact::mask_input(redactor, &mut input)?;
     }
     route
         .binding
@@ -1954,7 +1957,7 @@ pub(super) fn prepare_oneshot_http_request(
     let mut input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
     if let Some(redactor) = crate::redact::active() {
-        crate::redact::mask_input(redactor, &mut input);
+        crate::redact::mask_input(redactor, &mut input)?;
     }
     decorate_oneshot_request(route, &input, decorator)
 }
