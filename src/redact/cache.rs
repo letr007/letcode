@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use super::Span;
 
-const MAX_BYTES: u64 = 32 << 20;
+// Bump when the detector changes: model revision, rules or the score floor.
+const CACHE_VERSION: &str = "v1";
 
 pub(crate) const KINDS: [&str; 10] = [
     "email",
@@ -32,16 +33,7 @@ impl DiskCache {
         }
     }
 
-    /// Drops the file when it outgrows its budget, so one long session cannot
-    /// pin an unbounded cache on disk.
     pub(crate) fn load(&mut self) -> HashMap<[u8; 32], Vec<Span>> {
-        let Ok(metadata) = std::fs::metadata(&self.path) else {
-            return HashMap::new();
-        };
-        if metadata.len() > MAX_BYTES {
-            let _ = std::fs::remove_file(&self.path);
-            return HashMap::new();
-        }
         let Ok(file) = std::fs::File::open(&self.path) else {
             return HashMap::new();
         };
@@ -68,7 +60,7 @@ impl DiskCache {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        let line = format!("{}\t{}\n", hex(key), encode(spans));
+        let line = format!("{CACHE_VERSION}\t{}\t{}\n", hex(key), encode(spans));
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -87,7 +79,11 @@ fn encode(spans: &[Span]) -> String {
 }
 
 fn parse(line: &str) -> Option<([u8; 32], Vec<Span>)> {
-    let (key, body) = line.split_once('\t')?;
+    let (version, rest) = line.split_once('\t')?;
+    if version != CACHE_VERSION {
+        return None;
+    }
+    let (key, body) = rest.split_once('\t')?;
     let key = unhex(key)?;
     let mut spans = Vec::new();
     for item in body.split(',').filter(|item| !item.is_empty()) {

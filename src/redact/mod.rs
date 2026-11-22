@@ -76,8 +76,14 @@ impl SpanCache {
         }
     }
 
-    fn get(&self, key: &[u8; 32]) -> Option<&Vec<Span>> {
-        self.spans.get(key)
+    fn take(&mut self, key: &[u8; 32]) -> Option<Vec<Span>> {
+        let spans = self.spans.get(key)?.clone();
+        if let Some(index) = self.order.iter().position(|(entry, _)| entry == key)
+            && let Some(entry) = self.order.remove(index)
+        {
+            self.order.push_back(entry);
+        }
+        Some(spans)
     }
 
     fn insert(&mut self, key: [u8; 32], spans: Vec<Span>, len: usize) {
@@ -99,7 +105,7 @@ impl SpanCache {
     }
 }
 
-const CACHE_BUDGET: usize = 8 << 20;
+const CACHE_BUDGET: usize = 256 << 20;
 
 pub(crate) struct Model {
     weights: forward::Weights,
@@ -123,10 +129,10 @@ impl Model {
     pub(crate) fn detect(&self, text: &str) -> Result<Vec<Span>> {
         use sha2::Digest;
         let digest: [u8; 32] = sha2::Sha256::digest(text.as_bytes()).into();
-        if let Ok(cache) = self.cache.lock()
-            && let Some(spans) = cache.get(&digest)
+        if let Ok(mut cache) = self.cache.lock()
+            && let Some(spans) = cache.take(&digest)
         {
-            return Ok(spans.clone());
+            return Ok(spans);
         }
         let mut spans = self.classify(text)?;
         spans.extend(rules::scan(text));
