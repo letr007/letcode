@@ -2485,12 +2485,9 @@ impl TuiRuntime {
         if self.state.pending_permission.is_some() || self.state.pending_question.is_some() {
             return Ok(None);
         }
-        if let Some((done, total)) = crate::redact::preparing() {
-            let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
-            self.state.show_toast(
-                format!("脱敏模型准备中 {percent}%（下载完成后可发送）"),
-                ToastKind::Info,
-            );
+        if crate::redact::preparing().is_some() {
+            let message = self.state.t("runtime.redact_not_ready");
+            self.state.show_toast(message, ToastKind::Info);
             return Ok(None);
         }
 
