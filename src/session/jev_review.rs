@@ -311,8 +311,11 @@ impl AutoReviewService for JevReviewer {
 async fn ask_jev(
     client: &reqwest::Client,
     config: &JevReviewConfig,
-    state: Value,
+    mut state: Value,
 ) -> Result<Answer> {
+    if let Some(redactor) = crate::redact::active() {
+        crate::redact::mask_value(redactor, &mut state);
+    }
     let credential = config.credential.trim();
     if credential.is_empty() {
         bail!("{}", missing_credential_rationale(config));

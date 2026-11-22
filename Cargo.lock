@@ -2226,6 +2226,7 @@ dependencies = [
  "opentelemetry_sdk",
  "pulldown-cmark",
  "ratatui",
+ "regex",
  "reqwest 0.13.3",
  "rusqlite",
  "secrecy",

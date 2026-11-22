@@ -3,6 +3,7 @@ mod forward;
 mod kernels;
 mod masker;
 mod onnx;
+mod rules;
 
 use std::path::Path;
 
@@ -51,6 +52,7 @@ pub(crate) struct Span {
 pub(crate) struct Model {
     weights: forward::Weights,
     tokenizer: Tokenizer,
+    cache: std::sync::Mutex<std::collections::HashMap<[u8; 32], Vec<Span>>>,
 }
 
 impl Model {
@@ -59,10 +61,34 @@ impl Model {
         let weights = forward::Weights::load(&graph)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("reading tokenizer.json: {e}"))?;
-        Ok(Self { weights, tokenizer })
+        Ok(Self {
+            weights,
+            tokenizer,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     pub(crate) fn detect(&self, text: &str) -> Result<Vec<Span>> {
+        use sha2::Digest;
+        let digest: [u8; 32] = sha2::Sha256::digest(text.as_bytes()).into();
+        if let Ok(cache) = self.cache.lock()
+            && let Some(spans) = cache.get(&digest)
+        {
+            return Ok(spans.clone());
+        }
+        let mut spans = self.classify(text)?;
+        spans.extend(rules::scan(text));
+        let spans = merge(spans);
+        if let Ok(mut cache) = self.cache.lock() {
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(digest, spans.clone());
+        }
+        Ok(spans)
+    }
+
+    fn classify(&self, text: &str) -> Result<Vec<Span>> {
         let encoding = self
             .tokenizer
             .encode(text, false)
@@ -139,6 +165,18 @@ impl Model {
     }
 }
 
+fn merge(mut spans: Vec<Span>) -> Vec<Span> {
+    spans.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if out.last().is_some_and(|last| span.start < last.end) {
+            continue;
+        }
+        out.push(span);
+    }
+    out
+}
+
 fn argmax(row: &[f32]) -> (usize, f32) {
     let mut best = 0usize;
     let mut max = f32::NEG_INFINITY;
@@ -194,6 +232,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn masking_removes_the_values_and_puts_them_back() {
+        let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
+            return;
+        };
+        let key = std::env::temp_dir().join(format!("letcode-redact-key-{}", std::process::id()));
+        let _ = std::fs::remove_file(&key);
+        let mut masker = masker::Masker::open(Path::new(&dir), &key).expect("the masker opens");
+        let text = "联系张伟 13812345678，邮箱 zhangwei@example.com，key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+        let masked = masker.mask(text).expect("masking runs");
+        for value in [
+            "张伟",
+            "13812345678",
+            "zhangwei@example.com",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+        ] {
+            assert!(!masked.contains(value), "{value} survived in {masked}");
+        }
+        assert_eq!(masker.restore(&masked), text);
+        let _ = std::fs::remove_file(&key);
     }
 
     #[derive(serde::Deserialize)]
