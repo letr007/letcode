@@ -6,6 +6,7 @@ mod masker;
 mod onnx;
 mod rules;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
@@ -251,6 +252,21 @@ fn argmax(row: &[f32]) -> (usize, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_tracked_history_classification_reports_progress() {
+        let mut scan = Scan::start(1);
+        scan.track(false);
+        scan.classified();
+        scan.advance();
+        assert!(scan.progress.is_none());
+
+        scan.track(true);
+        scan.classified();
+        assert!(scan.progress.is_some());
+        scan.advance();
+        assert_eq!(scan.done, 1);
+    }
 
     // Reference spans from the same model read by ONNX Runtime; texts and values are synthetic.
     #[test]
@@ -504,6 +520,10 @@ impl Scan {
         }
     }
 
+    fn track(&mut self, tracking: bool) {
+        self.tracking = tracking;
+    }
+
     fn classified(&mut self) {
         if self.tracking && self.progress.is_none() {
             let progress = Progress::start(false, self.total);
@@ -513,6 +533,9 @@ impl Scan {
     }
 
     fn advance(&mut self) {
+        if !self.tracking {
+            return;
+        }
         self.done += 1;
         if let Some(progress) = &self.progress {
             progress.advance(self.done);
@@ -520,19 +543,42 @@ impl Scan {
     }
 }
 
-pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) -> Result<()> {
+pub(crate) fn mask_input(
+    redactor: &Redactor,
+    input: &mut ModelRequestInput,
+    history: &[String],
+) -> Result<()> {
     redactor.ensure()?;
-    let total = (input.segments.len() + input.messages.len()) as u64;
+    let history = history.iter().map(String::as_str).collect::<HashSet<_>>();
+    let total = input
+        .segment_origins
+        .iter()
+        .take(input.segments.len())
+        .chain(input.message_origins.iter().take(input.messages.len()))
+        .filter(|origin| history.contains(origin.as_str()))
+        .count() as u64;
     let mut scan = Scan::start(total);
-    for segment in &mut input.segments {
+    for (index, segment) in input.segments.iter_mut().enumerate() {
+        scan.track(origin_is_history(
+            input.segment_origins.get(index),
+            &history,
+        ));
         segment.text = mask_text(redactor, &segment.text, &mut scan)?;
         scan.advance();
     }
-    for message in &mut input.messages {
+    for (index, message) in input.messages.iter_mut().enumerate() {
+        scan.track(origin_is_history(
+            input.message_origins.get(index),
+            &history,
+        ));
         mask_parts(redactor, &mut message.content, &mut scan)?;
         scan.advance();
     }
     Ok(())
+}
+
+fn origin_is_history(origin: Option<&String>, history: &HashSet<&str>) -> bool {
+    origin.is_some_and(|origin| history.contains(origin.as_str()))
 }
 
 fn mask_text(redactor: &Redactor, text: &str, scan: &mut Scan) -> Result<String> {
