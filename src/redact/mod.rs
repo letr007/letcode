@@ -298,9 +298,6 @@ impl Redactor {
     }
 
     pub(crate) fn mask(&self, text: &str) -> String {
-        if self.ready().is_none() {
-            self.ensure();
-        }
         let Ok(mut slot) = self.masker.lock() else {
             return text.to_string();
         };

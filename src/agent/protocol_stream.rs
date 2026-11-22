@@ -726,8 +726,18 @@ where
             &tools,
         )
         .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
-        if let Some(redactor) = crate::redact::active() {
-            crate::redact::mask_input(redactor, &mut input);
+        if let Some(redactor) = crate::redact::active().cloned() {
+            input = tokio::task::spawn_blocking(move || {
+                crate::redact::mask_input(&redactor, &mut input);
+                input
+            })
+            .await
+            .map_err(|error| {
+                runtime_failure(
+                    crate::model_runtime::FailurePhase::Prepare,
+                    anyhow::anyhow!("masking task failed: {error}"),
+                )
+            })?;
         }
         let planned_observation = self.agent.preview_final_logical_request(&prepared.build);
         let telemetry = llm_request_telemetry(
