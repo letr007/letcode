@@ -6,7 +6,6 @@ mod masker;
 mod onnx;
 mod rules;
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
@@ -295,7 +294,10 @@ mod tests {
         let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
             return;
         };
-        let key = std::env::temp_dir().join(format!("letcode-redact-key-{}", std::process::id()));
+        let cache_dir =
+            std::env::temp_dir().join(format!("letcode-redact-key-{}", std::process::id()));
+        std::fs::create_dir_all(&cache_dir).expect("the temp dir is created");
+        let key = cache_dir.join("key");
         let _ = std::fs::remove_file(&key);
         let mut masker = masker::Masker::open(Path::new(&dir), &key).expect("the masker opens");
         let text = "联系张伟 13812345678，邮箱 zhangwei@example.com，key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
@@ -313,7 +315,52 @@ mod tests {
         let (cached, classified) = masker.mask_tracked(text).expect("cached masking runs");
         assert!(!classified);
         assert_eq!(cached, masked);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn masks_history_and_current_messages() {
+        use crate::model_runtime::{MessageRole, ModelMessage};
+
+        let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
+            return;
+        };
+        let cache_dir =
+            std::env::temp_dir().join(format!("letcode-redact-input-{}", std::process::id()));
+        std::fs::create_dir_all(&cache_dir).expect("the temp dir is created");
+        let key = cache_dir.join("key");
         let _ = std::fs::remove_file(&key);
+        let masker = masker::Masker::open(Path::new(&dir), &key).expect("the masker opens");
+        let redactor = Redactor {
+            dir: PathBuf::from(&dir),
+            key: key.clone(),
+            masker: Mutex::new(Some(masker)),
+            init: Mutex::new(()),
+        };
+        let history = "联系张伟 13812345678";
+        let current = "邮箱 zhangwei@example.com";
+        let mut input = ModelRequestInput::new(
+            "test",
+            vec![
+                ModelMessage::text(MessageRole::User, history),
+                ModelMessage::text(MessageRole::Assistant, "收到"),
+                ModelMessage::text(MessageRole::User, current),
+            ],
+        );
+        mask_input(&redactor, &mut input).expect("masking runs");
+        let texts: Vec<&str> = input
+            .messages
+            .iter()
+            .map(|message| match message.content.first() {
+                Some(ContentPart::Text(text)) => text.as_str(),
+                _ => panic!("text message"),
+            })
+            .collect();
+        assert!(!texts[0].contains("张伟"));
+        assert!(!texts[0].contains("13812345678"));
+        assert!(!texts[2].contains("zhangwei@example.com"));
+        assert_eq!(redactor.restore(texts[0]), history);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[derive(serde::Deserialize)]
@@ -478,33 +525,12 @@ pub(crate) fn active() -> Option<Arc<Redactor>> {
         .and_then(|slot| slot.as_ref().map(|(_, _, redactor)| Arc::clone(redactor)))
 }
 
-pub(crate) fn mask_input(
-    redactor: &Redactor,
-    input: &mut ModelRequestInput,
-    tracked: &[String],
-) -> Result<()> {
-    if tracked.is_empty() {
-        return Ok(());
-    }
+pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) -> Result<()> {
     redactor.ensure()?;
-    let tracked = tracked.iter().map(String::as_str).collect::<HashSet<_>>();
-    for (index, segment) in input.segments.iter_mut().enumerate() {
-        if !is_tracked(input.segment_origins.get(index), &tracked) {
-            continue;
-        }
-        segment.text = mask_text(redactor, &segment.text)?;
-    }
-    for (index, message) in input.messages.iter_mut().enumerate() {
-        if !is_tracked(input.message_origins.get(index), &tracked) {
-            continue;
-        }
+    for message in &mut input.messages {
         mask_parts(redactor, &mut message.content)?;
     }
     Ok(())
-}
-
-fn is_tracked(origin: Option<&String>, tracked: &HashSet<&str>) -> bool {
-    origin.is_some_and(|origin| tracked.contains(origin.as_str()))
 }
 
 fn mask_text(redactor: &Redactor, text: &str) -> Result<String> {

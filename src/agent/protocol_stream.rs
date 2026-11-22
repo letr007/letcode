@@ -693,14 +693,6 @@ where
     }
 }
 
-fn current_turn_origins(plan: &crate::request_builder::prompt_plan::PromptPlan) -> Vec<String> {
-    plan.segments
-        .iter()
-        .filter(|segment| segment.protection.current_turn)
-        .map(|segment| segment.id.clone())
-        .collect()
-}
-
 #[async_trait::async_trait]
 impl<'a, F, E, A, Dfut, Efut, Afut> TurnDriver for ResolvedTurnDriver<'a, F, E, A>
 where
@@ -735,9 +727,8 @@ where
         )
         .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
         if let Some(redactor) = crate::redact::active() {
-            let tracked = current_turn_origins(&prepared.build.prompt_plan);
             let masked = tokio::task::spawn_blocking(move || {
-                crate::redact::mask_input(&redactor, &mut input, &tracked)?;
+                crate::redact::mask_input(&redactor, &mut input)?;
                 Ok::<_, anyhow::Error>(input)
             })
             .await
@@ -1870,7 +1861,7 @@ pub(super) fn prepare_resolved_oneshot_request(
     // that will actually be sent.
     input.generation.structured_output = structured_output.cloned();
     if let Some(redactor) = crate::redact::active() {
-        crate::redact::mask_input(&redactor, &mut input, &[])?;
+        crate::redact::mask_input(&redactor, &mut input)?;
     }
     route
         .binding
@@ -1966,7 +1957,7 @@ pub(super) fn prepare_oneshot_http_request(
     let mut input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
     if let Some(redactor) = crate::redact::active() {
-        crate::redact::mask_input(&redactor, &mut input, &[])?;
+        crate::redact::mask_input(&redactor, &mut input)?;
     }
     decorate_oneshot_request(route, &input, decorator)
 }

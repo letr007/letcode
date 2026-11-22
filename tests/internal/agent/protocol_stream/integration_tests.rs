@@ -222,33 +222,3 @@ async fn rejecting_an_incomplete_tool_batch_keeps_a_reasoning_only_turn_out_of_h
         .collect::<Vec<_>>();
     assert_eq!(cancelled, vec!["call-explore".to_string()]);
 }
-
-#[test]
-fn current_turn_origins_skip_prelude_and_history() {
-    let prelude = [
-        crate::request_builder::PromptMessage::system("system"),
-        crate::request_builder::PromptMessage::developer("developer"),
-    ];
-    let frames = crate::protocol_frames::history_items_to_frames(&[
-        crate::request_builder::HistoryItem::user("older question"),
-        crate::request_builder::HistoryItem::assistant("older answer"),
-        crate::request_builder::HistoryItem::user("current question"),
-    ]);
-    let plan = crate::request_builder::prompt_plan::build_prompt_plan(
-        crate::request_builder::prompt_plan::PromptPlanBuildInput {
-            model_id: "model",
-            prelude: &prelude,
-            snapshot: &crate::runtime_context::RuntimeSnapshot::new("test"),
-            selected_frames: &frames,
-            segment_order_offset: 0,
-            protected_suffix_len: 1,
-            evidence_message: None,
-            selected_evidence_ids: &[],
-        },
-    );
-
-    assert_eq!(
-        current_turn_origins(&plan),
-        vec![plan.segments[4].id.clone()]
-    );
-}
