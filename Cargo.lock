@@ -2215,6 +2215,7 @@ dependencies = [
  "dotenvy",
  "fs4",
  "futures-util",
+ "getrandom 0.3.4",
  "httpdate",
  "image",
  "indexmap 2.14.0",

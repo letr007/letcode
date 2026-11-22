@@ -1,22 +1,13 @@
-//! The initializers of an ONNX tensor graph, read without a protobuf runtime.
-//!
-//! Only what this crate needs: tensor names, shapes, types and values, either
-//! inline (raw bytes or a typed array) or from the model's external data file,
-//! and the ops with their names and inputs, so the weights of each fused node
-//! can be found by position.
-
 use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
 pub(crate) struct Tensor {
-    pub(crate) dims: Vec<usize>,
     pub(crate) dtype: i32,
     values: Values,
 }
 
-/// A tensor's numbers, kept as the file has them.
 enum Values {
     Raw(Vec<u8>),
     Floats(Vec<f32>),
@@ -154,7 +145,6 @@ fn parse_graph(data: &[u8], dir: &Path, graph: &mut Graph) -> Result<()> {
         graph.tensors.insert(
             t.name,
             Tensor {
-                dims: t.dims,
                 dtype: t.dtype,
                 values: t.values,
             },
@@ -165,7 +155,6 @@ fn parse_graph(data: &[u8], dir: &Path, graph: &mut Graph) -> Result<()> {
 
 struct RawTensor {
     name: String,
-    dims: Vec<usize>,
     dtype: i32,
     values: Values,
     external: Option<Vec<(String, String)>>,
@@ -223,7 +212,6 @@ fn parse_tensor(data: &[u8]) -> Result<RawTensor> {
     };
     Ok(RawTensor {
         name,
-        dims,
         dtype,
         values,
         external,

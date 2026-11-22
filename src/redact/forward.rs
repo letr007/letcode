@@ -1,11 +1,5 @@
-//! The guard model's forward pass: a 12-layer, 384-wide int8 BERT encoder with
-//! a token-classification head.
-//!
-//! The exported graph uses Microsoft's fused ops (`QAttention`,
-//! `SkipLayerNormalization`, `BiasGelu`), so the weights are read by the name
-//! of the node that owns them and the arithmetic is written out here: the
-//! quantized products in [`crate::redact::kernels`], everything else in f32.
-
+// The export fuses attention, skip-layer normalization and bias GELU into
+// Microsoft contrib ops, so each one is written out here instead.
 use anyhow::{Context, Result, bail};
 
 use super::kernels::{QMatrix, quantize_into, threads};
@@ -130,7 +124,6 @@ impl Weights {
         })
     }
 
-    /// Tag probabilities for every token of one window, `[tokens][CLASSES]`.
     pub(crate) fn logits(&self, ids: &[usize], types: &[usize]) -> Result<Vec<f32>> {
         let n = ids.len();
         let mut h = vec![0f32; n * HIDDEN];
@@ -292,12 +285,11 @@ fn normalize(row: &mut [f32], gamma: &[f32], beta: &[f32]) {
     }
 }
 
-/// The exact GELU `BiasGelu` applies, through the error function.
 fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + erf(x * std::f32::consts::FRAC_1_SQRT_2))
 }
 
-/// Abramowitz and Stegun 7.1.26, whose error is under 1.5e-7.
+// Abramowitz and Stegun 7.1.26, error under 1.5e-7.
 fn erf(x: f32) -> f32 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
@@ -366,8 +358,6 @@ fn attention(qkv: &[f32], n: usize, out: &mut [f32]) {
     });
 }
 
-/// The dot product of two 32-float head slices, eight lanes at a time.
-///
 /// # Safety
 /// `a` and `b` must each be readable for `HEAD_DIM` floats.
 #[inline]

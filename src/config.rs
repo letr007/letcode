@@ -323,6 +323,7 @@ impl AppConfig {
                 )?,
             ),
             submit_while_running: raw_global.submit_while_running.unwrap_or_default(),
+            redact: raw_global.redact.unwrap_or(true),
             compaction,
             retry: build_retry_config(raw_global.retry.unwrap_or_default(), "global.retry")?,
             session_archive: build_session_archive_config(
@@ -586,6 +587,8 @@ pub struct GlobalConfig {
     pub sessions_dir: PathBuf,
     pub log_file: PathBuf,
     pub submit_while_running: SubmitWhileRunning,
+    /// Whether requests to model providers are masked before they leave.
+    pub redact: bool,
     pub compaction: CompactionConfig,
     pub retry: RetryConfig,
     pub session_archive: SessionArchiveConfig,
@@ -953,6 +956,7 @@ struct RawGlobalConfig {
     sessions_dir: Option<String>,
     log_file: Option<String>,
     submit_while_running: Option<SubmitWhileRunning>,
+    redact: Option<bool>,
     compaction: Option<RawCompactionConfig>,
     retry: Option<RawRetryConfig>,
     session_archive: Option<RawSessionArchiveConfig>,

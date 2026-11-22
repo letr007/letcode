@@ -32,7 +32,6 @@ mod peer;
 mod permission;
 mod project_memory;
 mod protocol_frames;
-#[allow(dead_code)]
 mod redact;
 mod request_builder;
 mod runtime_context;
@@ -120,6 +119,7 @@ async fn main() -> Result<()> {
         Err(error) => return Err(error),
     };
     let _tracing_guards = init_tracing(&config.global.log_file);
+    redact::install(config.global.redact, &config.config_dir);
 
     let (active_provider_name, active_provider) = config.active_provider();
     let active_route = config.active_route();

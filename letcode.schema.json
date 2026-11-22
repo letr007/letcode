@@ -66,6 +66,11 @@
           "default": "logs/combined.log",
           "description": "Runtime log file, resolved relative to the configuration directory."
         },
+        "redact": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mask secrets and personal data in requests to model providers before they are sent, and put the values back in the replies. Local detection: nothing is sent anywhere for it."
+        },
         "submit_while_running": {
           "type": "string",
           "enum": [

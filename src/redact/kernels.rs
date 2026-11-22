@@ -1,28 +1,9 @@
-//! Quantized matrix products for the guard model.
-//!
-//! The model is int8 with a scale and a zero point per column, and its
-//! activations are quantized to uint8 over their own range before every
-//! product (`DynamicQuantizeLinear`). A product here is therefore
-//! `sum((a - azp) * (w - wzp))`, kept in i32, and scaled back by
-//! `a_scale * w_scale[c]`.
-//!
-//! The x86 kernels are AVX2. VNNI is left out on purpose: on a hybrid Intel
-//! CPU `is_x86_feature_detected!` reports what the performance cores support,
-//! and a thread scheduled onto an efficiency core that lacks VNNI dies with
-//! SIGILL. AVX2 is on every core.
-//!
-//! The aarch64 kernels (NEON `sdot`) go behind the same functions and are
-//! written on a Mac; until then the scalar path runs there.
-
 use anyhow::{Result, bail};
 
-/// A matrix of int8 weights, quantized per column, as the model stores them.
 pub(crate) struct QMatrix {
     pub(crate) k: usize,
     pub(crate) cols: usize,
     w: Vec<i8>,
-    /// The weights interleaved for `madd`: eight columns of two k rows per 16
-    /// bytes, so one load feeds one multiply-add.
     blocked: Vec<i8>,
     k_pairs: usize,
     pub(crate) scale: Vec<f32>,
@@ -80,7 +61,6 @@ impl QMatrix {
         })
     }
 
-    /// `out[r, c] = sum_k (a[r,k] - azp) * (w[k,c] - zp[c]) * a_scale * scale[c] + bias[c]`
     pub(crate) fn gemm(
         &self,
         a: &[u8],
@@ -120,6 +100,8 @@ impl QMatrix {
         });
     }
 
+    // VNNI would double this, but on a hybrid Intel CPU a thread scheduled onto
+    // an efficiency core dies with SIGILL; AVX2 is on every core.
     fn kernel(&self, a: &[u8], out: &mut [i32]) {
         #[cfg(target_arch = "x86_64")]
         {
@@ -191,16 +173,12 @@ impl QMatrix {
     }
 }
 
-/// How many threads work over `rows` rows: half the cores, at most sixteen,
-/// one per 32 rows, so a short request does not pay for threads it cannot fill.
 pub(crate) fn threads(rows: usize) -> usize {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     (cores / 2).clamp(1, 8).min((rows / 32).max(1))
 }
 
-/// Quantizes `x` over its own range, as `DynamicQuantizeLinear` does: the scale
-/// covers the range through zero, the zero point is rounded half to even and
-/// clamped to 0..=255.
+// Scale covers the range through zero; the zero point rounds half to even.
 pub(crate) fn quantize_into(out: &mut Vec<u8>, x: &[f32]) -> (f32, i32) {
     let mut min = 0.0f32;
     let mut max = 0.0f32;

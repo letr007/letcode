@@ -302,6 +302,7 @@ where
         reconciled_async_tool_ids: BTreeSet::new(),
         attempt_assistant_persisted: false,
         user_handoff: false,
+        restore_carry: String::new(),
     };
     TurnOrchestrator::new(runtime, limits)
         .run(&route, &mut driver)
@@ -363,6 +364,7 @@ struct ResolvedTurnDriver<'a, F, E, A> {
     count_recovered_tool_calls: bool,
     reconciled_async_tool_ids: BTreeSet<String>,
     attempt_assistant_persisted: bool,
+    restore_carry: String,
 }
 
 impl<'a, F, E, A, Dfut, Efut, Afut> ResolvedTurnDriver<'a, F, E, A>
@@ -374,6 +376,21 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
+    fn restore_text(&mut self, delta: &str) -> String {
+        let Some(redactor) = crate::redact::active() else {
+            return delta.to_string();
+        };
+        let mut buffer = std::mem::take(&mut self.restore_carry);
+        buffer.push_str(delta);
+        // A placeholder may arrive in two deltas; hold its tail until the
+        // closing braces show up.
+        if let Some(open) = buffer.rfind("{{")
+            && !buffer[open..].contains("}}")
+        {
+            self.restore_carry = buffer.split_off(open);
+        }
+        redactor.restore(&buffer)
+    }
     async fn observe_async_tool_done(
         &mut self,
         id: &str,
@@ -719,13 +736,16 @@ where
         .await
         .map_err(preparation_failure)?;
         self.protected_start_index = prepared.protected_start_index;
-        let input = model_request_from_prompt_plan(
+        let mut input = model_request_from_prompt_plan(
             &self.route,
             &self.agent.active_model_metadata(),
             &prepared.build.prompt_plan,
             &tools,
         )
         .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
+        if let Some(redactor) = crate::redact::active() {
+            crate::redact::mask_input(redactor, &mut input);
+        }
         let planned_observation = self.agent.preview_final_logical_request(&prepared.build);
         let telemetry = llm_request_telemetry(
             &format!("turn-{}-iteration-{iteration}", self.agent.turn.turn_id),
@@ -1008,19 +1028,21 @@ where
     async fn observe_event(&mut self, event: &ModelEvent) -> std::result::Result<(), ModelFailure> {
         match event {
             ModelEvent::TextDelta { text } => {
-                (self.on_delta)(text).await.map_err(|error| {
+                let text = self.restore_text(text);
+                (self.on_delta)(&text).await.map_err(|error| {
                     runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
                 })?;
-                self.final_text.push_str(text);
+                self.final_text.push_str(&text);
             }
             ModelEvent::ReasoningDelta { item_id, text } => {
+                let text = self.restore_text(text);
                 self.reasoning_text
                     .entry(item_id.clone())
                     .or_default()
-                    .push_str(text);
+                    .push_str(&text);
                 (self.on_event)(AgentEvent::ReasoningDelta {
                     item_id: item_id.clone(),
-                    delta: text.clone(),
+                    delta: text,
                 })
                 .await
                 .map_err(|error| {
@@ -1090,7 +1112,11 @@ where
                 name,
                 arguments,
             } => {
-                self.observe_async_tool_done(id, name, arguments).await?;
+                let mut arguments = arguments.clone();
+                if let Some(redactor) = crate::redact::active() {
+                    crate::redact::restore_value(redactor, &mut arguments);
+                }
+                self.observe_async_tool_done(id, name, &arguments).await?;
             }
             ModelEvent::Usage {
                 input_tokens,
@@ -1844,6 +1870,9 @@ pub(super) fn prepare_resolved_oneshot_request(
     // Set before the binding preflight so the preflight validates the request
     // that will actually be sent.
     input.generation.structured_output = structured_output.cloned();
+    if let Some(redactor) = crate::redact::active() {
+        crate::redact::mask_input(redactor, &mut input);
+    }
     route
         .binding
         .prepare_request(&input)

@@ -1,12 +1,7 @@
-//! Local detection of secrets and personal data for outbound model requests.
-//!
-//! The model is AstrLink Guard, an int8 token classifier for Chinese and
-//! English text (Apache-2.0, `QuantumNous/astrlink-guard`). Its forward pass is
-//! [`forward`], its quantized products are [`kernels`], and its file is read by
-//! [`onnx`]. Detection is local: nothing here opens a socket.
-
+mod fetch;
 mod forward;
 mod kernels;
+mod masker;
 mod onnx;
 
 use std::path::Path;
@@ -14,7 +9,6 @@ use std::path::Path;
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-/// The guard's BIO tags, by output index, as the model's `config.json` has them.
 pub(crate) const LABELS: [&str; 21] = [
     "O",
     "B-email",
@@ -39,16 +33,13 @@ pub(crate) const LABELS: [&str; 21] = [
     "I-private_person",
 ];
 
-/// The fewest tokens of a window the classifier reads besides `<s>`/`</s>`,
-/// and how many tokens two windows share.
 const MAX_POS: usize = 512;
 const OVERLAP: usize = 128;
 const WINDOW: usize = MAX_POS - 2;
 
-/// The score under which a span is dropped, the model's recommended minimum.
+// The model's recommended minimum.
 pub(crate) const MIN_SCORE: f32 = 0.8;
 
-/// A span the model found in a text, with byte offsets into it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Span {
     pub(crate) start: usize,
@@ -63,8 +54,6 @@ pub(crate) struct Model {
 }
 
 impl Model {
-    /// Reads the model in `dir`: `model_int8.onnx`, its external data beside it,
-    /// and `tokenizer.json`. Nothing is downloaded here.
     pub(crate) fn load(dir: &Path) -> Result<Self> {
         let graph = onnx::read(&dir.join("model_int8.onnx"))?;
         let weights = forward::Weights::load(&graph)?;
@@ -73,7 +62,6 @@ impl Model {
         Ok(Self { weights, tokenizer })
     }
 
-    /// Every span above [`MIN_SCORE`] in `text`.
     pub(crate) fn detect(&self, text: &str) -> Result<Vec<Span>> {
         let encoding = self
             .tokenizer
@@ -171,8 +159,7 @@ fn argmax(row: &[f32]) -> (usize, f32) {
 mod tests {
     use super::*;
 
-    /// The reference spans came from the same model read by ONNX Runtime, at
-    /// the same threshold. These texts are synthetic; the values are made up.
+    // Reference spans from the same model read by ONNX Runtime; texts and values are synthetic.
     #[test]
     fn matches_the_reference_spans() {
         let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
@@ -220,5 +207,151 @@ mod tests {
         kind: String,
         text: String,
         score: f32,
+    }
+}
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::model_runtime::{ContentPart, ModelRequestInput};
+use masker::Masker;
+
+pub(crate) struct Redactor {
+    dir: PathBuf,
+    key: PathBuf,
+    masker: Mutex<Option<Masker>>,
+    fetching: AtomicBool,
+}
+
+impl Redactor {
+    fn new(config_dir: &Path) -> Arc<Self> {
+        let redactor = Arc::new(Self {
+            dir: config_dir.join("models").join("astrlink-guard"),
+            key: masker::key_path(config_dir),
+            masker: Mutex::new(None),
+            fetching: AtomicBool::new(false),
+        });
+        let worker = Arc::clone(&redactor);
+        std::thread::spawn(move || worker.ensure());
+        redactor
+    }
+
+    pub(crate) fn mask(&self, text: &str) -> String {
+        if self.ready().is_none() {
+            self.ensure();
+        }
+        let Ok(mut slot) = self.masker.lock() else {
+            return text.to_string();
+        };
+        match slot.as_mut() {
+            Some(masker) => masker.mask(text).unwrap_or_else(|_| text.to_string()),
+            None => text.to_string(),
+        }
+    }
+
+    pub(crate) fn restore(&self, text: &str) -> String {
+        match self.masker.lock() {
+            Ok(slot) => slot
+                .as_ref()
+                .map_or_else(|| text.to_string(), |m| m.restore(text)),
+            Err(_) => text.to_string(),
+        }
+    }
+
+    fn ready(&self) -> Option<()> {
+        self.masker
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|_| ()))
+    }
+
+    fn ensure(&self) {
+        if self.ready().is_some() {
+            return;
+        }
+        if !fetch::present(&self.dir) {
+            if self.fetching.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            if let Err(error) = fetch::fetch_missing(&self.dir) {
+                tracing::warn!("masking model unavailable: {error}");
+            }
+            self.fetching.store(false, Ordering::SeqCst);
+        }
+        let Ok(mut slot) = self.masker.lock() else {
+            return;
+        };
+        if slot.is_none() {
+            match Masker::open(&self.dir, &self.key) {
+                Ok(masker) => *slot = Some(masker),
+                Err(error) => tracing::warn!("masking model did not load: {error}"),
+            }
+        }
+    }
+}
+
+static ACTIVE: OnceLock<Option<Arc<Redactor>>> = OnceLock::new();
+
+pub(crate) fn install(enabled: bool, config_dir: &Path) {
+    let _ = ACTIVE.set(enabled.then(|| Redactor::new(config_dir)));
+}
+
+pub(crate) fn active() -> Option<&'static Arc<Redactor>> {
+    ACTIVE.get().and_then(Option::as_ref)
+}
+
+pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) {
+    for segment in &mut input.segments {
+        segment.text = redactor.mask(&segment.text);
+    }
+    for message in &mut input.messages {
+        mask_parts(redactor, &mut message.content);
+    }
+}
+
+fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart]) {
+    for part in parts {
+        match part {
+            ContentPart::Text(text) => *text = redactor.mask(text),
+            ContentPart::Reasoning { text, .. } => *text = redactor.mask(text),
+            ContentPart::ToolCall { arguments, .. } => mask_value(redactor, arguments),
+            ContentPart::ToolResult { content, .. } => mask_parts(redactor, content),
+            ContentPart::Image { .. } => {}
+        }
+    }
+}
+
+pub(crate) fn mask_value(redactor: &Redactor, value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = redactor.mask(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                mask_value(redactor, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                mask_value(redactor, item);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn restore_value(redactor: &Redactor, value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = redactor.restore(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                restore_value(redactor, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                restore_value(redactor, item);
+            }
+        }
+        _ => {}
     }
 }

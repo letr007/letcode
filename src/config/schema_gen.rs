@@ -202,6 +202,10 @@ fn targets() -> Result<Vec<Target>> {
             )),
         },
         Target {
+            pointer: &["definitions", "global", "properties", "redact"],
+            injection: Injection::Default(json!(true)),
+        },
+        Target {
             pointer: &["definitions", "global", "properties", "tool_timeout_secs"],
             injection: Injection::Default(json!(super::DEFAULT_TOOL_TIMEOUT_SECS)),
         },
