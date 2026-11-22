@@ -338,7 +338,9 @@ impl Redactor {
             return Ok(());
         }
         if !fetch::present(&self.dir) {
-            fetch::fetch_missing(&self.dir)?;
+            let fetched = fetch::fetch_missing(&self.dir);
+            set_preparing(None);
+            fetched?;
         }
         let masker = Masker::open(&self.dir, &self.key)?;
         *self
@@ -346,6 +348,18 @@ impl Redactor {
             .lock()
             .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))? = Some(masker);
         Ok(())
+    }
+}
+
+static PREPARING: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+pub(crate) fn preparing() -> Option<(u64, u64)> {
+    PREPARING.lock().ok().and_then(|state| *state)
+}
+
+pub(crate) fn set_preparing(value: Option<(u64, u64)>) {
+    if let Ok(mut state) = PREPARING.lock() {
+        *state = value;
     }
 }
 
