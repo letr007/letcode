@@ -1,11 +1,24 @@
 use anyhow::{Result, bail};
 
+#[cfg(target_arch = "x86_64")]
+const TILE_COLS: usize = 8;
+#[cfg(target_arch = "x86_64")]
+const TILE_ROWS: usize = 2;
+
+#[cfg(target_arch = "aarch64")]
+const TILE_COLS: usize = 4;
+#[cfg(target_arch = "aarch64")]
+const TILE_ROWS: usize = 4;
+
 pub(crate) struct QMatrix {
     pub(crate) k: usize,
     pub(crate) cols: usize,
+    #[cfg(any(not(target_arch = "aarch64"), test))]
     w: Vec<i8>,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     blocked: Vec<i8>,
-    k_pairs: usize,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    k_groups: usize,
     pub(crate) scale: Vec<f32>,
     pub(crate) zp: Vec<i32>,
     col_sum: Vec<i32>,
@@ -33,17 +46,20 @@ impl QMatrix {
                 *sum += i32::from(w[row * cols + c]);
             }
         }
-        let k_pairs = k.div_ceil(2);
-        let mut blocked = vec![0i8; cols.div_ceil(8) * k_pairs * 16];
-        for tile in 0..cols.div_ceil(8) {
-            for pair in 0..k_pairs {
-                let base = (tile * k_pairs + pair) * 16;
-                for c in 0..8 {
-                    let col = tile * 8 + c;
-                    for half in 0..2 {
-                        let row = pair * 2 + half;
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let k_groups = k.div_ceil(TILE_ROWS);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let mut blocked = vec![0i8; cols.div_ceil(TILE_COLS) * k_groups * TILE_COLS * TILE_ROWS];
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        for tile in 0..cols.div_ceil(TILE_COLS) {
+            for group in 0..k_groups {
+                let base = (tile * k_groups + group) * TILE_COLS * TILE_ROWS;
+                for c in 0..TILE_COLS {
+                    let col = tile * TILE_COLS + c;
+                    for r in 0..TILE_ROWS {
+                        let row = group * TILE_ROWS + r;
                         if col < cols && row < k {
-                            blocked[base + c * 2 + half] = w[row * cols + col];
+                            blocked[base + c * TILE_ROWS + r] = w[row * cols + col];
                         }
                     }
                 }
@@ -52,9 +68,12 @@ impl QMatrix {
         Ok(Self {
             k,
             cols,
+            #[cfg(any(not(target_arch = "aarch64"), test))]
             w,
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             blocked,
-            k_pairs,
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            k_groups,
             scale,
             zp,
             col_sum,
@@ -111,10 +130,24 @@ impl QMatrix {
                 unsafe { self.kernel_avx2(a, out) };
                 return;
             }
+            self.kernel_scalar(a, out);
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                // SAFETY: dotprod is present, and the blocked layout holds one
+                // 16-byte group per (tile, k group).
+                unsafe { self.kernel_dotprod(a, out) };
+            } else {
+                // SAFETY: NEON is part of the aarch64 baseline.
+                unsafe { self.kernel_neon(a, out) };
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         self.kernel_scalar(a, out);
     }
 
+    #[cfg(any(not(target_arch = "aarch64"), test))]
     fn kernel_scalar(&self, a: &[u8], out: &mut [i32]) {
         for (c, slot) in out.iter_mut().enumerate() {
             let mut acc = 0i32;
@@ -139,7 +172,7 @@ impl QMatrix {
             // SAFETY: the blocked layout holds one 16-byte group per
             // (tile, k-pair), and `a` has `k` values.
             unsafe {
-                for pair in 0..self.k_pairs {
+                for pair in 0..self.k_groups {
                     let row = pair * 2;
                     let lo = i32::from(*a.get_unchecked(row));
                     let hi = if row + 1 < self.k {
@@ -151,7 +184,7 @@ impl QMatrix {
                     // are interleaved the same way, so `madd` sums a k pair.
                     let av = _mm256_set1_epi32(lo | (hi << 16));
                     for (g, slot) in acc.iter_mut().enumerate().take(group) {
-                        let base = ((tile + g) * self.k_pairs + pair) * 16;
+                        let base = ((tile + g) * self.k_groups + pair) * 16;
                         let w = _mm_loadu_si128(self.blocked.as_ptr().add(base).cast());
                         *slot =
                             _mm256_add_epi32(*slot, _mm256_madd_epi16(av, _mm256_cvtepi8_epi16(w)));
@@ -169,6 +202,123 @@ impl QMatrix {
             tile += 4;
         }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn kernel_neon(&self, a: &[u8], out: &mut [i32]) {
+        use std::arch::aarch64::*;
+
+        let zero = vdupq_n_s32(0);
+        let tiles = self.cols.div_ceil(TILE_COLS);
+        let mut tile = 0;
+        while tile < tiles {
+            let group = (tiles - tile).min(4);
+            let mut acc = [(zero, zero); 4];
+            for k_group in 0..self.k_groups {
+                let start = k_group * TILE_ROWS;
+                let end = (start + TILE_ROWS).min(self.k);
+                let mut bytes = [0u8; 4];
+                bytes[..end - start].copy_from_slice(&a[start..end]);
+                // The activations are uint8 and the multiply is signed, so they
+                // enter centered and the store adds the bias back.
+                let av = vreinterpret_s8_u32(vdup_n_u32(u32::from_le_bytes(bytes) ^ 0x8080_8080));
+                for (g, (lo, hi)) in acc.iter_mut().enumerate().take(group) {
+                    // SAFETY: the blocked layout holds one 16-byte group per
+                    // (tile, k group), and `a` has `k` values.
+                    let w = unsafe {
+                        vld1q_s8(
+                            self.blocked
+                                .as_ptr()
+                                .add(((tile + g) * self.k_groups + k_group) * 16),
+                        )
+                    };
+                    *lo = vpadalq_s16(*lo, vmull_s8(vget_low_s8(w), av));
+                    *hi = vpadalq_s16(*hi, vmull_s8(vget_high_s8(w), av));
+                }
+            }
+            for (g, (lo, hi)) in acc.iter().enumerate().take(group) {
+                let mut sums = [0i32; 4];
+                // SAFETY: `sums` holds four i32, the width of one accumulator pair.
+                unsafe { vst1q_s32(sums.as_mut_ptr(), vpaddq_s32(*lo, *hi)) };
+                let col = (tile + g) * TILE_COLS;
+                let n = (self.cols - col).min(TILE_COLS);
+                for c in 0..n {
+                    out[col + c] = sums[c] + 128 * self.col_sum[col + c];
+                }
+            }
+            tile += 4;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn kernel_dotprod(&self, a: &[u8], out: &mut [i32]) {
+        use std::arch::aarch64::*;
+
+        const TILES: usize = 16;
+        let zero = vdupq_n_s32(0);
+        let tiles = self.cols.div_ceil(TILE_COLS);
+        let mut tile = 0;
+        while tile < tiles {
+            let group = (tiles - tile).min(TILES);
+            let mut acc = [zero; TILES];
+            for k_group in 0..self.k_groups {
+                let start = k_group * TILE_ROWS;
+                let end = (start + TILE_ROWS).min(self.k);
+                let mut bytes = [0u8; 4];
+                bytes[..end - start].copy_from_slice(&a[start..end]);
+                // Centered, as in the NEON kernel: the products are signed.
+                let av = vreinterpretq_s8_u32(vdupq_n_u32(u32::from_le_bytes(bytes) ^ 0x8080_8080));
+                for (g, slot) in acc.iter_mut().enumerate().take(group) {
+                    // SAFETY: the blocked layout holds one 16-byte group per
+                    // (tile, k group), and `a` has `k` values.
+                    let w = unsafe {
+                        vld1q_s8(
+                            self.blocked
+                                .as_ptr()
+                                .add(((tile + g) * self.k_groups + k_group) * 16),
+                        )
+                    };
+                    // SAFETY: `kernel_dotprod` carries the dotprod feature.
+                    *slot = unsafe { dot(*slot, av, w) };
+                }
+            }
+            for (g, acc) in acc.iter().enumerate().take(group) {
+                let mut sums = [0i32; 4];
+                // SAFETY: `sums` holds four i32, the width of the accumulator.
+                unsafe { vst1q_s32(sums.as_mut_ptr(), *acc) };
+                let col = (tile + g) * TILE_COLS;
+                let n = (self.cols - col).min(TILE_COLS);
+                for c in 0..n {
+                    out[col + c] = sums[c] + 128 * self.col_sum[col + c];
+                }
+            }
+            tile += TILES;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    w: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut out = acc;
+    // `vdotq_s32` is not stable yet, so the dot product is emitted directly.
+    // SAFETY: the caller carries the dotprod feature; the instruction reads
+    // only its two vector operands and writes the four accumulator lanes.
+    unsafe {
+        std::arch::asm!(
+            "sdot {out:v}.4s, {a:v}.16b, {w:v}.16b",
+            out = inout(vreg) out,
+            a = in(vreg) a,
+            w = in(vreg) w,
+            options(pure, nomem, nostack),
+        );
+    }
+    out
 }
 
 pub(crate) fn threads(rows: usize) -> usize {
@@ -200,4 +350,34 @@ pub(crate) fn quantize_into(out: &mut Vec<u8>, x: &[f32]) -> (f32, i32) {
         q.clamp(0.0, 255.0) as u8
     }));
     (scale, zp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_packed_kernel_matches_the_scalar_one() {
+        let (k, cols) = (18, 21);
+        let mut state = 0x2545_f491u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state % 255) as i32 - 127
+        };
+        let w: Vec<i8> = (0..k * cols).map(|_| next() as i8).collect();
+        let matrix =
+            QMatrix::new(k, cols, w, vec![0.5; cols], vec![0; cols]).expect("the matrix builds");
+        for row in 0..3u8 {
+            let a: Vec<u8> = (0..k)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(row))
+                .collect();
+            let mut want = vec![0i32; cols];
+            matrix.kernel_scalar(&a, &mut want);
+            let mut got = vec![0i32; cols];
+            matrix.kernel(&a, &mut got);
+            assert_eq!(want, got);
+        }
+    }
 }
