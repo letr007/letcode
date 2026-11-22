@@ -7206,6 +7206,16 @@ fn open_editable_config() -> (TuiRuntime, std::path::PathBuf) {
     (runtime, path)
 }
 
+#[test]
+fn redact_switch_updates_the_config_file() {
+    let (runtime, path) = runtime_with_config_path(EDITABLE_CONFIG);
+    runtime
+        .persist_redact_switch(false)
+        .expect("persist redact");
+    let text = std::fs::read_to_string(&path).expect("read config");
+    assert!(text.contains("redact = false"));
+}
+
 fn toggle_config_retry(runtime: &mut TuiRuntime) {
     search_config(runtime, "enabled");
     runtime

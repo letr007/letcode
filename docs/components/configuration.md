@@ -81,7 +81,7 @@ submit_while_running = "insert"
 - `submit_while_running`：活动回合中新输入的处理方式，适用于本地提交与跨实例消息。`insert`（默认）在下一个工具批次结束时关闭回合并执行该消息，没有工具批次时在回合结束时执行；`queue` 等当前回合结束后执行。
 - `max_iterations`：单个交互回合内允许的最大循环轮数。省略表示不设限制。
 - `max_tool_calls`：单个交互回合内允许调用的工具总次数。省略表示不设限制。
-- `redact`：默认开启。发往模型供应商的请求在本地把密钥与个人信息换成占位符，回复与工具参数还原。模型未就绪时请求等待。模型放在 `models/astrlink-guard/`，首次使用时下载；key 放在 `redact.key`。
+- `redact`：默认开启。发往模型供应商的请求在本地把密钥与个人信息换成占位符，回复与工具参数还原。模型未就绪时请求等待。模型放在 `models/astrlink-guard/`，首次使用时下载；key 放在 `redact.key`。会话内用 `/redact` 切换。
 
 ### 上下文保留 `[global.compaction]`
 

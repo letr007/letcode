@@ -151,6 +151,7 @@ Changing the mode clears those grants. A new session does not inherit them.
 - `/model` chooses a configured model. `/reasoning` chooses a supported effort.
 - `/thoughts` changes thinking display; `/tools` changes tool-output display.
 - `/panel`, `/scrollbar` and `/theme` adjust the interface.
+- `/redact` toggles request redaction.
 - `/language en` and `/language zh-CN` change the interface language.
 - `/mcp` browses MCP services and tools. `/skill` browses local skills.
 - `/config` opens the configuration editor. Field edits remain a draft until saved.

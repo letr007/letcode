@@ -1030,6 +1030,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::Fake(_) => ReplCommand::Unsupported(
             "CLI does not support /fake; use the TUI to select a fake client.".into(),
         ),
+        CommandIntent::ToggleRedact => ReplCommand::Unsupported(
+            "CLI does not support /redact; use the TUI to switch request redaction.".into(),
+        ),
         CommandIntent::ContextBrowse => ReplCommand::Unsupported(
             "CLI does not support /context yet; use the TUI for context browsing.".into(),
         ),

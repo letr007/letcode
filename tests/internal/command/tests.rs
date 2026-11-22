@@ -77,6 +77,15 @@ fn fast_command_selects_a_service_tier() {
 }
 
 #[test]
+fn toggles_request_redaction() {
+    assert_eq!(parse_command("/redact"), Ok(CommandIntent::ToggleRedact));
+    assert_eq!(
+        parse_command("/redact on"),
+        Err(CommandParseError::new("Usage: /redact"))
+    );
+}
+
+#[test]
 fn rejects_unknown_and_invalid_commands_locally() {
     assert_eq!(
         parse_command("/bogus"),

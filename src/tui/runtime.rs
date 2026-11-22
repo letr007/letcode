@@ -2571,7 +2571,8 @@ impl TuiRuntime {
                 | CommandIntent::PanelSet(_)
                 | CommandIntent::Theme(_)
                 | CommandIntent::Rename(_)
-                | CommandIntent::Fake(_))
+                | CommandIntent::Fake(_)
+                | CommandIntent::ToggleRedact)
         );
         if active_session_turn {
             match active_turn_disposition {
@@ -2798,6 +2799,7 @@ impl TuiRuntime {
             CommandIntent::PermissionShow => self.show_permission_dialog(),
             CommandIntent::Theme(command) => Ok(Some(self.handle_theme_command(command))),
             CommandIntent::Fake(command) => Ok(Some(self.handle_fake_command(command))),
+            CommandIntent::ToggleRedact => Ok(Some(self.handle_redact_command())),
             CommandIntent::TranscriptScrollbarSet(mode) => {
                 Ok(Some(self.handle_transcript_scrollbar_command(mode)))
             }
@@ -3047,6 +3049,29 @@ impl TuiRuntime {
         match command {
             ThemeCommand::Show => self.show_theme_dialog(),
             ThemeCommand::Set(theme) => self.apply_theme_selection(&theme),
+        }
+        SubmittedCommand::LocalOnly
+    }
+
+    fn handle_redact_command(&mut self) -> SubmittedCommand {
+        let enabled = crate::redact::active().is_none();
+        match self.persist_redact_switch(enabled) {
+            Ok(()) => {
+                let key = if enabled {
+                    "runtime.redact_enabled"
+                } else {
+                    "runtime.redact_disabled"
+                };
+                self.state.show_toast(self.state.t(key), ToastKind::Info);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to persist redaction switch");
+                let message = self.state.t_fmt(
+                    "runtime.redact_switch_failed",
+                    &[("error", &format!("{error:#}"))],
+                );
+                self.state.show_toast(message, ToastKind::Error);
+            }
         }
         SubmittedCommand::LocalOnly
     }

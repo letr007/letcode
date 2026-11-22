@@ -673,6 +673,27 @@ impl TuiRuntime {
         }
     }
 
+    pub(super) fn persist_redact_switch(&self, enabled: bool) -> anyhow::Result<()> {
+        let config_path = self
+            .config_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("configuration path is unavailable"))?;
+        let text = std::fs::read_to_string(config_path)?;
+        let mut document = text.parse::<toml_edit::DocumentMut>()?;
+        crate::config::set_config_scalar(
+            &mut document,
+            &["global", "redact"],
+            crate::config::ConfigScalar::Bool(enabled),
+        )?;
+        crate::config::save_config_document(config_path, &document)?;
+        let config_dir = crate::config::resolve_config_target(config_path)?
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| anyhow::anyhow!("configuration file has no directory"))?;
+        crate::redact::install(enabled, &config_dir);
+        Ok(())
+    }
+
     pub(super) fn load_config_draft(&mut self) {
         let text = self
             .config_path

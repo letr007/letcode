@@ -147,6 +147,7 @@ letcode
 - `/model` 选择已配置的模型。`/reasoning` 选择支持的推理强度。
 - `/thoughts` 调整思考显示，`/tools` 调整工具输出显示。
 - `/panel`、`/scrollbar` 和 `/theme` 调整界面。
+- `/redact` 开启或关闭请求脱敏。
 - `/language en` 和 `/language zh-CN` 切换界面语言。
 - `/mcp` 浏览 MCP 服务和工具。`/skill` 浏览本地技能。
 - `/config` 打开配置编辑器。字段修改保存前仍是草稿。

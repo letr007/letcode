@@ -150,6 +150,7 @@ impl SessionCommand {
             | CommandIntent::TranscriptScrollbarSet(_)
             | CommandIntent::PanelSet(_)
             | CommandIntent::Theme(_)
+            | CommandIntent::ToggleRedact
             | CommandIntent::Fake(crate::command::FakeCommand::Show)
             | CommandIntent::ResumeShow
             | CommandIntent::ContextBrowse
