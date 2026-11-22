@@ -693,11 +693,10 @@ where
     }
 }
 
-fn history_segment_origins(plan: &crate::request_builder::prompt_plan::PromptPlan) -> Vec<String> {
+fn current_turn_origins(plan: &crate::request_builder::prompt_plan::PromptPlan) -> Vec<String> {
     plan.segments
         .iter()
-        .filter(|segment| !segment.protection.current_turn)
-        .filter(|segment| segment.source.source_label.as_deref() != Some("prelude"))
+        .filter(|segment| segment.protection.current_turn)
         .map(|segment| segment.id.clone())
         .collect()
 }
@@ -736,9 +735,9 @@ where
         )
         .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
         if let Some(redactor) = crate::redact::active() {
-            let history_origins = history_segment_origins(&prepared.build.prompt_plan);
+            let tracked = current_turn_origins(&prepared.build.prompt_plan);
             let masked = tokio::task::spawn_blocking(move || {
-                crate::redact::mask_input(&redactor, &mut input, &history_origins)?;
+                crate::redact::mask_input(&redactor, &mut input, &tracked)?;
                 Ok::<_, anyhow::Error>(input)
             })
             .await

@@ -1303,16 +1303,3 @@ fn compaction_non_success_and_terminal_events_clear_pending() {
         Some("Context limit reached; earlier context cannot be compacted safely yet.")
     );
 }
-
-#[test]
-fn redact_scan_progress_clears_on_the_first_tick_after_it_finishes() {
-    let mut state = TuiState::default();
-    let progress = crate::redact::Progress::start(false, 2);
-    assert!(state.refresh_live_presentations(std::time::Instant::now()));
-    let toast = state.toast().expect("scan progress toast");
-    assert_eq!(toast.kind, ToastKind::Info);
-    assert_eq!(toast.ticks_remaining(), 1);
-    drop(progress);
-    state.apply_event(SessionEvent::Tick);
-    assert!(state.toast().is_none());
-}

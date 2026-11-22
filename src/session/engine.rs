@@ -1487,7 +1487,12 @@ async fn run_engine_loop(
                 };
                 let command = match idle_operation {
                     IdleSessionOperation::Interrupt => {
-                        subagent_runtime.cancel_active();
+                        cancel_active_subagents(
+                            &transcript,
+                            &subagent_runtime,
+                            &mut background_deliveries,
+                            &session_transport_tx,
+                        );
                         continue;
                     }
                     IdleSessionOperation::Command(command) => command,
@@ -3177,6 +3182,39 @@ pub(crate) fn observe_background_subagent_completion(
         emit_child_terminal(session_transport_tx, &summary.child_session_id);
     }
     true
+}
+
+/// Cancels every active subagent and publishes the terminal of each forced
+/// cancellation, without waiting for the executors' teardown.
+fn cancel_active_subagents(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    subagent_runtime: &SubagentPool,
+    background_deliveries: &mut HashMap<String, BackgroundDelivery>,
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+) {
+    let cancelled = subagent_runtime.cancel_active_forced();
+    if cancelled.is_empty() {
+        return;
+    }
+    let parent_session_id = transcript
+        .lock()
+        .map(|recorder| recorder.session_id().to_string())
+        .unwrap_or_default();
+    for summary in cancelled {
+        // The historian runtime publishes its own terminal.
+        if summary.agent_name == "historian" {
+            continue;
+        }
+        observe_background_subagent_completion(
+            transcript,
+            subagent_runtime,
+            background_deliveries,
+            session_transport_tx,
+            &parent_session_id,
+            None,
+            &Ok(summary),
+        );
+    }
 }
 
 /// Claim a terminal background shell task once; returns whether it is deliverable.

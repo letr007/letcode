@@ -253,21 +253,6 @@ fn argmax(row: &[f32]) -> (usize, f32) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn only_tracked_history_classification_reports_progress() {
-        let mut scan = Scan::start(1);
-        scan.track(false);
-        scan.classified();
-        scan.advance();
-        assert!(scan.progress.is_none());
-
-        scan.track(true);
-        scan.classified();
-        assert!(scan.progress.is_some());
-        scan.advance();
-        assert_eq!(scan.done, 1);
-    }
-
     // Reference spans from the same model read by ONNX Runtime; texts and values are synthetic.
     #[test]
     fn matches_the_reference_spans() {
@@ -424,52 +409,6 @@ impl Redactor {
     }
 }
 
-/// Progress belongs to the work that started it: the token is compared on
-/// every write and on release, so a cancelled turn cannot leave a stale
-/// percentage behind or clear somebody else's.
-static PREPARING: Mutex<Option<(u64, u64, u64, bool)>> = Mutex::new(None);
-static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-pub(crate) fn preparing() -> Option<(u64, u64, bool)> {
-    PREPARING
-        .lock()
-        .ok()
-        .and_then(|state| state.map(|(_, done, total, downloading)| (done, total, downloading)))
-}
-
-pub(crate) struct Progress {
-    token: u64,
-}
-
-impl Progress {
-    pub(crate) fn start(downloading: bool, total: u64) -> Self {
-        let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut state) = PREPARING.lock() {
-            *state = Some((token, 0, total, downloading));
-        }
-        Self { token }
-    }
-
-    pub(crate) fn advance(&self, done: u64) {
-        if let Ok(mut state) = PREPARING.lock()
-            && let Some((token, _, total, downloading)) = *state
-            && token == self.token
-        {
-            *state = Some((token, done, total, downloading));
-        }
-    }
-}
-
-impl Drop for Progress {
-    fn drop(&mut self) {
-        if let Ok(mut state) = PREPARING.lock()
-            && state.is_some_and(|(token, ..)| token == self.token)
-        {
-            *state = None;
-        }
-    }
-}
-
 static ACTIVE: Mutex<Option<(bool, PathBuf, Arc<Redactor>)>> = Mutex::new(None);
 
 /// Applies the switch, including after a configuration reload. A reload that
@@ -494,108 +433,46 @@ pub(crate) fn active() -> Option<Arc<Redactor>> {
         .and_then(|slot| slot.as_ref().map(|(_, _, redactor)| Arc::clone(redactor)))
 }
 
-struct Scan {
-    progress: Option<Progress>,
-    done: u64,
-    total: u64,
-    tracking: bool,
-}
-
-impl Scan {
-    fn start(total: u64) -> Self {
-        Self {
-            progress: None,
-            done: 0,
-            total,
-            tracking: true,
-        }
-    }
-
-    fn silent() -> Self {
-        Self {
-            progress: None,
-            done: 0,
-            total: 0,
-            tracking: false,
-        }
-    }
-
-    fn track(&mut self, tracking: bool) {
-        self.tracking = tracking;
-    }
-
-    fn classified(&mut self) {
-        if self.tracking && self.progress.is_none() {
-            let progress = Progress::start(false, self.total);
-            progress.advance(self.done);
-            self.progress = Some(progress);
-        }
-    }
-
-    fn advance(&mut self) {
-        if !self.tracking {
-            return;
-        }
-        self.done += 1;
-        if let Some(progress) = &self.progress {
-            progress.advance(self.done);
-        }
-    }
-}
-
 pub(crate) fn mask_input(
     redactor: &Redactor,
     input: &mut ModelRequestInput,
-    history: &[String],
+    tracked: &[String],
 ) -> Result<()> {
+    if tracked.is_empty() {
+        return Ok(());
+    }
     redactor.ensure()?;
-    let history = history.iter().map(String::as_str).collect::<HashSet<_>>();
-    let total = input
-        .segment_origins
-        .iter()
-        .take(input.segments.len())
-        .chain(input.message_origins.iter().take(input.messages.len()))
-        .filter(|origin| history.contains(origin.as_str()))
-        .count() as u64;
-    let mut scan = Scan::start(total);
+    let tracked = tracked.iter().map(String::as_str).collect::<HashSet<_>>();
     for (index, segment) in input.segments.iter_mut().enumerate() {
-        scan.track(origin_is_history(
-            input.segment_origins.get(index),
-            &history,
-        ));
-        segment.text = mask_text(redactor, &segment.text, &mut scan)?;
-        scan.advance();
+        if !is_tracked(input.segment_origins.get(index), &tracked) {
+            continue;
+        }
+        segment.text = mask_text(redactor, &segment.text)?;
     }
     for (index, message) in input.messages.iter_mut().enumerate() {
-        scan.track(origin_is_history(
-            input.message_origins.get(index),
-            &history,
-        ));
-        mask_parts(redactor, &mut message.content, &mut scan)?;
-        scan.advance();
+        if !is_tracked(input.message_origins.get(index), &tracked) {
+            continue;
+        }
+        mask_parts(redactor, &mut message.content)?;
     }
     Ok(())
 }
 
-fn origin_is_history(origin: Option<&String>, history: &HashSet<&str>) -> bool {
-    origin.is_some_and(|origin| history.contains(origin.as_str()))
+fn is_tracked(origin: Option<&String>, tracked: &HashSet<&str>) -> bool {
+    origin.is_some_and(|origin| tracked.contains(origin.as_str()))
 }
 
-fn mask_text(redactor: &Redactor, text: &str, scan: &mut Scan) -> Result<String> {
-    let (masked, classified) = redactor.mask_tracked(text)?;
-    if classified {
-        scan.classified();
-    }
-    Ok(masked)
+fn mask_text(redactor: &Redactor, text: &str) -> Result<String> {
+    Ok(redactor.mask_tracked(text)?.0)
 }
 
-fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart], scan: &mut Scan) -> Result<()> {
+fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart]) -> Result<()> {
     for part in parts {
         match part {
-            ContentPart::Text(text) => *text = mask_text(redactor, text, scan)?,
-            ContentPart::Reasoning { text, .. } => *text = mask_text(redactor, text, scan)?,
-            ContentPart::ToolCall { arguments, .. } => mask_value_in(redactor, arguments, scan)?,
-            ContentPart::ToolResult { content, .. } => mask_parts(redactor, content, scan)?,
+            ContentPart::Text(text) => *text = mask_text(redactor, text)?,
+            ContentPart::Reasoning { text, .. } => *text = mask_text(redactor, text)?,
+            ContentPart::ToolCall { arguments, .. } => mask_value_in(redactor, arguments)?,
+            ContentPart::ToolResult { content, .. } => mask_parts(redactor, content)?,
             ContentPart::Image { .. } => {}
         }
     }
@@ -603,24 +480,20 @@ fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart], scan: &mut Scan) -
 }
 
 pub(crate) fn mask_value(redactor: &Redactor, value: &mut serde_json::Value) -> Result<()> {
-    mask_value_in(redactor, value, &mut Scan::silent())
+    mask_value_in(redactor, value)
 }
 
-fn mask_value_in(
-    redactor: &Redactor,
-    value: &mut serde_json::Value,
-    scan: &mut Scan,
-) -> Result<()> {
+fn mask_value_in(redactor: &Redactor, value: &mut serde_json::Value) -> Result<()> {
     match value {
-        serde_json::Value::String(text) => *text = mask_text(redactor, text, scan)?,
+        serde_json::Value::String(text) => *text = mask_text(redactor, text)?,
         serde_json::Value::Array(items) => {
             for item in items {
-                mask_value_in(redactor, item, scan)?;
+                mask_value_in(redactor, item)?;
             }
         }
         serde_json::Value::Object(map) => {
             for item in map.values_mut() {
-                mask_value_in(redactor, item, scan)?;
+                mask_value_in(redactor, item)?;
             }
         }
         _ => {}

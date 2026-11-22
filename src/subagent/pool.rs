@@ -236,7 +236,10 @@ enum RunPathAccess {
 #[derive(Debug)]
 struct ActiveSlot {
     cancel: Option<oneshot::Sender<()>>,
+    abort: Option<tokio::task::AbortHandle>,
     cancellation_requested: bool,
+    finalized: Arc<std::sync::atomic::AtomicBool>,
+    terminal: Option<DropTerminalContext>,
     child: ChildSessionSummary,
     path_access: RunPathAccess,
     takeover_child_session_id: Option<String>,
@@ -256,6 +259,7 @@ struct RunReservation {
     state: Arc<Mutex<SubagentPoolState>>,
     changed: Arc<tokio::sync::Notify>,
     run_id: String,
+    finalized: Arc<std::sync::atomic::AtomicBool>,
     activated: bool,
 }
 
@@ -264,6 +268,7 @@ impl RunReservation {
         mut self,
         cancel: oneshot::Sender<()>,
         child: ChildSessionSummary,
+        terminal: Option<DropTerminalContext>,
         activation: Option<(&Arc<Mutex<TranscriptRecorder>>, super::SwarmMember)>,
         timeout_secs: Option<u64>,
     ) -> Result<Option<Instant>> {
@@ -318,6 +323,7 @@ impl RunReservation {
             .ok_or_else(|| anyhow!("subagent run reservation disappeared"))?;
         slot.cancel = Some(cancel);
         slot.child = child;
+        slot.terminal = terminal;
         if slot.cancellation_requested
             && let Some(cancel) = slot.cancel.take()
         {
@@ -342,6 +348,7 @@ impl Drop for RunReservation {
     }
 }
 
+#[derive(Clone)]
 struct DropTerminalContext {
     child_transcript: Arc<Mutex<TranscriptRecorder>>,
     parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
@@ -351,11 +358,22 @@ struct DropTerminalContext {
     agent_name: String,
 }
 
+impl std::fmt::Debug for DropTerminalContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DropTerminalContext")
+            .field("child_session_id", &self.child_session_id)
+            .field("agent_name", &self.agent_name)
+            .finish()
+    }
+}
+
 struct ActiveRunGuard {
     runtime: SubagentPool,
     state: Arc<Mutex<SubagentPoolState>>,
     changed: Arc<tokio::sync::Notify>,
     run_id: String,
+    finalized: Arc<std::sync::atomic::AtomicBool>,
     terminal_context: DropTerminalContext,
     terminal: bool,
 }
@@ -365,6 +383,7 @@ impl ActiveRunGuard {
         state: Arc<Mutex<SubagentPoolState>>,
         changed: Arc<tokio::sync::Notify>,
         run_id: String,
+        finalized: Arc<std::sync::atomic::AtomicBool>,
         terminal_context: DropTerminalContext,
         runtime: SubagentPool,
     ) -> Self {
@@ -373,6 +392,7 @@ impl ActiveRunGuard {
             state,
             changed,
             run_id,
+            finalized,
             terminal_context,
             terminal: false,
         }
@@ -415,64 +435,86 @@ impl ActiveRunGuard {
 
 impl Drop for ActiveRunGuard {
     fn drop(&mut self) {
-        if self.terminal {
+        if self.terminal
+            || self
+                .finalized
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
-        self.runtime.stop_swarm_members(Some(&self.run_id));
-        let context = &self.terminal_context;
-        let mut summary = build_runtime_summary(
+        finalize_cancelled_run(
+            &self.runtime,
+            &self.state,
+            &self.changed,
             &self.run_id,
-            &context.child_session_id,
-            &context.agent_name,
-            SubagentStatus::Cancelled,
-            format!("{} cancelled", context.agent_name),
+            &self.terminal_context,
         );
-        if let Err(error) = record_child_completion(
+    }
+}
+
+fn finalize_cancelled_run(
+    runtime: &SubagentPool,
+    state: &Arc<Mutex<SubagentPoolState>>,
+    changed: &Arc<tokio::sync::Notify>,
+    run_id: &str,
+    context: &DropTerminalContext,
+) -> SubagentRunSummary {
+    runtime.stop_swarm_members(Some(run_id));
+    let mut summary = build_runtime_summary(
+        run_id,
+        &context.child_session_id,
+        &context.agent_name,
+        SubagentStatus::Cancelled,
+        format!("{} cancelled", context.agent_name),
+    );
+    if let Err(error) = record_child_completion(
+        &context.child_transcript,
+        &summary,
+        &context.parent_session_id,
+        &context.parent_turn_id,
+    ) {
+        set_hard_failure(
+            &mut summary,
+            format!("failed to record dropped child subagent completion: {error}"),
+        );
+    }
+    if let Err(error) = record_parent_result(
+        &context.parent_transcript,
+        &summary,
+        &context.parent_session_id,
+        &context.parent_turn_id,
+    ) {
+        set_hard_failure(
+            &mut summary,
+            format!("failed to record dropped parent subagent result: {error}"),
+        );
+        let _ = record_child_completion(
             &context.child_transcript,
             &summary,
             &context.parent_session_id,
             &context.parent_turn_id,
-        ) {
-            set_hard_failure(
-                &mut summary,
-                format!("failed to record dropped child subagent completion: {error}"),
-            );
-        }
-        if let Err(error) = record_parent_result(
-            &context.parent_transcript,
-            &summary,
-            &context.parent_session_id,
-            &context.parent_turn_id,
-        ) {
-            set_hard_failure(
-                &mut summary,
-                format!("failed to record dropped parent subagent result: {error}"),
-            );
-            let _ = record_child_completion(
-                &context.child_transcript,
-                &summary,
-                &context.parent_session_id,
-                &context.parent_turn_id,
-            );
-        }
-        if let Ok(mut state) = self.state.lock() {
-            cancel_descendants(&mut state, &self.run_id);
-            if let Some(root) = state
-                .active_by_run
-                .get(&self.run_id)
-                .and_then(|slot| slot.swarm_root.clone())
-                && let Some(mailbox) = state
-                    .swarms
-                    .get_mut(&root)
-                    .and_then(|authority| authority.mailboxes.get_mut(&context.child_session_id))
-            {
-                mailbox.waking = false;
-            }
-            state.completed_by_run.insert(self.run_id.clone(), summary);
-            state.active_by_run.remove(&self.run_id);
-        }
-        self.changed.notify_waiters();
+        );
     }
+    if let Ok(mut state) = state.lock() {
+        cancel_descendants(&mut state, run_id);
+        if let Some(root) = state
+            .active_by_run
+            .get(run_id)
+            .and_then(|slot| slot.swarm_root.clone())
+            && let Some(mailbox) = state
+                .swarms
+                .get_mut(&root)
+                .and_then(|authority| authority.mailboxes.get_mut(&context.child_session_id))
+        {
+            mailbox.waking = false;
+        }
+        state
+            .completed_by_run
+            .insert(run_id.to_string(), summary.clone());
+        state.active_by_run.remove(run_id);
+    }
+    changed.notify_waiters();
+    summary
 }
 
 impl Default for SubagentPool {
@@ -547,9 +589,18 @@ impl SubagentPool {
         timeout_secs: Option<u64>,
     ) -> Result<Option<Instant>> {
         let run_id = reservation.run_id.clone();
+        let terminal = DropTerminalContext {
+            child_transcript: Arc::clone(child_transcript),
+            parent_transcript: parent_transcript.clone(),
+            parent_session_id: child.parent_session_id.clone(),
+            parent_turn_id: child.parent_run_id.clone(),
+            child_session_id: child.child_session_id.clone(),
+            agent_name: child.agent_name.clone(),
+        };
         let activation = reservation.activate(
             cancel,
             child.clone(),
+            Some(terminal),
             member.map(|member| (child_transcript, member)),
             timeout_secs,
         );
@@ -645,6 +696,59 @@ impl SubagentPool {
             self.changed.notify_waiters();
         }
         run_ids
+    }
+
+    pub(crate) fn attach_abort_handle(&self, run_id: &str, abort: tokio::task::AbortHandle) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(slot) = state.active_by_run.get_mut(run_id)
+        {
+            slot.abort = Some(abort);
+        }
+    }
+
+    /// Cancels every active run without waiting for its teardown. Detached
+    /// executors are aborted so a run that never observes the cancellation
+    /// signal still releases its slot and records its cancelled terminal.
+    pub fn cancel_active_forced(&self) -> Vec<SubagentRunSummary> {
+        self.stop_swarm_members(None);
+        let abandoned = {
+            let Ok(mut state) = self.state.lock() else {
+                return Vec::new();
+            };
+            let mut abandoned = Vec::new();
+            for (run_id, slot) in &mut state.active_by_run {
+                slot.cancellation_requested = true;
+                if let Some(cancel) = slot.cancel.take() {
+                    let _ = cancel.send(());
+                }
+                if let Some(context) = slot.terminal.clone() {
+                    abandoned.push((
+                        run_id.clone(),
+                        slot.abort.take(),
+                        Arc::clone(&slot.finalized),
+                        context,
+                    ));
+                }
+            }
+            abandoned
+        };
+        let mut summaries = Vec::with_capacity(abandoned.len());
+        for (run_id, abort, finalized, context) in abandoned {
+            if finalized.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+            if let Some(abort) = abort {
+                abort.abort();
+            }
+            summaries.push(finalize_cancelled_run(
+                self,
+                &self.state,
+                &self.changed,
+                &run_id,
+                &context,
+            ));
+        }
+        summaries
     }
 
     pub async fn wait_until_idle(&self) -> bool {
@@ -920,11 +1024,15 @@ impl SubagentPool {
         {
             bail!("takeover failed: child `{target}` already has an active takeover");
         }
+        let finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
         state.active_by_run.insert(
             run_id.clone(),
             ActiveSlot {
                 cancel: None,
+                abort: None,
                 cancellation_requested: false,
+                finalized: Arc::clone(&finalized),
+                terminal: None,
                 child: ChildSessionSummary {
                     parent_session_id,
                     parent_run_id: String::new(),
@@ -947,6 +1055,7 @@ impl SubagentPool {
             state: Arc::clone(&self.state),
             changed: Arc::clone(&self.changed),
             run_id,
+            finalized,
             activated: false,
         })
     }
@@ -1718,6 +1827,7 @@ impl SubagentPool {
                 .get_or_insert_with(|| event_sender.clone());
             mailbox.transcript = Arc::downgrade(&child_transcript);
         }
+        let finalized = Arc::clone(&reservation.finalized);
         let deadline = self.activate_run(
             reservation,
             cancel_tx,
@@ -1733,6 +1843,7 @@ impl SubagentPool {
                 Arc::clone(&self.state),
                 Arc::clone(&self.changed),
                 run_id.clone(),
+                finalized,
                 DropTerminalContext {
                     child_transcript: Arc::clone(&child_transcript),
                     parent_transcript: parent_transcript.clone(),
@@ -1943,6 +2054,7 @@ impl StartingReservationForTest {
                 },
                 None,
                 None,
+                None,
             )
             .expect("test activation");
         cancel_rx
@@ -2109,6 +2221,12 @@ where
     };
 
     let mut summary = summary;
+    if guard
+        .finalized
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok(summary);
+    }
     let observed_changed_paths = observed_changed_paths_from_child_transcript(&child_transcript);
     enforce_write_scope(
         &mut summary,

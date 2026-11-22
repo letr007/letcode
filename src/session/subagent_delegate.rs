@@ -779,7 +779,8 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                 let control_tx = self.background_control_tx.clone();
                 let child_completions = self.child_completions.clone();
                 return Ok(Box::pin(async move {
-                    tokio::spawn(async move {
+                    let abort_runtime = runtime.clone();
+                    let task = tokio::spawn(async move {
                         let result = runtime
                             .complete_started_run(started)
                             .await
@@ -799,6 +800,7 @@ impl SubagentDelegate for RunnerSubagentDelegate {
                             ));
                         }
                     });
+                    abort_runtime.attach_abort_handle(&run_id, task.abort_handle());
                     Ok(ToolResult::ok(
                         tool_name,
                         json!({

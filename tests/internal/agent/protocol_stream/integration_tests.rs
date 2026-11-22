@@ -224,7 +224,7 @@ async fn rejecting_an_incomplete_tool_batch_keeps_a_reasoning_only_turn_out_of_h
 }
 
 #[test]
-fn history_segment_origins_skip_prelude_and_current_turn() {
+fn current_turn_origins_skip_prelude_and_history() {
     let prelude = [
         crate::request_builder::PromptMessage::system("system"),
         crate::request_builder::PromptMessage::developer("developer"),
@@ -248,7 +248,7 @@ fn history_segment_origins_skip_prelude_and_current_turn() {
     );
 
     assert_eq!(
-        history_segment_origins(&plan),
-        vec![plan.segments[2].id.clone(), plan.segments[3].id.clone()]
+        current_turn_origins(&plan),
+        vec![plan.segments[4].id.clone()]
     );
 }

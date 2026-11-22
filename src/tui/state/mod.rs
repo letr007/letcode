@@ -3516,17 +3516,6 @@ impl TuiState {
             child.timeline.tick_reasoning_elapsed(now);
             child.timeline.finish_reasoning_transitions(now);
         }
-        if let Some((done, total, downloading)) = crate::redact::preparing() {
-            let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
-            let key = if downloading {
-                "runtime.redact_preparing"
-            } else {
-                "runtime.redact_scanning"
-            };
-            let message = self.t_fmt(key, &[("percent", &percent.to_string())]);
-            self.toast = Some(ToastState::new(message, ToastKind::Info, 1));
-            return true;
-        }
         self.refresh_retry_toast_at(now)
     }
 
