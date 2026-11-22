@@ -38,12 +38,12 @@ pub(crate) fn fetch_missing(dir: &Path) -> Result<Vec<String>> {
     let mut written = Vec::new();
     let total: u64 = FILES.iter().map(|(_, size, _)| size).sum();
     let mut done = 0u64;
-    super::set_preparing(Some((0, total)));
+    super::set_preparing(Some((0, total, true)));
     for (name, size, digest) in FILES {
         let target = dir.join(Path::new(name).file_name().context("a file name")?);
         if target.is_file() && digest_of(&target)? == digest {
             done += size;
-            super::set_preparing(Some((done, total)));
+            super::set_preparing(Some((done, total, true)));
             continue;
         }
         let mut last: Option<anyhow::Error> = None;
@@ -106,7 +106,7 @@ fn download(
         hasher.update(&buffer[..read]);
         std::io::Write::write_all(&mut file, &buffer[..read])?;
         *done += read as u64;
-        super::set_preparing(Some((*done, total)));
+        super::set_preparing(Some((*done, total, true)));
     }
     drop(file);
     let actual = format!("{:x}", hasher.finalize());

@@ -406,13 +406,13 @@ impl Redactor {
     }
 }
 
-static PREPARING: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+static PREPARING: Mutex<Option<(u64, u64, bool)>> = Mutex::new(None);
 
-pub(crate) fn preparing() -> Option<(u64, u64)> {
+pub(crate) fn preparing() -> Option<(u64, u64, bool)> {
     PREPARING.lock().ok().and_then(|state| *state)
 }
 
-pub(crate) fn set_preparing(value: Option<(u64, u64)>) {
+pub(crate) fn set_preparing(value: Option<(u64, u64, bool)>) {
     if let Ok(mut state) = PREPARING.lock() {
         *state = value;
     }
@@ -443,12 +443,20 @@ pub(crate) fn active() -> Option<Arc<Redactor>> {
 }
 
 pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) -> Result<()> {
+    let total = (input.segments.len() + input.messages.len()) as u64;
+    let mut done = 0;
+    set_preparing(Some((0, total, false)));
     for segment in &mut input.segments {
         segment.text = redactor.mask(&segment.text)?;
+        done += 1;
+        set_preparing(Some((done, total, false)));
     }
     for message in &mut input.messages {
         mask_parts(redactor, &mut message.content)?;
+        done += 1;
+        set_preparing(Some((done, total, false)));
     }
+    set_preparing(None);
     Ok(())
 }
 
