@@ -1,3 +1,4 @@
+mod cache;
 mod fetch;
 mod forward;
 mod kernels;
@@ -49,19 +50,40 @@ pub(crate) struct Span {
     pub(crate) score: f32,
 }
 
-#[derive(Default)]
 struct SpanCache {
     spans: std::collections::HashMap<[u8; 32], Vec<Span>>,
     order: std::collections::VecDeque<([u8; 32], usize)>,
     bytes: usize,
+    disk: Option<cache::DiskCache>,
 }
 
 impl SpanCache {
+    fn open(dir: Option<&Path>) -> Self {
+        let mut disk = dir.map(cache::DiskCache::open);
+        let spans = disk
+            .as_mut()
+            .map(cache::DiskCache::load)
+            .unwrap_or_default();
+        let order = spans
+            .iter()
+            .map(|(key, value)| (*key, value.len()))
+            .collect();
+        Self {
+            spans,
+            order,
+            bytes: 0,
+            disk,
+        }
+    }
+
     fn get(&self, key: &[u8; 32]) -> Option<&Vec<Span>> {
         self.spans.get(key)
     }
 
     fn insert(&mut self, key: [u8; 32], spans: Vec<Span>, len: usize) {
+        if let Some(disk) = self.disk.as_mut() {
+            disk.append(&key, &spans);
+        }
         if self.spans.insert(key, spans).is_none() {
             self.order.push_back((key, len));
             self.bytes += len;
@@ -86,7 +108,7 @@ pub(crate) struct Model {
 }
 
 impl Model {
-    pub(crate) fn load(dir: &Path) -> Result<Self> {
+    pub(crate) fn load(dir: &Path, cache_dir: Option<&Path>) -> Result<Self> {
         let graph = onnx::read(&dir.join("model_int8.onnx"))?;
         let weights = forward::Weights::load(&graph)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
@@ -94,7 +116,7 @@ impl Model {
         Ok(Self {
             weights,
             tokenizer,
-            cache: std::sync::Mutex::new(SpanCache::default()),
+            cache: std::sync::Mutex::new(SpanCache::open(cache_dir)),
         })
     }
 
@@ -230,7 +252,7 @@ mod tests {
         let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
             return;
         };
-        let model = Model::load(Path::new(&dir)).expect("the model loads");
+        let model = Model::load(Path::new(&dir), None).expect("the model loads");
         let cases: Vec<Case> =
             serde_json::from_str(include_str!("../../tests/fixtures/pii_guard_spans.json"))
                 .expect("the fixture parses");

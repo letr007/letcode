@@ -32,7 +32,7 @@ pub(crate) struct Masker {
 impl Masker {
     pub(crate) fn open(dir: &Path, key_path: &Path) -> Result<Self> {
         Ok(Self {
-            model: Model::load(dir)?,
+            model: Model::load(dir, key_path.parent())?,
             key: load_or_create_key(key_path)?,
             values: HashMap::new(),
             placeholders: HashMap::new(),
