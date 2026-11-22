@@ -314,7 +314,7 @@ async fn ask_jev(
     mut state: Value,
 ) -> Result<Answer> {
     if let Some(redactor) = crate::redact::active() {
-        crate::redact::mask_value(redactor, &mut state)?;
+        crate::redact::mask_value(&redactor, &mut state)?;
     }
     let credential = config.credential.trim();
     if credential.is_empty() {

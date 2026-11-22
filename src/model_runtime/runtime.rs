@@ -798,14 +798,14 @@ impl AttemptAccumulator {
             ModelEvent::TextDelta { text }
             | ModelEvent::ReasoningDelta { text, .. }
             | ModelEvent::ReasoningSummaryDelta { text, .. } => {
-                *text = self.restore_text(redactor, text);
+                *text = self.restore_text(&redactor, text);
             }
             ModelEvent::ReasoningDone { text, .. }
             | ModelEvent::ReasoningSummaryDone { text, .. } => {
                 *text = redactor.restore(text);
             }
             ModelEvent::ToolDone { arguments, .. } => {
-                crate::redact::restore_value(redactor, arguments);
+                crate::redact::restore_value(&redactor, arguments);
             }
             _ => {}
         }

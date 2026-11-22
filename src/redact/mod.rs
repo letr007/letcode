@@ -326,7 +326,7 @@ mod tests {
 }
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use crate::model_runtime::{ContentPart, ModelRequestInput};
 use masker::Masker;
@@ -418,14 +418,28 @@ pub(crate) fn set_preparing(value: Option<(u64, u64)>) {
     }
 }
 
-static ACTIVE: OnceLock<Option<Arc<Redactor>>> = OnceLock::new();
+static ACTIVE: Mutex<Option<(bool, PathBuf, Arc<Redactor>)>> = Mutex::new(None);
 
+/// Applies the switch, including after a configuration reload. A reload that
+/// leaves the switch and the directory alone keeps the running instance.
 pub(crate) fn install(enabled: bool, config_dir: &Path) {
-    let _ = ACTIVE.set(enabled.then(|| Redactor::new(config_dir)));
+    let Ok(mut slot) = ACTIVE.lock() else {
+        return;
+    };
+    if let Some((current_enabled, current_dir, _)) = slot.as_ref()
+        && *current_enabled == enabled
+        && current_dir == config_dir
+    {
+        return;
+    }
+    *slot = enabled.then(|| (true, config_dir.to_path_buf(), Redactor::new(config_dir)));
 }
 
-pub(crate) fn active() -> Option<&'static Arc<Redactor>> {
-    ACTIVE.get().and_then(Option::as_ref)
+pub(crate) fn active() -> Option<Arc<Redactor>> {
+    ACTIVE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|(_, _, redactor)| Arc::clone(redactor)))
 }
 
 pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) -> Result<()> {
