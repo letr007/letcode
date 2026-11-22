@@ -331,6 +331,7 @@ mod tests {
 }
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::model_runtime::{ContentPart, ModelRequestInput};
@@ -406,6 +407,50 @@ impl Redactor {
             .lock()
             .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))? = Some(masker);
         Ok(())
+    }
+}
+
+/// Each download carries a token so a stale download cannot clear the progress of a newer one.
+static PREPARING: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn preparing() -> Option<(u64, u64)> {
+    PREPARING
+        .lock()
+        .ok()
+        .and_then(|state| state.map(|(_, done, total)| (done, total)))
+}
+
+pub(crate) struct Progress {
+    token: u64,
+}
+
+impl Progress {
+    pub(crate) fn start(total: u64) -> Self {
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut state) = PREPARING.lock() {
+            *state = Some((token, 0, total));
+        }
+        Self { token }
+    }
+
+    pub(crate) fn advance(&self, done: u64) {
+        if let Ok(mut state) = PREPARING.lock()
+            && let Some((token, _, total)) = *state
+            && token == self.token
+        {
+            *state = Some((token, done, total));
+        }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if let Ok(mut state) = PREPARING.lock()
+            && state.is_some_and(|(token, _, _)| token == self.token)
+        {
+            *state = None;
+        }
     }
 }
 

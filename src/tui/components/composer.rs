@@ -920,6 +920,8 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
 
     let mode = if state.pending_permission.is_some() {
         state.t("permission.pending")
+    } else if crate::redact::active().is_some() {
+        state.t("ui.redact")
     } else {
         state.t("ui.prompt")
     };

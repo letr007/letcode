@@ -2485,6 +2485,11 @@ impl TuiRuntime {
         if self.state.pending_permission.is_some() || self.state.pending_question.is_some() {
             return Ok(None);
         }
+        if crate::redact::active().is_some() && crate::redact::preparing().is_some() {
+            let message = self.state.t("runtime.redact_not_ready");
+            self.state.show_toast(message, ToastKind::Info);
+            return Ok(None);
+        }
 
         if self.state.slash_panel_is_open()
             && let Some(selected) = self.selected_slash_command()
