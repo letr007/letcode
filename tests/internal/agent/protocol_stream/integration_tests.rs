@@ -89,7 +89,6 @@ where
         count_recovered_tool_calls: false,
         reconciled_async_tool_ids: BTreeSet::new(),
         attempt_assistant_persisted: false,
-        restore_carry: String::new(),
     }
 }
 

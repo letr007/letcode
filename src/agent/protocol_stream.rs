@@ -302,7 +302,6 @@ where
         reconciled_async_tool_ids: BTreeSet::new(),
         attempt_assistant_persisted: false,
         user_handoff: false,
-        restore_carry: String::new(),
     };
     TurnOrchestrator::new(runtime, limits)
         .run(&route, &mut driver)
@@ -364,7 +363,6 @@ struct ResolvedTurnDriver<'a, F, E, A> {
     count_recovered_tool_calls: bool,
     reconciled_async_tool_ids: BTreeSet<String>,
     attempt_assistant_persisted: bool,
-    restore_carry: String,
 }
 
 impl<'a, F, E, A, Dfut, Efut, Afut> ResolvedTurnDriver<'a, F, E, A>
@@ -376,21 +374,6 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
-    fn restore_text(&mut self, delta: &str) -> String {
-        let Some(redactor) = crate::redact::active() else {
-            return delta.to_string();
-        };
-        let mut buffer = std::mem::take(&mut self.restore_carry);
-        buffer.push_str(delta);
-        // A placeholder may arrive in two deltas; hold its tail until the
-        // closing braces show up.
-        if let Some(open) = buffer.rfind("{{")
-            && !buffer[open..].contains("}}")
-        {
-            self.restore_carry = buffer.split_off(open);
-        }
-        redactor.restore(&buffer)
-    }
     async fn observe_async_tool_done(
         &mut self,
         id: &str,
@@ -1028,21 +1011,19 @@ where
     async fn observe_event(&mut self, event: &ModelEvent) -> std::result::Result<(), ModelFailure> {
         match event {
             ModelEvent::TextDelta { text } => {
-                let text = self.restore_text(text);
-                (self.on_delta)(&text).await.map_err(|error| {
+                (self.on_delta)(text).await.map_err(|error| {
                     runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
                 })?;
-                self.final_text.push_str(&text);
+                self.final_text.push_str(text);
             }
             ModelEvent::ReasoningDelta { item_id, text } => {
-                let text = self.restore_text(text);
                 self.reasoning_text
                     .entry(item_id.clone())
                     .or_default()
-                    .push_str(&text);
+                    .push_str(text);
                 (self.on_event)(AgentEvent::ReasoningDelta {
                     item_id: item_id.clone(),
-                    delta: text,
+                    delta: text.clone(),
                 })
                 .await
                 .map_err(|error| {
@@ -1112,11 +1093,7 @@ where
                 name,
                 arguments,
             } => {
-                let mut arguments = arguments.clone();
-                if let Some(redactor) = crate::redact::active() {
-                    crate::redact::restore_value(redactor, &mut arguments);
-                }
-                self.observe_async_tool_done(id, name, &arguments).await?;
+                self.observe_async_tool_done(id, name, arguments).await?;
             }
             ModelEvent::Usage {
                 input_tokens,

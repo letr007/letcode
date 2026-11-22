@@ -749,7 +749,8 @@ async fn observe_events(
     accumulator: &mut AttemptAccumulator,
     events: Vec<ModelEvent>,
 ) -> Result<(), ModelAttemptFailure> {
-    for event in events {
+    for mut event in events {
+        accumulator.restore_event(&mut event);
         observer
             .observe(&event)
             .await
@@ -773,6 +774,7 @@ enum AssistantPartKey {
 
 #[derive(Default)]
 struct AttemptAccumulator {
+    restore_carry: String,
     events: Vec<ModelEvent>,
     order: Vec<AssistantPartKey>,
     text: String,
@@ -788,6 +790,46 @@ struct AttemptAccumulator {
 }
 
 impl AttemptAccumulator {
+    fn restore_event(&mut self, event: &mut ModelEvent) {
+        let Some(redactor) = crate::redact::active() else {
+            return;
+        };
+        match event {
+            ModelEvent::TextDelta { text }
+            | ModelEvent::ReasoningDelta { text, .. }
+            | ModelEvent::ReasoningSummaryDelta { text, .. } => {
+                *text = self.restore_text(redactor, text);
+            }
+            ModelEvent::ToolDone { arguments, .. } => {
+                crate::redact::restore_value(redactor, arguments);
+            }
+            _ => {}
+        }
+    }
+
+    fn restore_text(&mut self, redactor: &crate::redact::Redactor, delta: &str) -> String {
+        let mut buffer = std::mem::take(&mut self.restore_carry);
+        buffer.push_str(delta);
+        // A placeholder can arrive in two deltas; hold its tail until the
+        // closing braces show up, since the value must not reach the session.
+        if let Some(open) = buffer.rfind("{{")
+            && !buffer[open..].contains("}}")
+        {
+            self.restore_carry = buffer.split_off(open);
+        }
+        redactor.restore(&buffer)
+    }
+
+    fn flush_restore(&mut self) {
+        let carry = std::mem::take(&mut self.restore_carry);
+        if carry.is_empty() {
+            return;
+        }
+        if let Some(redactor) = crate::redact::active() {
+            self.text.push_str(&redactor.restore(&carry));
+        }
+    }
+
     fn consume_observed(&mut self, event: ModelEvent) -> Result<(), ModelFailure> {
         if self.terminal.is_some() || self.failure.is_some() {
             return Err(runtime_invalid("event received after terminal"));
@@ -888,7 +930,10 @@ impl AttemptAccumulator {
                 }
                 self.response_id = Some(response_id.clone());
             }
-            ModelEvent::Terminal { status } => self.terminal = Some(*status),
+            ModelEvent::Terminal { status } => {
+                self.flush_restore();
+                self.terminal = Some(*status);
+            }
             ModelEvent::Failure(failure) => self.failure = Some(failure.clone()),
             ModelEvent::Usage { .. } | ModelEvent::Cache { .. } => {}
         }
