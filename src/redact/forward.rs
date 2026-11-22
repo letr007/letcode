@@ -1,5 +1,4 @@
-// The export fuses attention, skip-layer normalization and bias GELU into
-// Microsoft contrib ops, so each one is written out here instead.
+// The export uses Microsoft's fused attention, skip-layer norm and bias GELU ops.
 use anyhow::{Context, Result, bail};
 
 use super::kernels::{QMatrix, quantize_into, threads};

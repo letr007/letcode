@@ -1,5 +1,3 @@
-// A file from either host is accepted only when its digest matches.
-
 use std::io::Read;
 use std::path::{Path, PathBuf};
 

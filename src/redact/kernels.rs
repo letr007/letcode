@@ -133,8 +133,6 @@ impl QMatrix {
         let tiles = self.cols.div_ceil(8);
         let zero = _mm256_setzero_si256();
         let mut tile = 0;
-        // Four output tiles per pass, so the broadcast of the a pair is shared
-        // by 32 columns instead of being redone for every 8.
         while tile < tiles {
             let group = (tiles - tile).min(4);
             let mut acc = [zero; 4];

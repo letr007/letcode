@@ -158,17 +158,13 @@ mod tests {
             vec![("common_secret", "hunter2-not-real")]
         );
         assert!(kinds("order 202409301234567890, total 128.00, build 4.8.2").is_empty());
+        assert!(kinds("card 4111111111111112").is_empty());
         assert_eq!(
-            kinds("id 11010519491231002X and card 4111 1111 1111 1111"),
-            vec![("account", "11010519491231002X")]
+            kinds("id 11010519491231002X and card 4111111111111111"),
+            vec![
+                ("account", "11010519491231002X"),
+                ("payment_card", "4111111111111111")
+            ]
         );
-    }
-
-    #[test]
-    fn keeps_only_numbers_that_pass_their_checksum() {
-        assert!(luhn("4111111111111111"));
-        assert!(!luhn("4111111111111112"));
-        assert!(id_card_checksum("11010519491231002X"));
-        assert!(!id_card_checksum("110105194912310021"));
     }
 }

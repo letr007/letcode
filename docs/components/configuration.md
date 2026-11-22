@@ -81,7 +81,7 @@ submit_while_running = "insert"
 - `submit_while_running`：活动回合中新输入的处理方式，适用于本地提交与跨实例消息。`insert`（默认）在下一个工具批次结束时关闭回合并执行该消息，没有工具批次时在回合结束时执行；`queue` 等当前回合结束后执行。
 - `max_iterations`：单个交互回合内允许的最大循环轮数。省略表示不设限制。
 - `max_tool_calls`：单个交互回合内允许调用的工具总次数。省略表示不设限制。
-- `redact`：请求脱敏，默认开启。向模型供应商发送前，用本地模型与规则把密钥、个人信息替换为 `{{KIND_xxxxxxxx}}` 占位符，回复与工具参数再用原值还原。同一值始终得到同一占位符，映射只存内存，key 存于配置目录下的 `redact.key`。模型（约 39 MB）在首次需要时从 `huggingface.co` 下载，失败转 `hf-mirror.com`，每个文件校验大小与 sha256，存放于配置目录下的 `models/astrlink-guard/`。模型未就绪时仍跑规则，请求不阻断。只覆盖发往模型供应商的请求，不覆盖工具自身的网络访问。
+- `redact`：请求脱敏，默认开启。发往模型供应商的密钥与个人信息在本地替换为占位符，回复与工具参数再还原；模型未就绪时只跑规则，不阻断请求。模型首次使用时下载到 `models/astrlink-guard/`，key 存 `redact.key`。
 
 ### 上下文保留 `[global.compaction]`
 
