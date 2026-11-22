@@ -126,13 +126,13 @@ impl Model {
         })
     }
 
-    pub(crate) fn detect(&self, text: &str) -> Result<Vec<Span>> {
+    pub(crate) fn detect_tracked(&self, text: &str) -> Result<(Vec<Span>, bool)> {
         use sha2::Digest;
         let digest: [u8; 32] = sha2::Sha256::digest(text.as_bytes()).into();
         if let Ok(mut cache) = self.cache.lock()
             && let Some(spans) = cache.take(&digest)
         {
-            return Ok(spans);
+            return Ok((spans, false));
         }
         let mut spans = self.classify(text)?;
         spans.extend(rules::scan(text));
@@ -140,7 +140,7 @@ impl Model {
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(digest, spans.clone(), text.len());
         }
-        Ok(spans)
+        Ok((spans, true))
     }
 
     fn classify(&self, text: &str) -> Result<Vec<Span>> {
@@ -263,7 +263,7 @@ mod tests {
             serde_json::from_str(include_str!("../../tests/fixtures/pii_guard_spans.json"))
                 .expect("the fixture parses");
         for case in cases {
-            let spans = model.detect(&case.text).expect("detection runs");
+            let spans = model.detect_tracked(&case.text).expect("detection runs").0;
             let got: Vec<(&str, &str, f32)> = spans
                 .iter()
                 .map(|s| (s.kind, &case.text[s.start..s.end], s.score))
@@ -298,7 +298,8 @@ mod tests {
         let _ = std::fs::remove_file(&key);
         let mut masker = masker::Masker::open(Path::new(&dir), &key).expect("the masker opens");
         let text = "联系张伟 13812345678，邮箱 zhangwei@example.com，key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
-        let masked = masker.mask(text).expect("masking runs");
+        let (masked, classified) = masker.mask_tracked(text).expect("masking runs");
+        assert!(classified);
         for value in [
             "张伟",
             "13812345678",
@@ -308,6 +309,9 @@ mod tests {
             assert!(!masked.contains(value), "{value} survived in {masked}");
         }
         assert_eq!(masker.restore(&masked), text);
+        let (cached, classified) = masker.mask_tracked(text).expect("cached masking runs");
+        assert!(!classified);
+        assert_eq!(cached, masked);
         let _ = std::fs::remove_file(&key);
     }
 
@@ -356,15 +360,15 @@ impl Redactor {
     }
 
     /// Waits for the model rather than letting a request leave unmasked.
-    pub(crate) fn mask(&self, text: &str) -> Result<String> {
+    pub(crate) fn mask_tracked(&self, text: &str) -> Result<(String, bool)> {
         self.ensure()?;
         let mut slot = self
             .masker
             .lock()
             .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))?;
         match slot.as_mut() {
-            Some(masker) => masker.mask(text),
-            None => Ok(text.to_string()),
+            Some(masker) => masker.mask_tracked(text),
+            None => Ok((text.to_string(), false)),
         }
     }
 
@@ -474,30 +478,78 @@ pub(crate) fn active() -> Option<Arc<Redactor>> {
         .and_then(|slot| slot.as_ref().map(|(_, _, redactor)| Arc::clone(redactor)))
 }
 
+struct Scan {
+    progress: Option<Progress>,
+    done: u64,
+    total: u64,
+    tracking: bool,
+}
+
+impl Scan {
+    fn start(total: u64) -> Self {
+        Self {
+            progress: None,
+            done: 0,
+            total,
+            tracking: true,
+        }
+    }
+
+    fn silent() -> Self {
+        Self {
+            progress: None,
+            done: 0,
+            total: 0,
+            tracking: false,
+        }
+    }
+
+    fn classified(&mut self) {
+        if self.tracking && self.progress.is_none() {
+            let progress = Progress::start(false, self.total);
+            progress.advance(self.done);
+            self.progress = Some(progress);
+        }
+    }
+
+    fn advance(&mut self) {
+        self.done += 1;
+        if let Some(progress) = &self.progress {
+            progress.advance(self.done);
+        }
+    }
+}
+
 pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) -> Result<()> {
+    redactor.ensure()?;
     let total = (input.segments.len() + input.messages.len()) as u64;
-    let progress = Progress::start(false, total);
-    let mut done = 0;
+    let mut scan = Scan::start(total);
     for segment in &mut input.segments {
-        segment.text = redactor.mask(&segment.text)?;
-        done += 1;
-        progress.advance(done);
+        segment.text = mask_text(redactor, &segment.text, &mut scan)?;
+        scan.advance();
     }
     for message in &mut input.messages {
-        mask_parts(redactor, &mut message.content)?;
-        done += 1;
-        progress.advance(done);
+        mask_parts(redactor, &mut message.content, &mut scan)?;
+        scan.advance();
     }
     Ok(())
 }
 
-fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart]) -> Result<()> {
+fn mask_text(redactor: &Redactor, text: &str, scan: &mut Scan) -> Result<String> {
+    let (masked, classified) = redactor.mask_tracked(text)?;
+    if classified {
+        scan.classified();
+    }
+    Ok(masked)
+}
+
+fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart], scan: &mut Scan) -> Result<()> {
     for part in parts {
         match part {
-            ContentPart::Text(text) => *text = redactor.mask(text)?,
-            ContentPart::Reasoning { text, .. } => *text = redactor.mask(text)?,
-            ContentPart::ToolCall { arguments, .. } => mask_value(redactor, arguments)?,
-            ContentPart::ToolResult { content, .. } => mask_parts(redactor, content)?,
+            ContentPart::Text(text) => *text = mask_text(redactor, text, scan)?,
+            ContentPart::Reasoning { text, .. } => *text = mask_text(redactor, text, scan)?,
+            ContentPart::ToolCall { arguments, .. } => mask_value_in(redactor, arguments, scan)?,
+            ContentPart::ToolResult { content, .. } => mask_parts(redactor, content, scan)?,
             ContentPart::Image { .. } => {}
         }
     }
@@ -505,16 +557,24 @@ fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart]) -> Result<()> {
 }
 
 pub(crate) fn mask_value(redactor: &Redactor, value: &mut serde_json::Value) -> Result<()> {
+    mask_value_in(redactor, value, &mut Scan::silent())
+}
+
+fn mask_value_in(
+    redactor: &Redactor,
+    value: &mut serde_json::Value,
+    scan: &mut Scan,
+) -> Result<()> {
     match value {
-        serde_json::Value::String(text) => *text = redactor.mask(text)?,
+        serde_json::Value::String(text) => *text = mask_text(redactor, text, scan)?,
         serde_json::Value::Array(items) => {
             for item in items {
-                mask_value(redactor, item)?;
+                mask_value_in(redactor, item, scan)?;
             }
         }
         serde_json::Value::Object(map) => {
             for item in map.values_mut() {
-                mask_value(redactor, item)?;
+                mask_value_in(redactor, item, scan)?;
             }
         }
         _ => {}

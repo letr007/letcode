@@ -39,10 +39,10 @@ impl Masker {
         })
     }
 
-    pub(crate) fn mask(&mut self, text: &str) -> Result<String> {
-        let spans = self.model.detect(text)?;
+    pub(crate) fn mask_tracked(&mut self, text: &str) -> Result<(String, bool)> {
+        let (spans, classified) = self.model.detect_tracked(text)?;
         if spans.is_empty() {
-            return Ok(text.to_string());
+            return Ok((text.to_string(), classified));
         }
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
@@ -56,7 +56,7 @@ impl Masker {
             at = span.end;
         }
         out.push_str(&text[at..]);
-        Ok(out)
+        Ok((out, classified))
     }
 
     pub(crate) fn restore(&self, text: &str) -> String {

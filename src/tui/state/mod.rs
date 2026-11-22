@@ -3524,11 +3524,7 @@ impl TuiState {
                 "runtime.redact_scanning"
             };
             let message = self.t_fmt(key, &[("percent", &percent.to_string())]);
-            self.toast = Some(ToastState::new(
-                message,
-                ToastKind::Info,
-                ToastState::DEFAULT_TICKS,
-            ));
+            self.toast = Some(ToastState::new(message, ToastKind::Info, 1));
             return true;
         }
         self.refresh_retry_toast_at(now)
