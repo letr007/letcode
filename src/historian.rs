@@ -72,6 +72,110 @@ pub(crate) fn history_input(
     UserMessageContent::new(text, attachments)
 }
 
+pub(crate) fn history_input_masked(
+    history: &[ProtocolItem],
+    eligible: &[bool],
+    references: &[Value],
+    project_facts: &[Value],
+    masker: &mut crate::redact::Masker,
+) -> Result<UserMessageContent> {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut attachments = Vec::new();
+    let mut new_messages = Vec::with_capacity(history.len());
+    for (index, item) in history.iter().enumerate() {
+        let mask = eligible.get(index).copied().unwrap_or(false);
+        let content = match item {
+            ProtocolItem::UserMessage { content } => {
+                let parts = content
+                    .parts()
+                    .into_iter()
+                    .map(|part| -> Result<Value> {
+                        Ok(match part {
+                            UserMessagePart::Text { text } => {
+                                let text = if mask {
+                                    masker.mask_tracked(&text, &cancel)?
+                                } else {
+                                    text
+                                };
+                                json!({"kind":"text","text":text})
+                            }
+                            UserMessagePart::Image { attachment } => json!({
+                                "kind":"image",
+                                "attachment":history_image(attachment, &mut attachments)
+                            }),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                json!({"kind":"user_message","parts":parts,"selected_skills":content.selected_skills})
+            }
+            ProtocolItem::AssistantTurn {
+                text,
+                reasoning_content,
+                calls,
+                ..
+            } => {
+                let text = match text {
+                    Some(text) if mask => Some(masker.mask_tracked(text, &cancel)?),
+                    _ => text.clone(),
+                };
+                let reasoning_content = match reasoning_content {
+                    Some(text) if mask => Some(masker.mask_tracked(text, &cancel)?),
+                    _ => reasoning_content.clone(),
+                };
+                let mut calls = calls.clone();
+                if mask {
+                    for call in &mut calls {
+                        call.arguments_json = masker.mask_tracked(&call.arguments_json, &cancel)?;
+                    }
+                }
+                json!({"kind":"assistant_turn","text":text,"reasoning_content":reasoning_content,"calls":calls})
+            }
+            ProtocolItem::ToolOutput {
+                call_id,
+                output_json,
+                images,
+            } => {
+                let output_json = if mask {
+                    masker.mask_tracked(output_json, &cancel)?
+                } else {
+                    output_json.clone()
+                };
+                let images: Vec<_> = images
+                    .iter()
+                    .cloned()
+                    .map(|image| history_image(image, &mut attachments))
+                    .collect();
+                json!({"kind":"tool_output","call_id":call_id,"output_json":output_json,"images":images})
+            }
+            ProtocolItem::ContextSummary { text } => {
+                let text = if mask {
+                    masker.mask_tracked(text, &cancel)?
+                } else {
+                    text.clone()
+                };
+                json!({"kind":"context_summary","text":text})
+            }
+            ProtocolItem::InternalContinuation { text } => {
+                let text = if mask {
+                    masker.mask_tracked(text, &cancel)?
+                } else {
+                    text.clone()
+                };
+                json!({"kind":"internal_continuation","text":text})
+            }
+        };
+        new_messages.push(json!({"index":index,"content":content}));
+    }
+    let text = json!({
+        "source_count":history.len(),
+        "references":references,
+        "project_facts":project_facts,
+        "new_messages":new_messages
+    })
+    .to_string();
+    Ok(UserMessageContent::new(text, attachments))
+}
+
 fn history_image(image: UserImageAttachment, attachments: &mut Vec<UserImageAttachment>) -> Value {
     let descriptor = json!({
         "attachment_index":attachments.len(),
@@ -207,6 +311,7 @@ pub(crate) async fn run_historian_with_repair<F, Fut, A>(
     id: &str,
     source_ids: &[String],
     input: &UserMessageContent,
+    restore: Option<std::sync::Arc<crate::redact::RestoreMap>>,
     mut on_delta: F,
     mut on_attempt: A,
 ) -> Result<HistorianRun>
@@ -216,7 +321,10 @@ where
     A: FnMut(HistorianAttempt<'_>) + Send,
 {
     let chunk_bytes = payload_bytes(input);
-    let (raw, usage) = match agent.run_historian(input, &mut on_delta).await {
+    let (raw, usage) = match agent
+        .run_historian(input, &mut on_delta, restore.clone())
+        .await
+    {
         Ok(exchange) => exchange,
         Err(error) => {
             let error = format!("{error:#}");
@@ -246,8 +354,38 @@ where
         payload_bytes: chunk_bytes,
     });
     let repair = repair_input(input, &raw, &error);
+    let mut restore = restore;
+    let repair = if restore.is_some() {
+        let redactor = crate::redact::installed()
+            .ok_or_else(|| anyhow::anyhow!("historian repair requires an installed redactor"))?;
+        let mut masker = redactor.masker()?;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let parts = repair
+            .parts()
+            .into_iter()
+            .map(|part| -> Result<UserMessagePart> {
+                Ok(match part {
+                    UserMessagePart::Text { text } => UserMessagePart::Text {
+                        text: masker.mask_tracked(&text, &cancel)?,
+                    },
+                    part => part,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut merged = restore.as_deref().cloned().unwrap_or_default();
+        merged.extend(
+            masker
+                .finish()
+                .iter()
+                .map(|(placeholder, value)| (placeholder.clone(), value.clone())),
+        );
+        restore = Some(std::sync::Arc::new(merged));
+        UserMessageContent::from_parts(parts)
+    } else {
+        repair
+    };
     let repair_bytes = payload_bytes(&repair);
-    let (raw, usage) = match agent.run_historian(&repair, &mut on_delta).await {
+    let (raw, usage) = match agent.run_historian(&repair, &mut on_delta, restore).await {
         Ok(exchange) => exchange,
         Err(error) => {
             let error = format!("{error:#}");

@@ -314,7 +314,11 @@ async fn ask_jev(
     mut state: Value,
 ) -> Result<Answer> {
     if let Some(redactor) = crate::redact::active() {
-        crate::redact::mask_value(&redactor, &mut state)?;
+        state = tokio::task::spawn_blocking(move || {
+            crate::redact::mask_value(&redactor, &mut state)?;
+            Ok::<_, anyhow::Error>(state)
+        })
+        .await??;
     }
     let credential = config.credential.trim();
     if credential.is_empty() {

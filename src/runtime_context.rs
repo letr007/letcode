@@ -147,6 +147,8 @@ pub(crate) struct RuntimeFrameProvenance {
     pub source_span: Option<SourceSpan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
+    #[serde(default)]
+    pub redaction_eligible: bool,
 }
 
 impl RuntimeFrameProvenance {
@@ -156,6 +158,7 @@ impl RuntimeFrameProvenance {
             label: None,
             source_span: None,
             source_id: None,
+            redaction_eligible: false,
         }
     }
 
@@ -166,6 +169,11 @@ impl RuntimeFrameProvenance {
 
     pub(crate) fn with_source_id(mut self, source_id: impl Into<String>) -> Self {
         self.source_id = Some(source_id.into());
+        self
+    }
+
+    pub(crate) fn with_redaction_eligible(mut self, eligible: bool) -> Self {
+        self.redaction_eligible = eligible;
         self
     }
 }

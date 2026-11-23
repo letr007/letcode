@@ -69,7 +69,7 @@
         "redact": {
           "type": "boolean",
           "default": true,
-          "description": "Replace secrets and personal data in outbound model requests with placeholders; restore them in replies and tool arguments. Detection is local. A request waits for the model rather than leaving unmasked."
+          "description": "Replace secrets and personal data in model requests with placeholders for content created while this switch is enabled; restore them in replies and tool arguments. Content created before the switch was enabled, or while it was disabled, stays exempt. Detection is local. A request waits for the model rather than leaving unmasked."
         },
         "submit_while_running": {
           "type": "string",

@@ -121,6 +121,9 @@ pub enum TranscriptEvent {
     SessionWorkspace {
         root: String,
     },
+    SessionRedaction {
+        enabled: bool,
+    },
     SessionSubagentsPolicy {
         policy: crate::config::SubagentsConfig,
     },

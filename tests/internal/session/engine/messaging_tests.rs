@@ -42,6 +42,7 @@ async fn idle_root_messages_use_the_engine_user_entry_and_stop_with_the_root() {
         let sessions = dir.path().join("sessions");
         fs::write(&config_path, format!(r#"active_provider = "test"
 [global]
+redact = false
 sessions_dir = "{}"
 [subagents]
 mode = "swarm"

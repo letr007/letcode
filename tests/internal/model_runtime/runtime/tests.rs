@@ -391,10 +391,15 @@ impl TurnDriver for TestDriver {
     async fn prepare_iteration(
         &mut self,
         _iteration: usize,
-    ) -> Result<ModelRequestInput, ModelFailure> {
-        self.requests
+    ) -> Result<crate::model_runtime::runtime::PreparedIteration, ModelFailure> {
+        let input = self
+            .requests
             .pop_front()
-            .ok_or_else(|| runtime_invalid("missing test request"))
+            .ok_or_else(|| runtime_invalid("missing test request"))?;
+        Ok(crate::model_runtime::runtime::PreparedIteration {
+            input,
+            restore: None,
+        })
     }
 
     async fn attempt_started(
@@ -1411,4 +1416,25 @@ tools = true
         assert!(driver.persisted.is_empty());
         assert!(driver.tool_batches.is_empty());
     }
+}
+
+#[test]
+fn accumulator_restores_placeholders_from_the_request_map() {
+    let restore = std::sync::Arc::new(std::collections::HashMap::from([(
+        "{{EMAIL_test123}}".to_string(),
+        "person@example.com".to_string(),
+    )]));
+    let mut accumulator = AttemptAccumulator {
+        restore: Some(restore),
+        ..Default::default()
+    };
+    let mut event = ModelEvent::TextDelta {
+        text: "mail {{EMAIL_test123}}".into(),
+    };
+    accumulator.restore_event(&mut event);
+    accumulator.consume_observed(event).unwrap();
+    assert!(matches!(
+        accumulator.snapshot().assistant.content.as_slice(),
+        [ContentPart::Text(text)] if text == "mail person@example.com"
+    ));
 }

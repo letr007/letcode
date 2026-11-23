@@ -726,6 +726,7 @@ pub struct Agent {
     retry_config: RetryConfig,
     tool_timeout_secs: Option<u64>,
     turn: TurnRuntimeState,
+    pending_redaction_enabled: Option<bool>,
     next_turn_id: u64,
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
@@ -1028,6 +1029,7 @@ impl AgentFactory {
             tool_timeout_secs: parent.tool_timeout_secs,
             can_background_shell: false,
             turn: TurnRuntimeState::default(),
+            pending_redaction_enabled: None,
             next_turn_id: 0,
             max_iterations: parent.max_iterations,
             max_tool_calls: capped_tool_call_limit(
@@ -1060,6 +1062,10 @@ impl AgentFactory {
 }
 
 impl Agent {
+    pub(crate) fn set_pending_redaction_enabled(&mut self, enabled: bool) {
+        self.pending_redaction_enabled = Some(enabled);
+    }
+
     fn preview_final_logical_request(
         &self,
         build: &crate::request_builder::BuildResult,
@@ -1540,6 +1546,7 @@ impl Agent {
             resolved_runtime_catalog: None,
             retained_route_preparations: HashMap::new(),
             turn: TurnRuntimeState::default(),
+            pending_redaction_enabled: None,
             next_turn_id: 0,
             max_iterations,
             max_tool_calls,
@@ -2850,6 +2857,7 @@ impl Agent {
         frame.source_provenance = Some(protocol_item_default_provenance(
             &frame.item,
             next_protocol_source_sequence(self),
+            self.turn.redaction_enabled,
         ));
         self.append_protocol_frame_to_snapshot(frame, item)
     }
@@ -2941,7 +2949,11 @@ impl Agent {
         let history_index = self.protocol_append_state.frame_count();
         frame.item = next_item;
         frame.history_index = history_index;
-        let runtime_frame = runtime_frame_from_protocol_frame(&frame, history_index as u32);
+        let runtime_frame = runtime_frame_from_protocol_frame(
+            &frame,
+            history_index as u32,
+            self.turn.redaction_enabled,
+        );
         let frame_id = runtime_frame.id;
         self.protocol_append_state.append(
             history_index,
@@ -3035,7 +3047,13 @@ impl Agent {
                     }
                     existing
                 })
-                .unwrap_or_else(|| runtime_frame_from_protocol_frame(frame, ordinal as u32));
+                .unwrap_or_else(|| {
+                    runtime_frame_from_protocol_frame(
+                        frame,
+                        ordinal as u32,
+                        self.turn.redaction_enabled,
+                    )
+                });
             snapshot.push_frame(runtime_frame);
         }
         snapshot.frames.extend(preserved_frames);
@@ -3129,6 +3147,7 @@ impl Agent {
             tool_timeout_secs: self.tool_timeout_secs,
             can_background_shell: false,
             turn: TurnRuntimeState::default(),
+            pending_redaction_enabled: None,
             next_turn_id: 0,
             // One normal helper iteration plus semantic recovery retries.
             max_iterations: self.helper_max_iterations(),
@@ -3163,15 +3182,18 @@ impl Agent {
         &self,
         user_input: &UserMessageContent,
         on_delta: F,
+        restore: Option<std::sync::Arc<crate::redact::RestoreMap>>,
     ) -> Result<(String, Vec<crate::historian::UsageUpdate>)>
     where
         F: FnMut(&str) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
     {
-        self.run_structured_oneshot(
+        self.run_structured_oneshot_with_redaction(
             user_input,
             |_: Option<crate::model_runtime::StructuredOutputSupport>| None,
             on_delta,
+            false,
+            restore,
         )
         .await
     }
@@ -3196,23 +3218,46 @@ impl Agent {
         F: FnMut(&str) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
     {
+        self.run_structured_oneshot_with_redaction(user_input, contract, on_delta, true, None)
+            .await
+    }
+
+    pub(crate) async fn run_structured_oneshot_with_redaction<C, F, Fut>(
+        &self,
+        user_input: &UserMessageContent,
+        contract: C,
+        on_delta: F,
+        redact: bool,
+        restore: Option<std::sync::Arc<crate::redact::RestoreMap>>,
+    ) -> Result<(String, Vec<crate::historian::UsageUpdate>)>
+    where
+        C: FnOnce(
+            Option<crate::model_runtime::StructuredOutputSupport>,
+        ) -> Option<crate::model_runtime::StructuredOutput>,
+        F: FnMut(&str) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
+    {
         let route = self
             .resolved_model_route()
             .ok_or_else(|| anyhow!("structured oneshot requires a resolved route"))?;
         let structured_output = contract(route.generation.structured_output);
         let mut prelude = self.prelude.clone();
         prepend_fake_claude_client_blocks(self, &route.protocol_id, &mut prelude);
-        let (_, input) = protocol_stream::prepare_resolved_oneshot_request(
+        let (_, input, prepared_restore) = protocol_stream::prepare_resolved_oneshot_request(
             route,
             self.active_model_metadata(),
             &prelude,
             user_input,
             structured_output.as_ref(),
+            redact,
         )?;
+        let restore = if redact { prepared_restore } else { restore };
         let decorator = protocol_stream::fake_request_decorator(self, route, false);
         let request = protocol_stream::decorate_oneshot_request(route, &input, decorator.as_ref())?;
         let (text, usage) = crate::model_runtime::runtime::ModelRuntime::default()
-            .execute_prepared_text_oneshot_with_usage(route, request, on_delta, || async { Ok(()) })
+            .execute_prepared_text_oneshot_with_usage(route, request, restore, on_delta, || async {
+                Ok(())
+            })
             .await
             .map_err(anyhow::Error::new)?;
         Ok((
@@ -3237,6 +3282,7 @@ impl Agent {
             &prelude,
             user_input,
             decorator.as_ref(),
+            true,
         )
         .await
     }
@@ -3256,6 +3302,7 @@ impl Agent {
             &prelude,
             user_input,
             fake_decorator.as_ref(),
+            true,
         )
         .await
         .map_err(|error| anyhow!("session title generation failed: {error:#}"))?;
@@ -3934,6 +3981,10 @@ impl Agent {
         self.invalidate_request_projection();
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.turn = TurnRuntimeState::new(self.next_turn_id);
+        self.turn.redaction_enabled = self
+            .pending_redaction_enabled
+            .take()
+            .unwrap_or_else(|| crate::redact::active().is_some());
         self.runtime_snapshot.workflow.auto_continue = AutoContinueState::default();
         if self.pressure_compaction_suppressed {
             self.turn.pressure_compaction.suppress();
@@ -4902,6 +4953,7 @@ pub(crate) fn protocol_frame_item_from_history_item(
 fn runtime_frame_from_protocol_frame(
     frame: &crate::protocol_frames::ProtocolFrame,
     ordinal: u32,
+    redaction_enabled: bool,
 ) -> RuntimeFrame {
     let (kind, stable_key, summary) = match &frame.item {
         crate::protocol_frames::ProtocolFrameItem::ContextSummary { text } => (
@@ -4955,10 +5007,9 @@ fn runtime_frame_from_protocol_frame(
     // Prefer producer provenance. Compatibility frames without provenance get a
     // synthetic transcript span so compaction can still retire them safely.
     // ContextSummary anchors remain spannable-optional (they are not retired).
-    let provenance = frame
-        .source_provenance
-        .clone()
-        .unwrap_or_else(|| protocol_item_default_provenance(&frame.item, ordinal as u64 + 1));
+    let provenance = frame.source_provenance.clone().unwrap_or_else(|| {
+        protocol_item_default_provenance(&frame.item, ordinal as u64 + 1, redaction_enabled)
+    });
     let source = provenance.source;
     let source_span = provenance.source_span;
     let mut runtime_frame = RuntimeFrame::new(
@@ -4981,14 +5032,18 @@ fn runtime_frame_from_protocol_frame(
 fn protocol_item_default_provenance(
     item: &crate::protocol_frames::ProtocolFrameItem,
     sequence: u64,
+    redaction_eligible: bool,
 ) -> RuntimeFrameProvenance {
     match item {
         crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. } => {
             RuntimeFrameProvenance::new(RuntimeSource::SummaryArtifact)
+                .with_redaction_eligible(redaction_eligible)
         }
-        _ => RuntimeFrameProvenance::new(RuntimeSource::Transcript).with_span(
-            SourceSpan::new(sequence.max(1), sequence.max(1)).expect("singleton source span"),
-        ),
+        _ => RuntimeFrameProvenance::new(RuntimeSource::Transcript)
+            .with_span(
+                SourceSpan::new(sequence.max(1), sequence.max(1)).expect("singleton source span"),
+            )
+            .with_redaction_eligible(redaction_eligible),
     }
 }
 
@@ -5119,6 +5174,7 @@ pub(super) fn rebind_active_protocol_from_history(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TurnRuntimeState {
     turn_id: u64,
+    redaction_enabled: bool,
     current_turn_start_index: Option<usize>,
     counters: TurnCounters,
     // Once enabled, auto-continue owns the rest of this turn so the LLM can
@@ -5139,6 +5195,7 @@ impl TurnRuntimeState {
     fn new(turn_id: u64) -> Self {
         Self {
             turn_id,
+            redaction_enabled: false,
             current_turn_start_index: None,
             counters: TurnCounters::default(),
             auto_continue_active: false,

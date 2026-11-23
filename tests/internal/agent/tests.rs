@@ -349,12 +349,13 @@ fn session_title_request_follows_the_fake_client_state() {
         .expect("the title helper shares the session route");
     let decorator = super::protocol_stream::fake_request_decorator(&title_agent, route, false)
         .expect("the title request carries the active fake");
-    let request = super::protocol_stream::prepare_oneshot_http_request(
+    let (request, _) = super::protocol_stream::prepare_oneshot_http_request(
         route,
         title_agent.active_model_metadata(),
         &title_agent.prelude,
         "rename this session",
         Some(&decorator),
+        false,
     )
     .expect("the title request is prepared");
 
@@ -384,12 +385,13 @@ fn session_title_request_follows_the_fake_client_state() {
     assert!(
         super::protocol_stream::fake_request_decorator(&plain_title, plain_route, false).is_none()
     );
-    let plain_request = super::protocol_stream::prepare_oneshot_http_request(
+    let (plain_request, _) = super::protocol_stream::prepare_oneshot_http_request(
         plain_route,
         plain_title.active_model_metadata(),
         &plain_title.prelude,
         "rename this session",
         None,
+        false,
     )
     .expect("the title request is prepared");
 
@@ -1302,7 +1304,7 @@ fn runtime_frames_for_history(history: &[HistoryItem]) -> Vec<RuntimeFrame> {
     crate::protocol_frames::history_items_to_frames(history)
         .iter()
         .enumerate()
-        .map(|(ordinal, frame)| runtime_frame_from_protocol_frame(frame, ordinal as u32))
+        .map(|(ordinal, frame)| runtime_frame_from_protocol_frame(frame, ordinal as u32, false))
         .collect()
 }
 
@@ -2818,13 +2820,14 @@ base_url = "https://example.invalid/v1"
             assert_eq!(instructions.matches("GPT-6 Astra 工作指引").count(), 1);
             assert!(!body["input"].to_string().contains("GPT-6 Astra 工作指引"));
 
-            let (_, helper_input) =
+            let (_, helper_input, _) =
                 crate::agent::protocol_stream::prepare_resolved_oneshot_request(
                     &resolved,
                     metadata,
                     &[PromptMessage::system("helper instructions")],
                     &crate::user_content::UserMessageContent::from("summarize"),
                     None,
+                    false,
                 )
                 .unwrap();
             let helper_request = resolved.binding.prepare_request(&helper_input).unwrap();

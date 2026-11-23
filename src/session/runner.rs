@@ -426,6 +426,9 @@ where {
             Ok(queue.drain_ready())
         }));
         let agent = continuation_guard.agent();
+        let redaction_enabled = crate::redact::active().is_some();
+        agent.set_pending_redaction_enabled(redaction_enabled);
+        self.record(|recorder| recorder.record_session_redaction(redaction_enabled))?;
         let sender = self.event_tx.clone();
         let response = agent
             .run_stream_content_with_interactions_async(
@@ -645,6 +648,10 @@ where {
         }
         agent.prepare_subagent_runtime()?;
         self.install_member_message_recorder(agent);
+        let redaction_enabled = crate::redact::active().is_some();
+        agent.set_pending_redaction_enabled(redaction_enabled);
+        self.record(|recorder| recorder.record_session_redaction(redaction_enabled))
+            .or_else(|error| self.finish_with_error(error))?;
         if record_user_prompt {
             let user_event = UserMessageEvent::from_submission(prompt.clone());
             self.emit(SessionTransportEvent::UserMessage(user_event))?;

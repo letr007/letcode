@@ -10,6 +10,14 @@ use crate::model_runtime::{
 use crate::user_content::UserMessageContent;
 use std::collections::{BTreeMap, BTreeSet};
 
+struct RedactCancelGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RedactCancelGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
 const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
 
@@ -267,8 +275,11 @@ where
         .as_ref()
         .map(|transport| ModelRuntime::new_responses_websocket(transport.clone()))
         .unwrap_or_default();
+    let redact_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _redact_cancel_guard = RedactCancelGuard(redact_cancel.clone());
     let mut driver = ResolvedTurnDriver {
         agent,
+        redact_cancel,
         route: route.clone(),
         protocol,
         turn_prelude: &turn_prelude,
@@ -329,6 +340,7 @@ struct WsRequestSnapshot {
 
 struct ResolvedTurnDriver<'a, F, E, A> {
     agent: &'a mut Agent,
+    redact_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     route: std::sync::Arc<crate::model_runtime::ResolvedModelRoute>,
     protocol: ApiProtocol,
     turn_prelude: &'a [PromptMessage],
@@ -706,7 +718,7 @@ where
     async fn prepare_iteration(
         &mut self,
         iteration: usize,
-    ) -> std::result::Result<ModelRequestInput, ModelFailure> {
+    ) -> std::result::Result<crate::model_runtime::runtime::PreparedIteration, ModelFailure> {
         let tools = self.agent.tool_definitions();
         let prepared = prepare_protocol_stream_request(
             self.agent,
@@ -726,10 +738,21 @@ where
             &tools,
         )
         .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
-        if let Some(redactor) = crate::redact::active() {
+        let redaction_enabled = self.agent.turn.redaction_enabled;
+        let eligible = prepared
+            .build
+            .prompt_plan
+            .segments
+            .iter()
+            .filter(|segment| segment_redaction_eligible(segment, redaction_enabled))
+            .map(|segment| segment.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut restore = None;
+        if let Some(redactor) = crate::redact::installed() {
+            let cancel = self.redact_cancel.clone();
             let masked = tokio::task::spawn_blocking(move || {
-                crate::redact::mask_input(&redactor, &mut input)?;
-                Ok::<_, anyhow::Error>(input)
+                let restore = crate::redact::mask_input(&redactor, &mut input, &eligible, &cancel)?;
+                Ok::<_, anyhow::Error>((input, restore))
             })
             .await
             .map_err(|error| {
@@ -738,7 +761,7 @@ where
                     anyhow::anyhow!("masking task failed: {error}"),
                 )
             })?;
-            input = masked.map_err(|error| {
+            (input, restore) = masked.map_err(|error| {
                 runtime_failure(crate::model_runtime::FailurePhase::Prepare, error)
             })?;
         }
@@ -773,7 +796,7 @@ where
             },
             inspection: None,
         });
-        Ok(input)
+        Ok(crate::model_runtime::runtime::PreparedIteration { input, restore })
     }
 
     fn bypass_iteration_limit(&self) -> bool {
@@ -1783,6 +1806,7 @@ fn build_oneshot_request(
     model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_content: &crate::user_content::UserMessageContent,
+    redact: bool,
 ) -> Result<crate::request_builder::BuildResult> {
     let mut snapshot = RuntimeSnapshot::new("helper-oneshot");
     let frames = crate::protocol_frames::history_items_to_frames(&[HistoryItem::user_content(
@@ -1793,7 +1817,7 @@ fn build_oneshot_request(
         let runtime_frame = RuntimeFrame::new(
             RuntimeFrameKind::User,
             FrameVisibility::Active,
-            RuntimeFrameProvenance::new(RuntimeSource::Derived),
+            RuntimeFrameProvenance::new(RuntimeSource::Derived).with_redaction_eligible(redact),
             RuntimeFrameIdSeed {
                 frame_kind: RuntimeFrameKind::User,
                 source: RuntimeSource::Derived,
@@ -1835,8 +1859,9 @@ pub(super) fn preflight_resolved_oneshot_text_request(
         prelude,
         &UserMessageContent::new(user_text, vec![]),
         None,
+        false,
     )
-    .map(|(build, _)| build)
+    .map(|(build, _, _)| build)
 }
 
 pub(super) fn prepare_resolved_oneshot_request(
@@ -1845,7 +1870,12 @@ pub(super) fn prepare_resolved_oneshot_request(
     prelude: &[PromptMessage],
     user_content: &UserMessageContent,
     structured_output: Option<&crate::model_runtime::StructuredOutput>,
-) -> Result<(crate::request_builder::BuildResult, ModelRequestInput)> {
+    redact: bool,
+) -> Result<(
+    crate::request_builder::BuildResult,
+    ModelRequestInput,
+    Option<std::sync::Arc<crate::redact::RestoreMap>>,
+)> {
     model.supports_reasoning = false;
     model.reasoning_effort = None;
     model.reasoning_summary = None;
@@ -1854,28 +1884,43 @@ pub(super) fn prepare_resolved_oneshot_request(
     model.service_tier = None;
     model.supports_input_images = route.capabilities.input_images;
     model.supports_tool_result_images = route.capabilities.tool_result_images;
-    let build = build_oneshot_request(&route.model_override, model.clone(), prelude, user_content)?;
+    let build = build_oneshot_request(
+        &route.model_override,
+        model.clone(),
+        prelude,
+        user_content,
+        redact,
+    )?;
     let mut input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
     // Set before the binding preflight so the preflight validates the request
     // that will actually be sent.
     input.generation.structured_output = structured_output.cloned();
-    if let Some(redactor) = crate::redact::active() {
-        crate::redact::mask_input(&redactor, &mut input)?;
+    let mut restore = None;
+    if redact && let Some(redactor) = crate::redact::active() {
+        let eligible = build
+            .prompt_plan
+            .segments
+            .iter()
+            .filter(|segment| segment_redaction_eligible(segment, true))
+            .map(|segment| segment.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        restore = crate::redact::mask_input(&redactor, &mut input, &eligible, &cancel)?;
     }
     route
         .binding
         .prepare_request(&input)
         .map_err(anyhow::Error::new)?;
-    Ok((build, input))
+    Ok((build, input, restore))
 }
-
 pub(super) async fn stream_resolved_oneshot_text_async<F, Fut, R, Rfut>(
     route: &crate::model_runtime::ResolvedModelRoute,
     model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     user_text: &str,
     decorator: Option<&crate::model_runtime::decorator::FakeRequestDecorator>,
+    redact: bool,
     mut on_delta: F,
     mut on_retry: R,
 ) -> Result<String>
@@ -1885,11 +1930,13 @@ where
     R: FnMut() -> Rfut + Send,
     Rfut: Future<Output = Result<()>> + Send,
 {
-    let request = prepare_oneshot_http_request(route, model, prelude, user_text, decorator)?;
+    let (request, restore) =
+        prepare_oneshot_http_request(route, model, prelude, user_text, decorator, redact)?;
     ModelRuntime::default()
         .execute_prepared_text_oneshot(
             route,
             request,
+            restore,
             move |delta| {
                 let future = on_delta(delta);
                 async move {
@@ -1917,6 +1964,7 @@ pub(super) async fn execute_resolved_text_oneshot(
     prelude: &[PromptMessage],
     user_text: &str,
     decorator: Option<&crate::model_runtime::decorator::FakeRequestDecorator>,
+    redact: bool,
 ) -> Result<String> {
     stream_resolved_oneshot_text_async(
         route,
@@ -1924,6 +1972,7 @@ pub(super) async fn execute_resolved_text_oneshot(
         prelude,
         user_text,
         decorator,
+        redact,
         |_| std::future::ready(Ok(())),
         || std::future::ready(Ok(())),
     )
@@ -1939,7 +1988,11 @@ pub(super) fn prepare_oneshot_http_request(
     prelude: &[PromptMessage],
     user_text: &str,
     decorator: Option<&crate::model_runtime::decorator::FakeRequestDecorator>,
-) -> Result<crate::model_runtime::PreparedHttpRequest> {
+    redact: bool,
+) -> Result<(
+    crate::model_runtime::PreparedHttpRequest,
+    Option<std::sync::Arc<crate::redact::RestoreMap>>,
+)> {
     model.supports_reasoning = false;
     model.reasoning_effort = None;
     model.reasoning_summary = None;
@@ -1953,15 +2006,25 @@ pub(super) fn prepare_oneshot_http_request(
         model.clone(),
         prelude,
         &crate::user_content::UserMessageContent::new(user_text, vec![]),
+        redact,
     )?;
     let mut input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
-    if let Some(redactor) = crate::redact::active() {
-        crate::redact::mask_input(&redactor, &mut input)?;
+    let mut restore = None;
+    if redact && let Some(redactor) = crate::redact::active() {
+        let eligible = build
+            .prompt_plan
+            .segments
+            .iter()
+            .filter(|segment| segment_redaction_eligible(segment, true))
+            .map(|segment| segment.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        restore = crate::redact::mask_input(&redactor, &mut input, &eligible, &cancel)?;
     }
-    decorate_oneshot_request(route, &input, decorator)
+    let request = decorate_oneshot_request(route, &input, decorator)?;
+    Ok((request, restore))
 }
-
 /// Builds the request a caller already shaped, then applies the fake disguise.
 pub(super) fn decorate_oneshot_request(
     route: &crate::model_runtime::ResolvedModelRoute,
@@ -2019,3 +2082,22 @@ where
 #[cfg(test)]
 #[path = "../../tests/internal/agent/protocol_stream/integration_tests.rs"]
 mod integration_tests;
+
+fn segment_redaction_eligible(
+    segment: &crate::request_builder::prompt_plan::PromptSegment,
+    redaction_enabled: bool,
+) -> bool {
+    if segment.source.provenance.redaction_eligible {
+        return true;
+    }
+    redaction_enabled
+        && matches!(
+            segment.source.contributor_kind,
+            crate::runtime_context::PromptContributorKind::RuntimeContext
+                | crate::runtime_context::PromptContributorKind::ContextMaterial
+                | crate::runtime_context::PromptContributorKind::ContextIndex
+                | crate::runtime_context::PromptContributorKind::Evidence
+                | crate::runtime_context::PromptContributorKind::CurrentTurn
+                | crate::runtime_context::PromptContributorKind::Other
+        )
+}

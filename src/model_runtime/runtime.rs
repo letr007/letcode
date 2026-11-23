@@ -489,7 +489,7 @@ impl ModelRuntime {
         Rfut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
     {
         let request = route.binding.prepare_request(input)?;
-        self.execute_prepared_text_oneshot_with_usage(route, request, on_delta, on_retry)
+        self.execute_prepared_text_oneshot_with_usage(route, request, None, on_delta, on_retry)
             .await
     }
 
@@ -498,6 +498,7 @@ impl ModelRuntime {
         &self,
         route: &ResolvedModelRoute,
         request: PreparedHttpRequest,
+        restore: Option<Arc<crate::redact::RestoreMap>>,
         on_delta: F,
         on_retry: R,
     ) -> Result<String, ModelFailure>
@@ -507,7 +508,7 @@ impl ModelRuntime {
         R: FnMut() -> Rfut + Send,
         Rfut: std::future::Future<Output = Result<(), ModelFailure>> + Send,
     {
-        self.execute_prepared_text_oneshot_with_usage(route, request, on_delta, on_retry)
+        self.execute_prepared_text_oneshot_with_usage(route, request, restore, on_delta, on_retry)
             .await
             .map(|(text, _)| text)
     }
@@ -519,6 +520,7 @@ impl ModelRuntime {
         &self,
         route: &ResolvedModelRoute,
         request: PreparedHttpRequest,
+        restore: Option<Arc<crate::redact::RestoreMap>>,
         mut on_delta: F,
         mut on_retry: R,
     ) -> Result<(String, Vec<ModelEvent>), ModelFailure>
@@ -538,7 +540,7 @@ impl ModelRuntime {
                 rejected_event: false,
             };
             match self
-                .execute_prepared_attempt(route, request.clone(), &mut observer)
+                .execute_prepared_attempt(route, request.clone(), &mut observer, restore.clone())
                 .await
             {
                 Ok(result) => {
@@ -604,6 +606,17 @@ impl ModelRuntime {
         input: &ModelRequestInput,
         observer: &mut dyn ModelEventObserver,
     ) -> Result<ModelAttemptResult, ModelAttemptFailure> {
+        self.execute_attempt_with_restore(route, input, observer, None)
+            .await
+    }
+
+    pub async fn execute_attempt_with_restore(
+        &self,
+        route: &ResolvedModelRoute,
+        input: &ModelRequestInput,
+        observer: &mut dyn ModelEventObserver,
+        restore: Option<Arc<crate::redact::RestoreMap>>,
+    ) -> Result<ModelAttemptResult, ModelAttemptFailure> {
         let request =
             route
                 .binding
@@ -612,7 +625,7 @@ impl ModelRuntime {
                     failure,
                     partial: Box::new(ModelAttemptSnapshot::default()),
                 })?;
-        self.execute_prepared_attempt(route, request, observer)
+        self.execute_prepared_attempt(route, request, observer, restore)
             .await
     }
 
@@ -621,6 +634,7 @@ impl ModelRuntime {
         route: &ResolvedModelRoute,
         request: PreparedHttpRequest,
         observer: &mut dyn ModelEventObserver,
+        restore: Option<Arc<crate::redact::RestoreMap>>,
     ) -> Result<ModelAttemptResult, ModelAttemptFailure> {
         let owned_secrets = route_error_secrets(route);
         let secret_refs = owned_secrets.iter().map(String::as_str).collect::<Vec<_>>();
@@ -656,7 +670,10 @@ impl ModelRuntime {
         } else {
             route.binding.new_decoder()
         };
-        let mut accumulator = AttemptAccumulator::default();
+        let mut accumulator = AttemptAccumulator {
+            restore,
+            ..Default::default()
+        };
         while let Some(chunk) = response.next_chunk().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -774,6 +791,7 @@ enum AssistantPartKey {
 
 #[derive(Default)]
 struct AttemptAccumulator {
+    restore: Option<Arc<crate::redact::RestoreMap>>,
     restore_carry: String,
     events: Vec<ModelEvent>,
     order: Vec<AssistantPartKey>,
@@ -791,27 +809,28 @@ struct AttemptAccumulator {
 
 impl AttemptAccumulator {
     fn restore_event(&mut self, event: &mut ModelEvent) {
-        let Some(redactor) = crate::redact::active() else {
+        let Some(values) = self.restore.clone() else {
             return;
         };
+        let values = values.as_ref();
         match event {
             ModelEvent::TextDelta { text }
             | ModelEvent::ReasoningDelta { text, .. }
             | ModelEvent::ReasoningSummaryDelta { text, .. } => {
-                *text = self.restore_text(&redactor, text);
+                *text = self.restore_text(values, text);
             }
             ModelEvent::ReasoningDone { text, .. }
             | ModelEvent::ReasoningSummaryDone { text, .. } => {
-                *text = redactor.restore(text);
+                *text = crate::redact::restore_text(values, text);
             }
             ModelEvent::ToolDone { arguments, .. } => {
-                crate::redact::restore_value(&redactor, arguments);
+                crate::redact::restore_value(values, arguments);
             }
             _ => {}
         }
     }
 
-    fn restore_text(&mut self, redactor: &crate::redact::Redactor, delta: &str) -> String {
+    fn restore_text(&mut self, values: &crate::redact::RestoreMap, delta: &str) -> String {
         let mut buffer = std::mem::take(&mut self.restore_carry);
         buffer.push_str(delta);
         // A placeholder can arrive in two deltas; hold its tail until the
@@ -821,7 +840,7 @@ impl AttemptAccumulator {
         {
             self.restore_carry = buffer.split_off(open);
         }
-        redactor.restore(&buffer)
+        crate::redact::restore_text(values, &buffer)
     }
 
     fn flush_restore(&mut self) {
@@ -829,8 +848,9 @@ impl AttemptAccumulator {
         if carry.is_empty() {
             return;
         }
-        if let Some(redactor) = crate::redact::active() {
-            self.text.push_str(&redactor.restore(&carry));
+        if let Some(values) = self.restore.as_deref() {
+            self.text
+                .push_str(&crate::redact::restore_text(values, &carry));
         }
     }
 
@@ -1091,12 +1111,17 @@ pub struct TurnResult {
     pub recovery_attempts: usize,
 }
 
+pub(crate) struct PreparedIteration {
+    pub(crate) input: ModelRequestInput,
+    pub(crate) restore: Option<Arc<crate::redact::RestoreMap>>,
+}
+
 #[async_trait]
-pub trait TurnDriver: Send {
+pub(crate) trait TurnDriver: Send {
     async fn prepare_iteration(
         &mut self,
         iteration: usize,
-    ) -> Result<ModelRequestInput, ModelFailure>;
+    ) -> Result<PreparedIteration, ModelFailure>;
 
     fn bypass_iteration_limit(&self) -> bool {
         false
@@ -1254,11 +1279,18 @@ impl TurnOrchestrator {
                         .with_code("max_iterations"),
                 );
             }
-            let input = driver.prepare_iteration(iteration).await?;
-            let request = route.binding.prepare_request(&input)?;
+            let prepared = driver.prepare_iteration(iteration).await?;
+            let request = route.binding.prepare_request(&prepared.input)?;
             let request = driver.decorate_request(request).await?;
             let result = self
-                .execute_with_physical_retries(route, &request, driver, &retry, iteration)
+                .execute_with_physical_retries(
+                    route,
+                    &request,
+                    driver,
+                    &retry,
+                    iteration,
+                    prepared.restore.clone(),
+                )
                 .await;
             let result = match result {
                 Ok(result) => result,
@@ -1367,6 +1399,7 @@ impl TurnOrchestrator {
         driver: &mut dyn TurnDriver,
         retry: &RuntimeRetryConfig,
         iteration: usize,
+        restore: Option<Arc<crate::redact::RestoreMap>>,
     ) -> Result<ModelAttemptResult, ModelAttemptFailure> {
         let mut attempt = 1;
         loop {
@@ -1387,7 +1420,7 @@ impl TurnOrchestrator {
             let mut observer = DriverObserver { driver };
             let result = self
                 .runtime
-                .execute_prepared_attempt(route, request.clone(), &mut observer)
+                .execute_prepared_attempt(route, request.clone(), &mut observer, restore.clone())
                 .await;
             let outcome = match &result {
                 Ok(result) => AttemptOutcome::Completed {

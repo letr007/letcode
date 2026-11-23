@@ -298,7 +298,9 @@ fn append_history_frames(
                 merged_runtime_source_span(&entry.source_spans),
             )
         };
-        let provenance = runtime_provenance(source, source_span, Some(entry.stable_key.clone()));
+        let mut provenance =
+            runtime_provenance(source, source_span, Some(entry.stable_key.clone()));
+        provenance.redaction_eligible = entry.redaction_eligible;
         let frame = RuntimeFrame::new(
             kind,
             FrameVisibility::Active,

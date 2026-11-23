@@ -3052,3 +3052,55 @@ fn session_history_tree_projects_applied_history_entries() {
     // The applied-history record sits between the user turn and its reply.
     assert_eq!(entries[2].parent_id.as_deref(), Some("entry-2"));
 }
+
+#[test]
+fn redaction_state_marks_content_at_creation() {
+    let records = [
+        record_at(1, TranscriptEvent::SessionRedaction { enabled: true }),
+        record_at(
+            2,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("first"),
+            },
+        ),
+        record_at(3, TranscriptEvent::SessionRedaction { enabled: false }),
+        record_at(
+            4,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("second"),
+            },
+        ),
+        record_at(5, TranscriptEvent::SessionRedaction { enabled: true }),
+        record_at(
+            6,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("third"),
+            },
+        ),
+    ];
+
+    let projected = project_runtime_restore_snapshot(
+        "s".into(),
+        records.to_vec(),
+        SessionContextCursor {
+            branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            leaf_sequence: Some(6),
+        },
+        &[],
+    )
+    .expect("runtime snapshot");
+
+    let flags = projected
+        .snapshot
+        .frames
+        .iter()
+        .filter(|frame| {
+            matches!(
+                frame.protocol,
+                Some(crate::protocol_frames::ProtocolFrameItem::UserMessage { .. })
+            )
+        })
+        .map(|frame| frame.provenance.redaction_eligible)
+        .collect::<Vec<_>>();
+    assert_eq!(flags, vec![true, false, true]);
+}

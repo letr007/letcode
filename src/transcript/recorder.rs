@@ -1502,6 +1502,10 @@ impl TranscriptRecorder {
         self.append_record(event, unix_timestamp_ms(), context_branch_id, true)
     }
 
+    pub fn record_session_redaction(&mut self, enabled: bool) -> Result<()> {
+        self.append(TranscriptEvent::SessionRedaction { enabled })
+    }
+
     pub(crate) fn record_subagents_policy(
         &mut self,
         policy: &crate::config::SubagentsConfig,

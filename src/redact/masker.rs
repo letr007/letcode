@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use super::Model;
+use super::{Ready, RestoreMap};
 
 pub(crate) fn kind_of(label: &str) -> &'static str {
     match label {
@@ -23,26 +25,27 @@ pub(crate) fn kind_of(label: &str) -> &'static str {
 }
 
 pub(crate) struct Masker {
-    model: Model,
-    key: [u8; 32],
+    ready: Arc<Ready>,
     values: HashMap<String, String>,
     placeholders: HashMap<(String, String), String>,
 }
 
 impl Masker {
-    pub(crate) fn open(dir: &Path, key_path: &Path) -> Result<Self> {
-        Ok(Self {
-            model: Model::load(dir, key_path.parent())?,
-            key: load_or_create_key(key_path)?,
+    pub(crate) fn new(ready: Arc<Ready>) -> Self {
+        Self {
+            ready,
             values: HashMap::new(),
             placeholders: HashMap::new(),
-        })
+        }
     }
 
-    pub(crate) fn mask_tracked(&mut self, text: &str) -> Result<(String, bool)> {
-        let (spans, classified) = self.model.detect_tracked(text)?;
+    pub(crate) fn mask_tracked(&mut self, text: &str, cancel: &AtomicBool) -> Result<String> {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("redaction cancelled");
+        }
+        let spans = self.ready.model.detect_tracked(text, cancel)?;
         if spans.is_empty() {
-            return Ok((text.to_string(), classified));
+            return Ok(text.to_string());
         }
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
@@ -56,11 +59,33 @@ impl Masker {
             at = span.end;
         }
         out.push_str(&text[at..]);
-        Ok((out, classified))
+        Ok(out)
     }
 
-    pub(crate) fn restore(&self, text: &str) -> String {
-        restore_values(&self.values, text)
+    pub(crate) fn mask_value(
+        &mut self,
+        value: &mut serde_json::Value,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        match value {
+            serde_json::Value::String(text) => *text = self.mask_tracked(text, cancel)?,
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.mask_value(item, cancel)?;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values_mut() {
+                    self.mask_value(item, cancel)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Arc<RestoreMap> {
+        Arc::new(self.values)
     }
 
     fn placeholder(&mut self, kind: &str, value: &str) -> String {
@@ -68,13 +93,12 @@ impl Masker {
         if let Some(existing) = self.placeholders.get(&id) {
             return existing.clone();
         }
-        let placeholder = format!("{{{{{kind}_{}}}}}", tag(&self.key, kind, value));
+        let placeholder = format!("{{{{{kind}_{}}}}}", tag(&self.ready.key, kind, value));
         self.placeholders.insert(id, placeholder.clone());
         self.values.insert(placeholder.clone(), value.to_string());
         placeholder
     }
 }
-
 pub(crate) fn tag(key: &[u8; 32], kind: &str, value: &str) -> String {
     let mut data = Vec::with_capacity(kind.len() + value.len() + 1);
     data.extend_from_slice(kind.as_bytes());
@@ -112,7 +136,7 @@ pub(crate) fn restore_values(values: &HashMap<String, String>, text: &str) -> St
     out
 }
 
-fn load_or_create_key(path: &Path) -> Result<[u8; 32]> {
+pub(crate) fn load_or_create_key(path: &Path) -> Result<[u8; 32]> {
     if let Ok(bytes) = std::fs::read(path) {
         let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) else {
             bail!("{} is not a 32 byte key", path.display());

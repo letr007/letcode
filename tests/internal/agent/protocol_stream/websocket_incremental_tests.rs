@@ -43,6 +43,7 @@ fn segment(
                 label: None,
                 source_span,
                 source_id: None,
+                redaction_eligible: false,
             },
             source_key: None,
             source_label: source_label.map(str::to_owned),

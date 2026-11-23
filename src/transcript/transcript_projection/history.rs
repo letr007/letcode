@@ -15,6 +15,7 @@ pub(super) struct HistoryProjectionEntry {
     pub(super) turn_id: Option<u64>,
     pub(super) segment_id: Option<u64>,
     pub(super) origin: HistoryProjectionOrigin,
+    pub(super) redaction_eligible: bool,
     pub(super) stable_key: String,
 }
 
@@ -66,6 +67,7 @@ pub(crate) fn restore_session_history_projection(records: &[TranscriptRecord]) -
 #[derive(Debug, Clone, Default)]
 pub(super) struct HistoryProjectionState {
     history: Vec<HistoryProjectionEntry>,
+    redaction_enabled: bool,
     active_turn_id: Option<u64>,
     active_segment_id: Option<u64>,
     archive: crate::context_history::HistoryArchive,
@@ -74,6 +76,10 @@ pub(super) struct HistoryProjectionState {
 
 impl HistoryProjectionState {
     pub(super) fn apply_record(&mut self, record: &TranscriptRecord) {
+        if let TranscriptEvent::SessionRedaction { enabled } = &record.event {
+            self.redaction_enabled = *enabled;
+            return;
+        }
         if let TranscriptEvent::ToolCallCancelled { call_id, .. } = &record.event {
             self.cancelled_call_ids.insert(call_id.clone());
         }
@@ -161,6 +167,7 @@ impl HistoryProjectionState {
                             turn_id: None,
                             segment_id: None,
                             origin: HistoryProjectionOrigin::CompactionSummary,
+                            redaction_eligible: self.redaction_enabled,
                         });
                     }
                 }
@@ -175,6 +182,7 @@ impl HistoryProjectionState {
                         turn_id: None,
                         segment_id: None,
                         origin: HistoryProjectionOrigin::CompactionSummary,
+                            redaction_eligible: self.redaction_enabled,
                     });
                 }
                 compacted.append(&mut history);
@@ -233,6 +241,7 @@ impl HistoryProjectionState {
                     turn_id: None,
                     segment_id: None,
                     origin: HistoryProjectionOrigin::CompactionSummary,
+                    redaction_eligible: self.redaction_enabled,
                     stable_key: format!("compaction:{}", record.sequence),
                 });
                 if let Some(user) = preserved_user {
@@ -252,6 +261,7 @@ impl HistoryProjectionState {
                         turn_id: preserved_user_index.and(active_turn_id),
                         segment_id: preserved_user_index.and(active_segment_id),
                         origin: HistoryProjectionOrigin::CompactionContinuation,
+                        redaction_eligible: self.redaction_enabled,
                         stable_key: format!("compaction:{}:continuation", record.sequence),
                     });
                 }
@@ -279,6 +289,7 @@ impl HistoryProjectionState {
                     turn_id: active_turn_id,
                     segment_id: Some(event.segment_id),
                     origin: HistoryProjectionOrigin::LogicalCheckpointSummary,
+                    redaction_eligible: self.redaction_enabled,
                     stable_key: format!("{}:summary", event.checkpoint_id),
                 });
                 history.push(HistoryProjectionEntry {
@@ -289,6 +300,7 @@ impl HistoryProjectionState {
                     turn_id: active_turn_id,
                     segment_id: Some(event.segment_id),
                     origin: HistoryProjectionOrigin::LogicalCheckpointContinuation,
+                    redaction_eligible: self.redaction_enabled,
                     stable_key: format!("{}:continuation", event.checkpoint_id),
                 });
                 active_segment_id = Some(event.segment_id);
@@ -317,6 +329,7 @@ impl HistoryProjectionState {
                 record,
                 active_turn_id,
                 active_segment_id,
+                self.redaction_enabled,
             ),
         }
         self.history = history;
@@ -569,6 +582,7 @@ fn normalize_incomplete_tool_call_groups(
                 turn_id: entry.turn_id,
                 segment_id: entry.segment_id,
                 origin: entry.origin,
+                redaction_eligible: entry.redaction_eligible,
                 stable_key: entry.stable_key,
             });
         }
@@ -584,6 +598,7 @@ fn normalize_incomplete_tool_call_groups(
                     turn_id: None,
                     segment_id: None,
                     origin: HistoryProjectionOrigin::RawTranscript,
+                    redaction_eligible: false,
                     stable_key: format!("cancelled:{call_id}"),
                 });
             }
@@ -617,6 +632,7 @@ fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>, sequence: u
             turn_id: None,
             segment_id: None,
             origin: HistoryProjectionOrigin::RawTranscript,
+            redaction_eligible: false,
             stable_key: format!("interruption-close:{sequence}"),
         });
     }
@@ -627,6 +643,7 @@ fn append_history_projection_entry_from_transcript_record(
     record: &TranscriptRecord,
     active_turn_id: Option<u64>,
     active_segment_id: Option<u64>,
+    redaction_enabled: bool,
 ) {
     // Committed batches are the protocol authority. Their subsequent lifecycle
     // starts are audit records only and must not create a second group.
@@ -685,6 +702,7 @@ fn append_history_projection_entry_from_transcript_record(
             } else {
                 HistoryProjectionOrigin::RawTranscript
             },
+            redaction_eligible: redaction_enabled,
             stable_key: format!("raw:{}", record.sequence),
         });
     }

@@ -56,6 +56,7 @@ where
 {
     ResolvedTurnDriver {
         agent,
+        redact_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         route,
         protocol: ApiProtocol::Responses,
         turn_prelude: &[],

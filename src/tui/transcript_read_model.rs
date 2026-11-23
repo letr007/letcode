@@ -51,6 +51,7 @@ impl TranscriptTimelineProjection {
                         ),
                     ))
             }
+            TranscriptEvent::SessionRedaction { .. } => {}
             TranscriptEvent::AssistantTurn(turn) => {
                 if let Some(content) = turn.text.clone() {
                     self.timeline

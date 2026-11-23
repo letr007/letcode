@@ -682,6 +682,7 @@ where
         &prelude,
         &prompt,
         None,
+        false,
         move |delta| {
             std::future::ready(
                 delta_tx

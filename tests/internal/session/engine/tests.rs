@@ -2331,6 +2331,7 @@ base_url = "http://127.0.0.1:1/v1"
 active_provider = "test"
 
 [global]
+redact = false
 sessions_dir = "{}"
 
 [providers.test]
@@ -2553,6 +2554,7 @@ max_output_tokens = 4096
 active_provider = "test"
 
 [global]
+redact = false
 sessions_dir = "{}"
 
 [providers.test]
@@ -2820,6 +2822,7 @@ max_output_tokens = 4096
 active_provider = "test"
 
 [global]
+redact = false
 sessions_dir = "{}"
 
 [providers.test]
@@ -3046,6 +3049,7 @@ max_output_tokens = 4096
 active_provider = "test"
 
 [global]
+redact = false
 sessions_dir = "{}"
 
 [providers.test]
@@ -3175,6 +3179,7 @@ max_output_tokens = 4096
 active_provider = "test"
 
 [global]
+redact = false
 sessions_dir = "{}"
 
 [providers.test]
@@ -3324,6 +3329,7 @@ max_output_tokens = 4096
 active_provider = "test"
 
 [global]
+redact = false
 submit_while_running = "queue"
 sessions_dir = "{}"
 

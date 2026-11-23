@@ -65,9 +65,10 @@ max_output_tokens=128
                 &prelude,
                 &content,
                 None,
+                false,
             );
             if !input_images {
-                let (build, input) = result.unwrap();
+                let (build, input, _) = result.unwrap();
                 let placeholders = UserMessageContent::from_parts(
                     content
                         .parts()
@@ -82,12 +83,13 @@ max_output_tokens=128
                         })
                         .collect(),
                 );
-                let (text_build, _) = protocol_stream::prepare_resolved_oneshot_request(
+                let (text_build, _, _) = protocol_stream::prepare_resolved_oneshot_request(
                     route,
                     metadata,
                     &prelude,
                     &placeholders,
                     None,
+                    false,
                 )
                 .unwrap();
                 assert_eq!(
@@ -105,7 +107,7 @@ max_output_tokens=128
                 route.binding.prepare_request(&input).unwrap();
                 continue;
             }
-            let (build, input) = result.unwrap();
+            let (build, input, _) = result.unwrap();
             assert!(!build.budget.truncated);
             assert!(build.budget.estimated_request_tokens < 20_000);
             assert!(
@@ -124,12 +126,13 @@ max_output_tokens=128
                 );
             }
             let larger = crate::historian::history_input(&larger_history, &[], &[]);
-            let (larger_build, _) = protocol_stream::prepare_resolved_oneshot_request(
+            let (larger_build, _, _) = protocol_stream::prepare_resolved_oneshot_request(
                 route,
                 metadata.clone(),
                 &prelude,
                 &larger,
                 None,
+                false,
             )
             .unwrap();
             assert_eq!(

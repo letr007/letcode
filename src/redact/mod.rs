@@ -126,24 +126,24 @@ impl Model {
         })
     }
 
-    pub(crate) fn detect_tracked(&self, text: &str) -> Result<(Vec<Span>, bool)> {
+    pub(crate) fn detect_tracked(&self, text: &str, cancel: &AtomicBool) -> Result<Vec<Span>> {
         use sha2::Digest;
         let digest: [u8; 32] = sha2::Sha256::digest(text.as_bytes()).into();
         if let Ok(mut cache) = self.cache.lock()
             && let Some(spans) = cache.take(&digest)
         {
-            return Ok((spans, false));
+            return Ok(spans);
         }
-        let mut spans = self.classify(text)?;
+        let mut spans = self.classify(text, cancel)?;
         spans.extend(rules::scan(text));
         let spans = merge(spans);
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(digest, spans.clone(), text.len());
         }
-        Ok((spans, true))
+        Ok(spans)
     }
 
-    fn classify(&self, text: &str) -> Result<Vec<Span>> {
+    fn classify(&self, text: &str, cancel: &AtomicBool) -> Result<Vec<Span>> {
         let encoding = self
             .tokenizer
             .encode(text, false)
@@ -161,6 +161,7 @@ impl Model {
 
         let mut start = 0usize;
         loop {
+            check_cancel(cancel)?;
             let end = (start + WINDOW).min(n);
             let mut seq = Vec::with_capacity(end - start + 2);
             seq.push(0);
@@ -248,190 +249,68 @@ fn argmax(row: &[f32]) -> (usize, f32) {
     (best, 1.0 / sum)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Reference spans from the same model read by ONNX Runtime; texts and values are synthetic.
-    #[test]
-    fn matches_the_reference_spans() {
-        let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
-            return;
-        };
-        let model = Model::load(Path::new(&dir), None).expect("the model loads");
-        let cases: Vec<Case> =
-            serde_json::from_str(include_str!("../../tests/fixtures/pii_guard_spans.json"))
-                .expect("the fixture parses");
-        for case in cases {
-            let spans = model.detect_tracked(&case.text).expect("detection runs").0;
-            let got: Vec<(&str, &str, f32)> = spans
-                .iter()
-                .map(|s| (s.kind, &case.text[s.start..s.end], s.score))
-                .collect();
-            let want: Vec<(&str, &str, f32)> = case
-                .spans
-                .iter()
-                .map(|s| (s.kind.as_str(), s.text.as_str(), s.score))
-                .collect();
-            assert_eq!(
-                got.iter().map(|(k, t, _)| (*k, *t)).collect::<Vec<_>>(),
-                want.iter().map(|(k, t, _)| (*k, *t)).collect::<Vec<_>>(),
-                "spans for {:?}",
-                case.text
-            );
-            for ((_, _, got), (_, _, want)) in got.iter().zip(want.iter()) {
-                assert!(
-                    (got - want).abs() < 0.01,
-                    "score {got:.4} against {want:.4} for {:?}",
-                    case.text
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn masking_removes_the_values_and_puts_them_back() {
-        let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
-            return;
-        };
-        let cache_dir =
-            std::env::temp_dir().join(format!("letcode-redact-key-{}", std::process::id()));
-        std::fs::create_dir_all(&cache_dir).expect("the temp dir is created");
-        let key = cache_dir.join("key");
-        let _ = std::fs::remove_file(&key);
-        let mut masker = masker::Masker::open(Path::new(&dir), &key).expect("the masker opens");
-        let text = "联系张伟 13812345678，邮箱 zhangwei@example.com，key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
-        let (masked, classified) = masker.mask_tracked(text).expect("masking runs");
-        assert!(classified);
-        for value in [
-            "张伟",
-            "13812345678",
-            "zhangwei@example.com",
-            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
-        ] {
-            assert!(!masked.contains(value), "{value} survived in {masked}");
-        }
-        assert_eq!(masker.restore(&masked), text);
-        let (cached, classified) = masker.mask_tracked(text).expect("cached masking runs");
-        assert!(!classified);
-        assert_eq!(cached, masked);
-        let _ = std::fs::remove_dir_all(&cache_dir);
-    }
-
-    #[test]
-    fn masks_history_and_current_messages() {
-        use crate::model_runtime::{MessageRole, ModelMessage};
-
-        let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
-            return;
-        };
-        let cache_dir =
-            std::env::temp_dir().join(format!("letcode-redact-input-{}", std::process::id()));
-        std::fs::create_dir_all(&cache_dir).expect("the temp dir is created");
-        let key = cache_dir.join("key");
-        let _ = std::fs::remove_file(&key);
-        let masker = masker::Masker::open(Path::new(&dir), &key).expect("the masker opens");
-        let redactor = Redactor {
-            dir: PathBuf::from(&dir),
-            key: key.clone(),
-            masker: Mutex::new(Some(masker)),
-            init: Mutex::new(()),
-        };
-        let history = "联系张伟 13812345678";
-        let current = "邮箱 zhangwei@example.com";
-        let mut input = ModelRequestInput::new(
-            "test",
-            vec![
-                ModelMessage::text(MessageRole::User, history),
-                ModelMessage::text(MessageRole::Assistant, "收到"),
-                ModelMessage::text(MessageRole::User, current),
-            ],
-        );
-        mask_input(&redactor, &mut input).expect("masking runs");
-        let texts: Vec<&str> = input
-            .messages
-            .iter()
-            .map(|message| match message.content.first() {
-                Some(ContentPart::Text(text)) => text.as_str(),
-                _ => panic!("text message"),
-            })
-            .collect();
-        assert!(!texts[0].contains("张伟"));
-        assert!(!texts[0].contains("13812345678"));
-        assert!(!texts[2].contains("zhangwei@example.com"));
-        assert_eq!(redactor.restore(texts[0]), history);
-        let _ = std::fs::remove_dir_all(&cache_dir);
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Case {
-        text: String,
-        spans: Vec<Expected>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Expected {
-        kind: String,
-        text: String,
-        score: f32,
-    }
-}
-
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::model_runtime::{ContentPart, ModelRequestInput};
-use masker::Masker;
+pub(crate) use masker::Masker;
+
+pub(crate) type RestoreMap = std::collections::HashMap<String, String>;
+
+pub(crate) struct Ready {
+    pub(crate) model: Model,
+    pub(crate) key: [u8; 32],
+}
 
 pub(crate) struct Redactor {
     dir: PathBuf,
     key: PathBuf,
-    masker: Mutex<Option<Masker>>,
+    ready: Mutex<Option<Arc<Ready>>>,
     init: Mutex<()>,
+    started: AtomicBool,
 }
 
 impl Redactor {
-    fn new(config_dir: &Path) -> Arc<Self> {
+    fn new(config_dir: &Path, preload: bool) -> Arc<Self> {
         let redactor = Arc::new(Self {
             dir: config_dir.join("models").join("astrlink-guard"),
             key: masker::key_path(config_dir),
-            masker: Mutex::new(None),
+            ready: Mutex::new(None),
             init: Mutex::new(()),
+            started: AtomicBool::new(false),
         });
-        let worker = Arc::clone(&redactor);
+        if preload {
+            redactor.preload();
+        }
+        redactor
+    }
+
+    fn preload(self: &Arc<Self>) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let worker = Arc::clone(self);
         std::thread::spawn(move || {
             if let Err(error) = worker.ensure() {
                 tracing::warn!("masking model unavailable: {error}");
             }
         });
-        redactor
     }
 
-    /// Waits for the model rather than letting a request leave unmasked.
-    pub(crate) fn mask_tracked(&self, text: &str) -> Result<(String, bool)> {
+    pub(crate) fn masker(&self) -> Result<Masker> {
         self.ensure()?;
-        let mut slot = self
-            .masker
+        let ready = self
+            .ready
             .lock()
-            .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))?;
-        match slot.as_mut() {
-            Some(masker) => masker.mask_tracked(text),
-            None => Ok((text.to_string(), false)),
-        }
-    }
-
-    pub(crate) fn restore(&self, text: &str) -> String {
-        match self.masker.lock() {
-            Ok(slot) => slot
-                .as_ref()
-                .map_or_else(|| text.to_string(), |m| m.restore(text)),
-            Err(_) => text.to_string(),
-        }
+            .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the masking model is unavailable"))?;
+        Ok(Masker::new(ready))
     }
 
     fn ready(&self) -> bool {
-        self.masker.lock().is_ok_and(|slot| slot.is_some())
+        self.ready.lock().is_ok_and(|slot| slot.is_some())
     }
 
     fn ensure(&self) -> Result<()> {
@@ -445,15 +324,28 @@ impl Redactor {
         if self.ready() {
             return Ok(());
         }
-        if !fetch::present(&self.dir) {
-            fetch::fetch_missing(&self.dir)?;
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| -> Result<()> {
+                    if !fetch::present(&self.dir) {
+                        fetch::fetch_missing(&self.dir)?;
+                    }
+                    let model = Model::load(&self.dir, self.key.parent())?;
+                    let key = masker::load_or_create_key(&self.key)?;
+                    *self
+                        .ready
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))? =
+                        Some(Arc::new(Ready { model, key }));
+                    Ok(())
+                })
+                .join()
+        });
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => anyhow::bail!("the masking model initializer panicked"),
         }
-        let masker = Masker::open(&self.dir, &self.key)?;
-        *self
-            .masker
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the masking model lock is poisoned"))? = Some(masker);
-        Ok(())
     }
 }
 
@@ -509,41 +401,91 @@ pub(crate) fn install(enabled: bool, config_dir: &Path) {
     let Ok(mut slot) = ACTIVE.lock() else {
         return;
     };
-    if let Some((current_enabled, current_dir, _)) = slot.as_ref()
-        && *current_enabled == enabled
-        && current_dir == config_dir
+    if let Some((current_enabled, current_dir, redactor)) = slot.as_mut()
+        && *current_dir == config_dir
     {
+        *current_enabled = enabled;
+        if enabled {
+            redactor.preload();
+        }
         return;
     }
-    *slot = enabled.then(|| (true, config_dir.to_path_buf(), Redactor::new(config_dir)));
+    *slot = Some((
+        enabled,
+        config_dir.to_path_buf(),
+        Redactor::new(config_dir, enabled),
+    ));
 }
 
 pub(crate) fn active() -> Option<Arc<Redactor>> {
+    ACTIVE.lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .filter(|(enabled, _, _)| *enabled)
+            .map(|(_, _, redactor)| Arc::clone(redactor))
+    })
+}
+
+pub(crate) fn installed() -> Option<Arc<Redactor>> {
     ACTIVE
         .lock()
         .ok()
         .and_then(|slot| slot.as_ref().map(|(_, _, redactor)| Arc::clone(redactor)))
 }
 
-pub(crate) fn mask_input(redactor: &Redactor, input: &mut ModelRequestInput) -> Result<()> {
-    redactor.ensure()?;
-    for message in &mut input.messages {
-        mask_parts(redactor, &mut message.content)?;
+pub(crate) fn mask_input(
+    redactor: &Redactor,
+    input: &mut ModelRequestInput,
+    eligible: &std::collections::HashSet<String>,
+    cancel: &AtomicBool,
+) -> Result<Option<Arc<RestoreMap>>> {
+    if eligible.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        input.segment_origins.len() == input.segments.len(),
+        "segment origins do not match segments"
+    );
+    anyhow::ensure!(
+        input.message_origins.len() == input.messages.len(),
+        "message origins do not match messages"
+    );
+    let mut masker = redactor.masker()?;
+    for (index, segment) in input.segments.iter_mut().enumerate() {
+        if !is_eligible(input.segment_origins.get(index), eligible) {
+            continue;
+        }
+        check_cancel(cancel)?;
+        segment.text = masker.mask_tracked(&segment.text, cancel)?;
+    }
+    for (index, message) in input.messages.iter_mut().enumerate() {
+        if !is_eligible(input.message_origins.get(index), eligible) {
+            continue;
+        }
+        check_cancel(cancel)?;
+        mask_parts(&mut masker, &mut message.content, cancel)?;
+    }
+    Ok(Some(masker.finish()))
+}
+
+fn is_eligible(origin: Option<&String>, eligible: &std::collections::HashSet<String>) -> bool {
+    origin.is_some_and(|origin| eligible.contains(origin))
+}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        anyhow::bail!("redaction cancelled");
     }
     Ok(())
 }
 
-fn mask_text(redactor: &Redactor, text: &str) -> Result<String> {
-    Ok(redactor.mask_tracked(text)?.0)
-}
-
-fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart]) -> Result<()> {
+fn mask_parts(masker: &mut Masker, parts: &mut [ContentPart], cancel: &AtomicBool) -> Result<()> {
     for part in parts {
+        check_cancel(cancel)?;
         match part {
-            ContentPart::Text(text) => *text = mask_text(redactor, text)?,
-            ContentPart::Reasoning { text, .. } => *text = mask_text(redactor, text)?,
-            ContentPart::ToolCall { arguments, .. } => mask_value_in(redactor, arguments)?,
-            ContentPart::ToolResult { content, .. } => mask_parts(redactor, content)?,
+            ContentPart::Text(text) => *text = masker.mask_tracked(text, cancel)?,
+            ContentPart::Reasoning { text, .. } => *text = masker.mask_tracked(text, cancel)?,
+            ContentPart::ToolCall { arguments, .. } => masker.mask_value(arguments, cancel)?,
+            ContentPart::ToolResult { content, .. } => mask_parts(masker, content, cancel)?,
             ContentPart::Image { .. } => {}
         }
     }
@@ -551,40 +493,163 @@ fn mask_parts(redactor: &Redactor, parts: &mut [ContentPart]) -> Result<()> {
 }
 
 pub(crate) fn mask_value(redactor: &Redactor, value: &mut serde_json::Value) -> Result<()> {
-    mask_value_in(redactor, value)
+    let cancel = AtomicBool::new(false);
+    let mut masker = redactor.masker()?;
+    masker.mask_value(value, &cancel)
 }
 
-fn mask_value_in(redactor: &Redactor, value: &mut serde_json::Value) -> Result<()> {
+pub(crate) fn restore_text(values: &RestoreMap, text: &str) -> String {
+    masker::restore_values(values, text)
+}
+
+pub(crate) fn restore_value(values: &RestoreMap, value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(text) => *text = mask_text(redactor, text)?,
+        serde_json::Value::String(text) => *text = masker::restore_values(values, text),
         serde_json::Value::Array(items) => {
             for item in items {
-                mask_value_in(redactor, item)?;
+                restore_value(values, item);
             }
         }
         serde_json::Value::Object(map) => {
             for item in map.values_mut() {
-                mask_value_in(redactor, item)?;
+                restore_value(values, item);
             }
         }
         _ => {}
     }
-    Ok(())
 }
 
-pub(crate) fn restore_value(redactor: &Redactor, value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => *text = redactor.restore(text),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                restore_value(redactor, item);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_runtime::{MessageRole, ModelMessage};
+    use std::collections::HashSet;
+
+    #[test]
+    fn matches_the_reference_spans() {
+        let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
+            return;
+        };
+        let model = Model::load(Path::new(&dir), None).expect("the model loads");
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../tests/fixtures/pii_guard_spans.json"))
+                .expect("the fixture parses");
+        let cancel = AtomicBool::new(false);
+        for case in cases {
+            let spans = model
+                .detect_tracked(&case.text, &cancel)
+                .expect("detection runs");
+            let got: Vec<(&str, &str, f32)> = spans
+                .iter()
+                .map(|s| (s.kind, &case.text[s.start..s.end], s.score))
+                .collect();
+            let want: Vec<(&str, &str, f32)> = case
+                .spans
+                .iter()
+                .map(|s| (s.kind.as_str(), s.text.as_str(), s.score))
+                .collect();
+            assert_eq!(
+                got.iter().map(|(k, t, _)| (*k, *t)).collect::<Vec<_>>(),
+                want.iter().map(|(k, t, _)| (*k, *t)).collect::<Vec<_>>(),
+                "spans for {:?}",
+                case.text
+            );
+            for ((_, _, got), (_, _, want)) in got.iter().zip(want.iter()) {
+                assert!(
+                    (got - want).abs() < 0.01,
+                    "score {got:.4} against {want:.4} for {:?}",
+                    case.text
+                );
             }
         }
-        serde_json::Value::Object(map) => {
-            for item in map.values_mut() {
-                restore_value(redactor, item);
-            }
-        }
-        _ => {}
+    }
+
+    #[test]
+    fn masking_removes_the_values_and_puts_them_back() {
+        let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
+            return;
+        };
+        let cache_dir =
+            std::env::temp_dir().join(format!("letcode-redact-key-{}", std::process::id()));
+        std::fs::create_dir_all(&cache_dir).expect("the temp dir is created");
+        let key_path = cache_dir.join("key");
+        let _ = std::fs::remove_file(&key_path);
+        let ready = Arc::new(Ready {
+            model: Model::load(Path::new(&dir), None).expect("the model loads"),
+            key: masker::load_or_create_key(&key_path).expect("the key loads"),
+        });
+        let mut masker = Masker::new(ready);
+        let cancel = AtomicBool::new(false);
+        let text = "联系张伟 13800138000，邮箱 zhang@example.com，key sk-test-secret";
+        let masked = masker.mask_tracked(text, &cancel).expect("masking runs");
+        assert_ne!(masked, text);
+        let values = masker.finish();
+        assert_eq!(restore_text(&values, &masked), text);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn masks_only_eligible_messages() {
+        let Ok(dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
+            return;
+        };
+        let cache_dir =
+            std::env::temp_dir().join(format!("letcode-redact-input-{}", std::process::id()));
+        std::fs::create_dir_all(&cache_dir).expect("the temp dir is created");
+        let key_path = cache_dir.join("key");
+        let _ = std::fs::remove_file(&key_path);
+        let ready = Arc::new(Ready {
+            model: Model::load(Path::new(&dir), None).expect("the model loads"),
+            key: masker::load_or_create_key(&key_path).expect("the key loads"),
+        });
+        let redactor = Redactor {
+            dir: PathBuf::from(&dir),
+            key: key_path,
+            ready: Mutex::new(Some(ready)),
+            init: Mutex::new(()),
+            started: AtomicBool::new(false),
+        };
+        let history = "联系张伟 13800138000";
+        let current = "邮箱 zhang@example.com";
+        let mut input = ModelRequestInput::new(
+            "test",
+            vec![
+                ModelMessage::text(MessageRole::User, history),
+                ModelMessage::text(MessageRole::Assistant, "收到"),
+                ModelMessage::text(MessageRole::User, current),
+            ],
+        );
+        input.message_origins = vec!["old".into(), "assistant".into(), "current".into()];
+        let eligible = HashSet::from(["current".to_string()]);
+        let cancel = AtomicBool::new(false);
+        let values = mask_input(&redactor, &mut input, &eligible, &cancel)
+            .expect("masking runs")
+            .expect("current message is masked");
+        let texts: Vec<&str> = input
+            .messages
+            .iter()
+            .map(|message| match message.content.first() {
+                Some(ContentPart::Text(text)) => text.as_str(),
+                _ => panic!("text message"),
+            })
+            .collect();
+        assert_eq!(texts[0], history);
+        assert_eq!(texts[1], "收到");
+        assert_ne!(texts[2], current);
+        assert_eq!(restore_text(&values, texts[2]), current);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        text: String,
+        spans: Vec<Expected>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Expected {
+        kind: String,
+        text: String,
+        score: f32,
     }
 }
