@@ -25,7 +25,6 @@ pub(crate) struct HistoryWork {
     pub revision: u64,
     pub source_ids: Vec<String>,
     pub input: crate::user_content::UserMessageContent,
-    pub restore: Option<std::sync::Arc<crate::redact::RestoreMap>>,
     pub project_path: String,
     pub external_fact_ids: Vec<String>,
 }
@@ -256,7 +255,6 @@ impl HistorianRuntime {
             let source_session_id = work.session_id.clone();
             let source_branch_id = work.branch_id.clone();
             let input = work.input.clone();
-            let work_restore = work.restore.clone();
             let delta_tx = event_tx.clone();
             let result = pool.complete_started_run_with_executor(started, move |agent, _, child, _, child_session_id, _| {
                 async move {
@@ -300,7 +298,6 @@ impl HistorianRuntime {
                             &publication_id,
                             &source_ids,
                             &input,
-                            work_restore,
                             &mut on_delta,
                             on_attempt,
                         )

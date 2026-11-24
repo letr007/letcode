@@ -1151,6 +1151,49 @@ impl Agent {
         self.runtime_snapshot.active_protocol_frames()
     }
 
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.runtime_snapshot.session_id.as_deref()
+    }
+
+    pub(crate) async fn mask_value_at_creation(&self, value: &mut serde_json::Value) -> Result<()> {
+        if !self.turn.redaction_enabled {
+            return Ok(());
+        }
+        let Some(redactor) = crate::redact::active() else {
+            return Ok(());
+        };
+        let session_id = self.runtime_snapshot.session_id.clone();
+        let text = std::mem::take(value);
+        let masked = tokio::task::spawn_blocking(move || {
+            let mut text = text;
+            crate::redact::mask_json(&redactor, session_id.as_deref(), &mut text)?;
+            Ok::<_, anyhow::Error>(text)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("masking task failed: {error}"))??;
+        *value = masked;
+        Ok(())
+    }
+
+    pub(crate) async fn mask_tool_result_at_creation(
+        &self,
+        output: &ToolResult,
+    ) -> Result<ToolResult> {
+        let mut output = output.clone();
+        if let Some(data) = output.data.as_mut() {
+            self.mask_value_at_creation(data).await?;
+        }
+        if let Some(error) = output.error.as_mut() {
+            let mut message = serde_json::Value::String(std::mem::take(&mut error.message));
+            self.mask_value_at_creation(&mut message).await?;
+            error.message = match message {
+                serde_json::Value::String(text) => text,
+                _ => unreachable!("a string stays a string"),
+            };
+        }
+        Ok(output)
+    }
+
     pub(crate) fn runtime_context(&self) -> Result<crate::runtime_context::RuntimeActiveContext> {
         crate::runtime_context::RuntimeActiveContext::try_from(&self.runtime_snapshot)
     }
@@ -2896,8 +2939,17 @@ impl Agent {
     fn append_protocol_frame_to_snapshot(
         &mut self,
         mut frame: crate::protocol_frames::ProtocolFrame,
-        item: HistoryItem,
+        mut item: HistoryItem,
     ) -> Result<()> {
+        if self.turn.redaction_enabled
+            && let Some(redactor) = crate::redact::active()
+        {
+            crate::redact::mask_item(
+                &redactor,
+                &mut item,
+                self.runtime_snapshot.session_id.as_deref(),
+            )?;
+        }
         let active_protocol_frame_count = self
             .runtime_snapshot
             .frames
@@ -3182,18 +3234,15 @@ impl Agent {
         &self,
         user_input: &UserMessageContent,
         on_delta: F,
-        restore: Option<std::sync::Arc<crate::redact::RestoreMap>>,
     ) -> Result<(String, Vec<crate::historian::UsageUpdate>)>
     where
         F: FnMut(&str) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
     {
-        self.run_structured_oneshot_with_redaction(
+        self.run_structured_oneshot(
             user_input,
             |_: Option<crate::model_runtime::StructuredOutputSupport>| None,
             on_delta,
-            false,
-            restore,
         )
         .await
     }
@@ -3218,44 +3267,24 @@ impl Agent {
         F: FnMut(&str) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
     {
-        self.run_structured_oneshot_with_redaction(user_input, contract, on_delta, true, None)
-            .await
-    }
-
-    pub(crate) async fn run_structured_oneshot_with_redaction<C, F, Fut>(
-        &self,
-        user_input: &UserMessageContent,
-        contract: C,
-        on_delta: F,
-        redact: bool,
-        restore: Option<std::sync::Arc<crate::redact::RestoreMap>>,
-    ) -> Result<(String, Vec<crate::historian::UsageUpdate>)>
-    where
-        C: FnOnce(
-            Option<crate::model_runtime::StructuredOutputSupport>,
-        ) -> Option<crate::model_runtime::StructuredOutput>,
-        F: FnMut(&str) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<(), crate::model_runtime::ModelFailure>> + Send,
-    {
         let route = self
             .resolved_model_route()
             .ok_or_else(|| anyhow!("structured oneshot requires a resolved route"))?;
         let structured_output = contract(route.generation.structured_output);
         let mut prelude = self.prelude.clone();
         prepend_fake_claude_client_blocks(self, &route.protocol_id, &mut prelude);
-        let (_, input, prepared_restore) = protocol_stream::prepare_resolved_oneshot_request(
+        let (_, input, _) = protocol_stream::prepare_resolved_oneshot_request(
             route,
             self.active_model_metadata(),
             &prelude,
             user_input,
             structured_output.as_ref(),
-            redact,
+            false,
         )?;
-        let restore = if redact { prepared_restore } else { restore };
         let decorator = protocol_stream::fake_request_decorator(self, route, false);
         let request = protocol_stream::decorate_oneshot_request(route, &input, decorator.as_ref())?;
         let (text, usage) = crate::model_runtime::runtime::ModelRuntime::default()
-            .execute_prepared_text_oneshot_with_usage(route, request, restore, on_delta, || async {
+            .execute_prepared_text_oneshot_with_usage(route, request, None, on_delta, || async {
                 Ok(())
             })
             .await

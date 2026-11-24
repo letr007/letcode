@@ -164,6 +164,7 @@ fn prepare_parallel_tool_call(
 }
 
 async fn emit_parallel_tool_call_started<E, Efut>(
+    agent: &Agent,
     prepared: &PreparedParallelToolCall,
     on_event: &mut E,
 ) -> Result<()>
@@ -171,10 +172,12 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
+    let mut args = prepared.args.clone();
+    agent.mask_value_at_creation(&mut args).await?;
     on_event(AgentEvent::ToolCallStarted {
         call_id: prepared.call.call_id.clone(),
         name: prepared.call.name.clone(),
-        args: prepared.args.clone(),
+        args,
     })
     .await
 }
@@ -296,7 +299,7 @@ where
         Ok(prepared) => prepared,
         Err(_) => return Ok(None),
     };
-    emit_parallel_tool_call_started(&prepared, on_event).await?;
+    emit_parallel_tool_call_started(agent, &prepared, on_event).await?;
     if !parallel_tool_call_permission_is_current(agent, &prepared)? {
         on_event(AgentEvent::ToolCallCancelled {
             call_id: prepared.call.call_id.clone(),
@@ -335,7 +338,7 @@ where
     // Do not expose any call as started until every call in this batch has
     // completed structural and permission preflight successfully.
     for (index, call) in prepared.iter().enumerate() {
-        if let Err(error) = emit_parallel_tool_call_started(call, on_event).await {
+        if let Err(error) = emit_parallel_tool_call_started(agent, call, on_event).await {
             cancel_parallel_calls_best_effort(
                 prepared[..=index]
                     .iter()
@@ -424,11 +427,12 @@ where
         })
         .await?;
     }
+    let output = agent.mask_tool_result_at_creation(&record.output).await?;
     on_event(AgentEvent::ToolCallFinished {
         call_id: record.call_id.clone(),
         name: record.tool_name.clone(),
-        ok: record.output.ok,
-        output: record.output.clone(),
+        ok: output.ok,
+        output,
     })
     .await?;
     agent.record_tool_effects(record);
@@ -590,16 +594,19 @@ where
     // Do not expose an admitted call as started until every call in this
     // concurrent group has completed preflight successfully.
     for ((_, entry), call) in preflight.iter().zip(calls) {
-        if let SubagentPreflight::Admitted(args) = entry
-            && let Err(error) = on_event(AgentEvent::ToolCallStarted {
+        if let SubagentPreflight::Admitted(args) = entry {
+            let mut masked_args = args.clone();
+            agent.mask_value_at_creation(&mut masked_args).await?;
+            if let Err(error) = on_event(AgentEvent::ToolCallStarted {
                 call_id: call.call_id.clone(),
                 name: call.name.clone(),
-                args: args.clone(),
+                args: masked_args,
             })
             .await
-        {
-            finish_subagent_batch_spans_error(&preflight);
-            return Err(error);
+            {
+                finish_subagent_batch_spans_error(&preflight);
+                return Err(error);
+            }
         }
     }
 
@@ -684,7 +691,7 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    emit_finished(on_event, call, record).await?;
+    emit_finished(agent, on_event, call, record).await?;
     agent.record_tool_effects(record);
     Agent::emit_audit_event(
         on_event,
@@ -880,7 +887,7 @@ where
             None,
             output,
         );
-        emit_finished(on_event, call, &record).await?;
+        emit_finished(agent, on_event, call, &record).await?;
         return Ok(record);
     }
 
@@ -897,7 +904,7 @@ where
             Some(ToolExecutionRejection::ToolScopeDenied),
             output,
         );
-        emit_finished(on_event, call, &record).await?;
+        emit_finished(agent, on_event, call, &record).await?;
         return Ok(record);
     }
 
@@ -919,7 +926,7 @@ where
                     None,
                     ToolResult::err(&call.name, error.to_string()),
                 );
-                emit_finished(on_event, call, &record).await?;
+                emit_finished(agent, on_event, call, &record).await?;
                 return Ok(record);
             }
         }
@@ -943,7 +950,7 @@ where
                     None,
                     ToolResult::err(&call.name, error.to_string()),
                 );
-                emit_finished(on_event, call, &record).await?;
+                emit_finished(agent, on_event, call, &record).await?;
                 return Ok(record);
             }
         }
@@ -968,7 +975,7 @@ where
                 Some(ToolExecutionRejection::DelegationScopeDenied),
                 ToolResult::err(&call.name, message),
             );
-            emit_finished(on_event, call, &record).await?;
+            emit_finished(agent, on_event, call, &record).await?;
             return Ok(record);
         }
         if is_delegation_path_scoped_tool(&call.name) {
@@ -1093,10 +1100,12 @@ where
     }
 
     if should_execute {
+        let mut masked_args = args.clone();
+        agent.mask_value_at_creation(&mut masked_args).await?;
         on_event(AgentEvent::ToolCallStarted {
             call_id: call.call_id.clone(),
             name: call.name.clone(),
-            args: args.clone(),
+            args: masked_args,
         })
         .await?;
 
@@ -1120,7 +1129,7 @@ where
                             None,
                             output,
                         );
-                        emit_finished(on_event, call, &record).await?;
+                        emit_finished(agent, on_event, call, &record).await?;
                         return Ok(record);
                     }
                 };
@@ -1196,7 +1205,10 @@ where
                             })
                             .await?;
                         }
-                        let output = timed_out_tool_result(&call.name, timeout_secs);
+                        let mut output = timed_out_tool_result(&call.name, timeout_secs);
+                        if let Some(data) = output.data.as_mut() {
+                            agent.mask_value_at_creation(data).await?;
+                        }
                         on_event(AgentEvent::ToolCallFinished {
                             call_id: call.call_id.clone(),
                             name: call.name.clone(),
@@ -1235,7 +1247,7 @@ where
             call_id: call.call_id.clone(),
             name: call.name.clone(),
             ok: output.ok,
-            output: output.clone(),
+            output: agent.mask_tool_result_at_creation(&output).await?,
         })
         .await?;
 
@@ -1276,7 +1288,7 @@ where
             Some(rejection),
             output,
         );
-        emit_finished(on_event, call, &record).await?;
+        emit_finished(agent, on_event, call, &record).await?;
         Ok(record)
     }
 }
@@ -1334,6 +1346,7 @@ where
             call.arguments_json
         ),
     );
+    let output = agent.mask_tool_result_at_creation(&output).await?;
     on_event(AgentEvent::ToolCallFinished {
         call_id: call.call_id.clone(),
         name: call.name.clone(),
@@ -1352,6 +1365,7 @@ where
 }
 
 async fn emit_finished<E, Efut>(
+    agent: &Agent,
     on_event: &mut E,
     call: &HistoryToolCall,
     record: &ToolExecutionRecord,
@@ -1360,11 +1374,12 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
+    let output = agent.mask_tool_result_at_creation(&record.output).await?;
     on_event(AgentEvent::ToolCallFinished {
         call_id: call.call_id.clone(),
         name: call.name.clone(),
-        ok: record.output.ok,
-        output: record.output.clone(),
+        ok: output.ok,
+        output,
     })
     .await
 }

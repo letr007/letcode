@@ -76,7 +76,14 @@ impl ToolHandler for HistoryTool {
             leaf_sequence,
         };
         let records = read_sources(&cursor)?;
-        let entries = source_entries(&records)?;
+        let mut entries = source_entries(&records)?;
+        if let Some(values) = crate::redact::installed().and_then(|redactor| {
+            crate::redact::session_restore_map(&redactor, Some(&cursor.session_id))
+        }) {
+            for entry in &mut entries {
+                entry.text = crate::redact::restore_text(&values, &entry.text);
+            }
+        }
         let offset = number(&args, "offset", 0, usize::MAX)?;
         if self.expand {
             let id = args["id"]

@@ -119,7 +119,11 @@ async fn main() -> Result<()> {
         Err(error) => return Err(error),
     };
     let _tracing_guards = init_tracing(&config.global.log_file);
-    redact::install(config.global.redact, &config.config_dir);
+    redact::install(
+        config.global.redact,
+        &config.config_dir,
+        &config.global.sessions_dir,
+    );
 
     let (active_provider_name, active_provider) = config.active_provider();
     let active_route = config.active_route();

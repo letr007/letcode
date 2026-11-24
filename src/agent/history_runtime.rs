@@ -167,34 +167,7 @@ pub(super) fn work(
                     .ok_or_else(|| anyhow!("historian source has no durable identity"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let eligible = frames[start..end]
-            .iter()
-            .map(|frame| {
-                frame
-                    .source_provenance
-                    .as_ref()
-                    .is_some_and(|provenance| provenance.redaction_eligible)
-            })
-            .collect::<Vec<_>>();
-        let (input, restore) = if eligible.iter().any(|eligible| *eligible) {
-            let redactor = crate::redact::installed().ok_or_else(|| {
-                anyhow!("historian source is eligible but redaction is not installed")
-            })?;
-            let mut masker = redactor.masker()?;
-            let input = crate::historian::history_input_masked(
-                &history[start..end],
-                &eligible,
-                &references,
-                &facts,
-                &mut masker,
-            )?;
-            (input, Some(masker.finish()))
-        } else {
-            (
-                crate::historian::history_input(&history[start..end], &references, &facts),
-                None,
-            )
-        };
+        let input = crate::historian::history_input(&history[start..end], &references, &facts);
         match protocol_stream::prepare_resolved_oneshot_request(
             route,
             helper.active_model_metadata(),
@@ -219,7 +192,6 @@ pub(super) fn work(
                     revision: snapshot.context_scope_revision,
                     source_ids,
                     input,
-                    restore,
                     project_path: crate::tool::workspace_root_for_subagent_lock()?
                         .to_string_lossy()
                         .into_owned(),
@@ -577,7 +549,6 @@ where
             &work.id,
             &work.source_ids,
             &work.input,
-            work.restore.clone(),
             |_: &str| std::future::ready(Ok::<(), crate::model_runtime::ModelFailure>(())),
             |_| {},
         )

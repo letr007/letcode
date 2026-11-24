@@ -18,10 +18,22 @@ use crate::transcript::{TranscriptEvent, TranscriptRecord};
 use crate::user_content::UserMessageSubmission;
 
 pub(crate) fn timeline_from_transcript_records(records: &[TranscriptRecord]) -> Timeline {
+    let restore = records.first().and_then(|record| {
+        crate::redact::installed().and_then(|redactor| {
+            crate::redact::session_restore_map(&redactor, Some(&record.session_id))
+        })
+    });
     let mut projection = TranscriptTimelineProjection::default();
     projection.timeline.begin_bulk_restore();
     for record in records {
-        projection.apply_record(record);
+        match &restore {
+            Some(values) => {
+                let mut restored = record.clone();
+                restore_event(values, &mut restored.event);
+                projection.apply_record(&restored);
+            }
+            None => projection.apply_record(record),
+        }
     }
     projection.timeline.finish_bulk_restore();
     projection.timeline
@@ -33,6 +45,54 @@ struct TranscriptTimelineProjection {
     current_auto_continue: AutoContinueState,
     /// The child's delegation prompt is recorded as a user message; the delegation block replaces it.
     pending_delegation_prompt: bool,
+}
+
+fn restore_event(values: &crate::redact::RestoreMap, event: &mut TranscriptEvent) {
+    use crate::redact::restore_text;
+    match event {
+        TranscriptEvent::UserMessage { content } => {
+            let skills = content.selected_skills.clone();
+            let mut parts = Vec::with_capacity(content.parts().len());
+            for part in content.parts() {
+                parts.push(match part {
+                    crate::user_content::UserMessagePart::Text { text } => {
+                        crate::user_content::UserMessagePart::Text {
+                            text: restore_text(values, &text),
+                        }
+                    }
+                    part => part,
+                });
+            }
+            *content = crate::user_content::UserMessageContent::from_parts(parts)
+                .with_selected_skills(skills);
+        }
+        TranscriptEvent::AssistantMessage { content } => {
+            *content = restore_text(values, content);
+        }
+        TranscriptEvent::ReasoningMessage { content, .. } => {
+            *content = restore_text(values, content);
+        }
+        TranscriptEvent::ToolCallFinished { output, .. } => {
+            if let Some(data) = output.data.as_mut() {
+                crate::redact::restore_value(values, data);
+            }
+            if let Some(error) = output.error.as_mut() {
+                error.message = restore_text(values, &error.message);
+            }
+        }
+        TranscriptEvent::AssistantTurn(turn) => {
+            if let Some(text) = turn.text.as_mut() {
+                *text = restore_text(values, text);
+            }
+            if let Some(reasoning) = turn.reasoning_content.as_mut() {
+                *reasoning = restore_text(values, reasoning);
+            }
+            for call in &mut turn.calls {
+                call.arguments_json = restore_text(values, &call.arguments_json);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl TranscriptTimelineProjection {

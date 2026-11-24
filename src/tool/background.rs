@@ -213,7 +213,7 @@ struct TaskRecord {
 #[derive(Default)]
 struct Registry {
     next_id: u64,
-    notifier: Option<Notifier>,
+    notifiers: HashMap<Option<String>, Notifier>,
     tasks: HashMap<String, TaskRecord>,
     pending_terminal: HashSet<String>,
 }
@@ -241,8 +241,17 @@ pub(super) fn allocate_id() -> String {
     format!("bg-{}", registry.next_id)
 }
 
-pub(crate) fn set_notifier(notifier: Notifier) {
-    lock(registry()).notifier = Some(notifier);
+pub(crate) fn set_notifier(session_id: Option<&str>, notifier: Notifier) {
+    lock(registry())
+        .notifiers
+        .insert(session_id.map(str::to_string), notifier);
+}
+
+fn notifier_for(registry: &Registry, session_id: Option<&str>) -> Option<Notifier> {
+    registry
+        .notifiers
+        .get(&session_id.map(str::to_string))
+        .cloned()
 }
 
 pub(super) fn register(
@@ -281,7 +290,7 @@ pub(super) fn register(
             observed: false,
         },
     );
-    if let Some(notifier) = registry.notifier.clone() {
+    if let Some(notifier) = notifier_for(&registry, session_id) {
         notifier(BackgroundEvent::Started {
             task_id: task_id.to_string(),
             session_id: session_id.map(str::to_string),
@@ -328,7 +337,8 @@ pub(crate) fn complete(
             output_path: output_path.map(|path| path.to_string_lossy().to_string()),
             preview,
         };
-        (registry.notifier.clone(), outcome)
+        let notifier = notifier_for(&registry, outcome.session_id.as_deref());
+        (notifier, outcome)
     };
     if let Some(notifier) = notifier {
         notifier(BackgroundEvent::Completed(outcome.clone()));

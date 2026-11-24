@@ -1245,6 +1245,8 @@ base_url = "http://127.0.0.1:1"
             &path,
             r#"
 active_provider = "test"
+[global]
+redact = false
 [providers.test]
 protocol = "responses"
 default_model = "model"
@@ -1365,6 +1367,9 @@ base_url = "http://127.0.0.1:1/v1"
         let old_contents = r#"
             active_provider = "primary"
 
+            [global]
+            redact = false
+
             [providers.primary]
             protocol = "responses"
             default_model = "old"
@@ -1379,6 +1384,9 @@ base_url = "http://127.0.0.1:1/v1"
             "#;
         let bad_contents = r#"
             active_provider = "primary"
+
+            [global]
+            redact = false
 
             [providers.primary]
             unknown = true
@@ -1501,6 +1509,9 @@ base_url = "http://127.0.0.1:1/v1"
             &path,
             r#"
             active_provider = "primary"
+
+            [global]
+            redact = false
 
             [mcp.alpha]
             enabled = true
@@ -1652,6 +1663,9 @@ base_url = "http://127.0.0.1:1/v1"
             r#"
             active_provider = "primary"
 
+            [global]
+            redact = false
+
             [providers.primary]
             protocol = "responses"
             default_model = "primary-model"
@@ -1692,6 +1706,9 @@ base_url = "http://127.0.0.1:1/v1"
             &path,
             r#"
             active_provider = "primary"
+
+            [global]
+            redact = false
 
             [providers.primary]
             protocol = "responses"
@@ -1780,6 +1797,10 @@ base_url = "http://127.0.0.1:1/v1"
         ));
         let initial = r#"
             active_provider = "primary"
+
+            [global]
+            redact = false
+
             [providers.primary]
             protocol = "responses"
             default_model = "session-model"
@@ -1914,6 +1935,10 @@ base_url = "http://127.0.0.1:1/v1"
         ));
         let initial = r#"
             active_provider = "primary"
+
+            [global]
+            redact = false
+
             [providers.primary]
             protocol = "responses"
             default_model = "model"
@@ -2025,6 +2050,10 @@ base_url = "http://127.0.0.1:1/v1"
         ));
         let initial = r#"
             active_provider = "primary"
+
+            [global]
+            redact = false
+
             [providers.primary]
             protocol = "responses"
             default_model = "a"
@@ -2162,6 +2191,9 @@ base_url = "http://127.0.0.1:1/v1"
             &path,
             r#"
             active_provider = "primary"
+
+            [global]
+            redact = false
 
             [providers.primary]
             protocol = "responses"

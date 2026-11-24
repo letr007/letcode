@@ -6018,3 +6018,94 @@ fn builtin_tool_schemas_avoid_root_level_composition() {
         }
     }
 }
+
+static REDACT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct RedactGlobals {
+    active: Option<(bool, PathBuf, std::sync::Arc<crate::redact::Redactor>)>,
+}
+
+impl Drop for RedactGlobals {
+    fn drop(&mut self) {
+        crate::redact::restore_active(self.active.clone());
+    }
+}
+
+#[test]
+fn request_assembly_never_masks() {
+    let source = include_str!("../../../src/agent/protocol_stream.rs");
+    for needle in ["mask_input", "mask_tracked", "mask_json", "mask_text"] {
+        assert!(
+            !source.contains(needle),
+            "request assembly must not call {needle}"
+        );
+    }
+}
+
+#[test]
+fn a_masked_frame_stays_masked_across_switches() {
+    let Ok(model_dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
+        return;
+    };
+    let _guard = REDACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let config_dir =
+        std::env::temp_dir().join(format!("letcode-redact-switch-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&config_dir);
+    fs::create_dir_all(&config_dir).expect("the config dir is created");
+    std::fs::create_dir_all(config_dir.join("models").join("astrlink-guard"))
+        .expect("the model dir is created");
+    let model_target = config_dir.join("models").join("astrlink-guard");
+    for name in ["model_int8.onnx", "model_int8.onnx_data", "tokenizer.json"] {
+        if !model_target.join(name).exists() {
+            std::fs::copy(
+                PathBuf::from(&model_dir).join(name),
+                model_target.join(name),
+            )
+            .expect("the model is copied");
+        }
+    }
+    let sessions_dir = config_dir.join("sessions");
+    fs::create_dir_all(&sessions_dir).expect("the sessions dir is created");
+    let _restore = RedactGlobals {
+        active: crate::redact::active_snapshot(),
+    };
+    crate::redact::install(true, &config_dir, &sessions_dir);
+
+    let mut agent = test_agent();
+    agent.runtime_snapshot.session_id = Some("switch-session".into());
+    agent.turn.redaction_enabled = true;
+    let secret = "邮箱 zhang@example.com";
+    agent
+        .append_history_item(HistoryItem::user(secret))
+        .expect("the masked message is appended");
+    let masked = match agent.active_history_items().first() {
+        Some(HistoryItem::UserMessage { content }) => content.prompt_plan_text(),
+        _ => panic!("a user message"),
+    };
+    assert_ne!(masked, secret);
+    assert!(masked.contains("{|>EMAIL:"), "{masked}");
+
+    crate::redact::install(false, &config_dir, &sessions_dir);
+    agent.turn.redaction_enabled = false;
+    agent
+        .append_history_item(HistoryItem::user(secret))
+        .expect("the plaintext message is appended");
+    agent.turn.redaction_enabled = true;
+    crate::redact::install(true, &config_dir, &sessions_dir);
+    agent.turn.redaction_enabled = false;
+
+    let items = agent.active_history_items();
+    let first = match items.first() {
+        Some(HistoryItem::UserMessage { content }) => content.prompt_plan_text(),
+        _ => panic!("a user message"),
+    };
+    let second = match items.get(1) {
+        Some(HistoryItem::UserMessage { content }) => content.prompt_plan_text(),
+        _ => panic!("a user message"),
+    };
+    assert_eq!(
+        first, masked,
+        "an existing frame must not change after the switch"
+    );
+    assert_eq!(second, secret, "a frame created while off stays plaintext");
+}

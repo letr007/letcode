@@ -690,7 +690,7 @@ impl TuiRuntime {
             .parent()
             .map(std::path::Path::to_path_buf)
             .ok_or_else(|| anyhow::anyhow!("configuration file has no directory"))?;
-        crate::redact::install(enabled, &config_dir);
+        crate::redact::install(enabled, &config_dir, &self.sessions_dir);
         Ok(())
     }
 

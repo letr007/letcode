@@ -470,6 +470,7 @@ where {
                                 let mut state = reconciliation.lock().await;
                                 state.reconcile(&event, journal_effect)
                             };
+                            let event = restore_for_display(&transcript, &event);
                             match event {
                                 AgentEvent::ToolCallStarted { call_id, name, args } => {
                                     send_optional_event(
@@ -682,11 +683,26 @@ where {
                 .clone()
                 .or_else(|| self.event_tx.clone());
             let prompt = prompt_text.clone();
+            let title_redaction_enabled = redaction_enabled;
+            let title_session_id = session_id.clone();
             tokio::spawn(async move {
                 match title_agent.generate_session_title(&prompt).await {
                     Ok(title) => {
                         let Some(transcript) = transcript else {
                             return;
+                        };
+                        let title = match mask_session_title(
+                            title,
+                            title_redaction_enabled,
+                            &title_session_id,
+                        )
+                        .await
+                        {
+                            Ok(title) => title,
+                            Err(error) => {
+                                warn!(error = %error, session_id, "failed to mask generated session title");
+                                return;
+                            }
                         };
                         let mut recorder = match transcript.lock() {
                             Ok(recorder) => recorder,
@@ -813,6 +829,7 @@ where {
                                 let mut state = tool_batch_state.lock().await;
                                 state.reconcile(&event, journal_effect)
                             };
+                            let event = restore_for_display(&transcript, &event);
                             match event {
                                 AgentEvent::ContextCompactionStarted { .. } => send_scoped_event(
                                     &sender,
@@ -1615,6 +1632,60 @@ fn build_subagent_event_sender(
             },
         ),
     )
+}
+
+fn restore_for_display(
+    transcript: &Option<Arc<std::sync::Mutex<TranscriptRecorder>>>,
+    event: &AgentEvent,
+) -> AgentEvent {
+    let Some(transcript) = transcript else {
+        return event.clone();
+    };
+    let Some(redactor) = crate::redact::installed() else {
+        return event.clone();
+    };
+    let Ok(recorder) = transcript.lock() else {
+        return event.clone();
+    };
+    let Some(values) = crate::redact::session_restore_map(&redactor, Some(recorder.session_id()))
+    else {
+        return event.clone();
+    };
+    let mut restored = event.clone();
+    match &mut restored {
+        AgentEvent::ToolCallStarted { args, .. } => {
+            crate::redact::restore_value(&values, args);
+        }
+        AgentEvent::ToolCallFinished { output, .. } => {
+            if let Some(data) = output.data.as_mut() {
+                crate::redact::restore_value(&values, data);
+            }
+            if let Some(error) = output.error.as_mut() {
+                error.message = crate::redact::restore_text(&values, &error.message);
+            }
+        }
+        _ => {}
+    }
+    restored
+}
+
+async fn mask_session_title(
+    title: String,
+    redaction_enabled: bool,
+    session_id: &str,
+) -> Result<String> {
+    if !redaction_enabled {
+        return Ok(title);
+    }
+    let Some(redactor) = crate::redact::active() else {
+        return Ok(title);
+    };
+    let session_id = session_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::redact::mask_text(&redactor, Some(&session_id), &title)
+    })
+    .await
+    .map_err(|error| anyhow!("masking task failed: {error}"))?
 }
 
 #[cfg(test)]

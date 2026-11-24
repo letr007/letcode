@@ -1421,7 +1421,7 @@ tools = true
 #[test]
 fn accumulator_restores_placeholders_from_the_request_map() {
     let restore = std::sync::Arc::new(std::collections::HashMap::from([(
-        "{{EMAIL_test123}}".to_string(),
+        "EMAIL:test1234".to_string(),
         "person@example.com".to_string(),
     )]));
     let mut accumulator = AttemptAccumulator {
@@ -1429,7 +1429,7 @@ fn accumulator_restores_placeholders_from_the_request_map() {
         ..Default::default()
     };
     let mut event = ModelEvent::TextDelta {
-        text: "mail {{EMAIL_test123}}".into(),
+        text: "mail {|>EMAIL:test1234<|}".into(),
     };
     accumulator.restore_event(&mut event);
     accumulator.consume_observed(event).unwrap();

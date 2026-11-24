@@ -43,7 +43,7 @@ impl Masker {
         if cancel.load(Ordering::Relaxed) {
             bail!("redaction cancelled");
         }
-        let spans = self.ready.model.detect_tracked(text, cancel)?;
+        let spans = self.ready.model.detect(text, cancel)?;
         if spans.is_empty() {
             return Ok(text.to_string());
         }
@@ -93,9 +93,10 @@ impl Masker {
         if let Some(existing) = self.placeholders.get(&id) {
             return existing.clone();
         }
-        let placeholder = format!("{{{{{kind}_{}}}}}", tag(&self.ready.key, kind, value));
+        let body = format!("{kind}:{}", tag(&self.ready.key, kind, value));
+        let placeholder = format!("{OPEN}{body}{CLOSE}");
         self.placeholders.insert(id, placeholder.clone());
-        self.values.insert(placeholder.clone(), value.to_string());
+        self.values.insert(body, value.to_string());
         placeholder
     }
 }
@@ -107,27 +108,51 @@ pub(crate) fn tag(key: &[u8; 32], kind: &str, value: &str) -> String {
     base32(&hmac_sha256(key, &data))[..8].to_string()
 }
 
+const OPEN: &str = "{|>";
+const CLOSE: &str = "<|}";
+
+pub(crate) fn is_placeholder(body: &str) -> bool {
+    let Some((kind, tag)) = body.split_once(':') else {
+        return false;
+    };
+    !kind.is_empty()
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'_')
+        && tag.len() == 8
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+pub(crate) fn split_placeholder(delta: &str) -> (&str, &str) {
+    match delta.rfind(OPEN) {
+        Some(open) if !delta[open..].contains(CLOSE) => delta.split_at(open),
+        _ => (delta, ""),
+    }
+}
+
 pub(crate) fn restore_values(values: &HashMap<String, String>, text: &str) -> String {
-    if values.is_empty() || !text.contains("{{") {
+    if values.is_empty() || !text.contains(OPEN) {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(open) = rest.find("{{") {
+    while let Some(open) = rest.find(OPEN) {
         out.push_str(&rest[..open]);
-        let after = &rest[open + 2..];
-        let Some(close) = after.find("}}") else {
+        let after = &rest[open + OPEN.len()..];
+        let Some(close) = after.find(CLOSE) else {
             out.push_str(&rest[open..]);
             return out;
         };
-        let name = &after[..close];
-        match values.get(&format!("{{{{{name}}}}}")) {
+        let body = &after[..close];
+        match values.get(body).filter(|_| is_placeholder(body)) {
             Some(value) => {
                 out.push_str(value);
-                rest = &after[close + 2..];
+                rest = &after[close + CLOSE.len()..];
             }
             None => {
-                out.push_str("{{");
+                out.push_str(OPEN);
                 rest = after;
             }
         }
@@ -142,6 +167,17 @@ pub(crate) fn load_or_create_key(path: &Path) -> Result<[u8; 32]> {
             bail!("{} is not a 32 byte key", path.display());
         };
         return Ok(key);
+    }
+    if let Ok(sessions) = crate::memory::configured_memory_sessions_dir()
+        && sessions
+            .join("maps")
+            .read_dir()
+            .is_ok_and(|mut e| e.next().is_some())
+    {
+        bail!(
+            "{} is missing but masked sessions exist; restore it or the sessions cannot be read",
+            path.display()
+        );
     }
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).context("reading random bytes")?;
@@ -227,12 +263,22 @@ mod tests {
         );
         assert_ne!(tag(&key, "SECRET", "one"), tag(&key, "SECRET", "two"));
 
-        let name = format!("{{{{SECRET_{}}}}}", tag(&key, "SECRET", "sk-test-123"));
-        let values = HashMap::from([(name.clone(), "sk-test-123".to_string())]);
-        let text = format!("auth {name}, again {name} and {{{{SECRET_unknown}}}}");
+        let id = tag(&key, "SECRET", "sk-test-123");
+        let name = format!("{{|>SECRET:{id}<|}}");
+        let values = HashMap::from([(format!("SECRET:{id}"), "sk-test-123".to_string())]);
+        let text =
+            format!("auth {name}, again {name} and {{|>SECRET:unknown<|}} {{|l|c|}} {{{{name}}}}");
         assert_eq!(
             restore_values(&values, &text),
-            "auth sk-test-123, again sk-test-123 and {{SECRET_unknown}}"
+            format!(
+                "auth sk-test-123, again sk-test-123 and {{|>SECRET:unknown<|}} {{|l|c|}} {{{{name}}}}"
+            )
+        );
+        let whole = format!("mail {name} sen");
+        assert_eq!(split_placeholder(&whole), (whole.as_str(), ""));
+        assert_eq!(
+            split_placeholder(&format!("mail {name} {{|>EMA")),
+            (format!("mail {name} ").as_str(), "{|>EMA")
         );
     }
 }

@@ -58,7 +58,11 @@ pub(crate) fn apply_config_reload(
     provider_api_key_hints: &mut indexmap::IndexMap<String, String>,
     event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
 ) -> Result<()> {
-    crate::redact::install(config.global.redact, &config.config_dir);
+    crate::redact::install(
+        config.global.redact,
+        &config.config_dir,
+        &config.global.sessions_dir,
+    );
     let catalog_event = model_catalog_updated_event(&config);
     let next_runtime_catalog = config.runtime_catalog.clone();
     let next_runtime_fingerprint = next_runtime_catalog.fingerprint().clone();

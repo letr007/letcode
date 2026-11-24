@@ -3517,13 +3517,18 @@ impl TuiState {
             child.timeline.finish_reasoning_transitions(now);
         }
         if crate::redact::active().is_some()
-            && let Some((done, total)) = crate::redact::preparing()
+            && let Some(preparing) = crate::redact::preparing()
         {
-            let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
-            let message = self.t_fmt(
-                "runtime.redact_preparing",
-                &[("percent", &percent.to_string())],
-            );
+            let message = match preparing {
+                crate::redact::Preparing::Downloading { done, total } => {
+                    let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
+                    self.t_fmt(
+                        "runtime.redact_preparing",
+                        &[("percent", &percent.to_string())],
+                    )
+                }
+                crate::redact::Preparing::Loading => self.t("runtime.redact_loading"),
+            };
             self.toast = Some(ToastState::new(
                 message,
                 ToastKind::Info,

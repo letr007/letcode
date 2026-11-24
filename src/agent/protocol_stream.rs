@@ -10,14 +10,6 @@ use crate::model_runtime::{
 use crate::user_content::UserMessageContent;
 use std::collections::{BTreeMap, BTreeSet};
 
-struct RedactCancelGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-impl Drop for RedactCancelGuard {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
 const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
 
@@ -275,11 +267,8 @@ where
         .as_ref()
         .map(|transport| ModelRuntime::new_responses_websocket(transport.clone()))
         .unwrap_or_default();
-    let redact_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _redact_cancel_guard = RedactCancelGuard(redact_cancel.clone());
     let mut driver = ResolvedTurnDriver {
         agent,
-        redact_cancel,
         route: route.clone(),
         protocol,
         turn_prelude: &turn_prelude,
@@ -340,7 +329,6 @@ struct WsRequestSnapshot {
 
 struct ResolvedTurnDriver<'a, F, E, A> {
     agent: &'a mut Agent,
-    redact_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     route: std::sync::Arc<crate::model_runtime::ResolvedModelRoute>,
     protocol: ApiProtocol,
     turn_prelude: &'a [PromptMessage],
@@ -731,40 +719,16 @@ where
         .await
         .map_err(preparation_failure)?;
         self.protected_start_index = prepared.protected_start_index;
-        let mut input = model_request_from_prompt_plan(
+        let input = model_request_from_prompt_plan(
             &self.route,
             &self.agent.active_model_metadata(),
             &prepared.build.prompt_plan,
             &tools,
         )
         .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Prepare, error))?;
-        let redaction_enabled = self.agent.turn.redaction_enabled;
-        let eligible = prepared
-            .build
-            .prompt_plan
-            .segments
-            .iter()
-            .filter(|segment| segment_redaction_eligible(segment, redaction_enabled))
-            .map(|segment| segment.id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        let mut restore = None;
-        if let Some(redactor) = crate::redact::installed() {
-            let cancel = self.redact_cancel.clone();
-            let masked = tokio::task::spawn_blocking(move || {
-                let restore = crate::redact::mask_input(&redactor, &mut input, &eligible, &cancel)?;
-                Ok::<_, anyhow::Error>((input, restore))
-            })
-            .await
-            .map_err(|error| {
-                runtime_failure(
-                    crate::model_runtime::FailurePhase::Prepare,
-                    anyhow::anyhow!("masking task failed: {error}"),
-                )
-            })?;
-            (input, restore) = masked.map_err(|error| {
-                runtime_failure(crate::model_runtime::FailurePhase::Prepare, error)
-            })?;
-        }
+        let restore = crate::redact::installed().and_then(|redactor| {
+            crate::redact::session_restore_map(&redactor, self.agent.session_id())
+        });
         let planned_observation = self.agent.preview_final_logical_request(&prepared.build);
         let telemetry = llm_request_telemetry(
             &format!("turn-{}-iteration-{iteration}", self.agent.turn.turn_id),
@@ -1896,23 +1860,11 @@ pub(super) fn prepare_resolved_oneshot_request(
     // Set before the binding preflight so the preflight validates the request
     // that will actually be sent.
     input.generation.structured_output = structured_output.cloned();
-    let mut restore = None;
-    if redact && let Some(redactor) = crate::redact::active() {
-        let eligible = build
-            .prompt_plan
-            .segments
-            .iter()
-            .filter(|segment| segment_redaction_eligible(segment, true))
-            .map(|segment| segment.id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        restore = crate::redact::mask_input(&redactor, &mut input, &eligible, &cancel)?;
-    }
     route
         .binding
         .prepare_request(&input)
         .map_err(anyhow::Error::new)?;
-    Ok((build, input, restore))
+    Ok((build, input, None))
 }
 pub(super) async fn stream_resolved_oneshot_text_async<F, Fut, R, Rfut>(
     route: &crate::model_runtime::ResolvedModelRoute,
@@ -2008,22 +1960,10 @@ pub(super) fn prepare_oneshot_http_request(
         &crate::user_content::UserMessageContent::new(user_text, vec![]),
         redact,
     )?;
-    let mut input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
+    let input = model_request_from_prompt_plan(route, &model, &build.prompt_plan, &[])
         .map_err(anyhow::Error::msg)?;
-    let mut restore = None;
-    if redact && let Some(redactor) = crate::redact::active() {
-        let eligible = build
-            .prompt_plan
-            .segments
-            .iter()
-            .filter(|segment| segment_redaction_eligible(segment, true))
-            .map(|segment| segment.id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        restore = crate::redact::mask_input(&redactor, &mut input, &eligible, &cancel)?;
-    }
     let request = decorate_oneshot_request(route, &input, decorator)?;
-    Ok((request, restore))
+    Ok((request, None))
 }
 /// Builds the request a caller already shaped, then applies the fake disguise.
 pub(super) fn decorate_oneshot_request(
@@ -2082,22 +2022,3 @@ where
 #[cfg(test)]
 #[path = "../../tests/internal/agent/protocol_stream/integration_tests.rs"]
 mod integration_tests;
-
-fn segment_redaction_eligible(
-    segment: &crate::request_builder::prompt_plan::PromptSegment,
-    redaction_enabled: bool,
-) -> bool {
-    if segment.source.provenance.redaction_eligible {
-        return true;
-    }
-    redaction_enabled
-        && matches!(
-            segment.source.contributor_kind,
-            crate::runtime_context::PromptContributorKind::RuntimeContext
-                | crate::runtime_context::PromptContributorKind::ContextMaterial
-                | crate::runtime_context::PromptContributorKind::ContextIndex
-                | crate::runtime_context::PromptContributorKind::Evidence
-                | crate::runtime_context::PromptContributorKind::CurrentTurn
-                | crate::runtime_context::PromptContributorKind::Other
-        )
-}

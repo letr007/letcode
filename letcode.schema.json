@@ -69,7 +69,7 @@
         "redact": {
           "type": "boolean",
           "default": true,
-          "description": "Replace secrets and personal data in model requests with placeholders for content created while this switch is enabled; restore them in replies and tool arguments. Content created before the switch was enabled, or while it was disabled, stays exempt. Detection is local. A request waits for the model rather than leaving unmasked."
+          "description": "Replace secrets and personal data with placeholders when content is created while this switch is enabled; restore them in replies, tool execution and local display. Whether a piece of content is masked depends only on the switch at creation time and never changes afterwards. Request assembly performs no masking, so toggling the switch never re-runs detection. System prompts, instruction files and skills are not masked. Detection is local. Sending is blocked while the model downloads or loads."
         },
         "submit_while_running": {
           "type": "string",

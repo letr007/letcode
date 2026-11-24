@@ -834,13 +834,11 @@ impl AttemptAccumulator {
         let mut buffer = std::mem::take(&mut self.restore_carry);
         buffer.push_str(delta);
         // A placeholder can arrive in two deltas; hold its tail until the
-        // closing braces show up, since the value must not reach the session.
-        if let Some(open) = buffer.rfind("{{")
-            && !buffer[open..].contains("}}")
-        {
-            self.restore_carry = buffer.split_off(open);
-        }
-        crate::redact::restore_text(values, &buffer)
+        // closing delimiter shows up, since the value must not reach the session.
+        let (head, tail) = crate::redact::split_placeholder(&buffer);
+        let restored = crate::redact::restore_text(values, head);
+        self.restore_carry = tail.to_string();
+        restored
     }
 
     fn flush_restore(&mut self) {

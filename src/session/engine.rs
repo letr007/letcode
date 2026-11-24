@@ -243,33 +243,36 @@ impl SessionEngine {
         };
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        crate::tool::background::set_notifier(Arc::new({
-            let control_tx = control_tx.clone();
-            let event_tx = event_tx.clone();
-            move |event| match event {
-                crate::tool::background::BackgroundEvent::Started {
-                    task_id,
-                    session_id,
-                    command,
-                    title,
-                } => {
-                    let _ = event_tx.send(SessionTransportEvent::BackgroundShellStarted {
+        crate::tool::background::set_notifier(
+            Some(projection.session_id.as_str()),
+            Arc::new({
+                let control_tx = control_tx.clone();
+                let event_tx = event_tx.clone();
+                move |event| match event {
+                    crate::tool::background::BackgroundEvent::Started {
                         task_id,
                         session_id,
                         command,
                         title,
-                    });
+                    } => {
+                        let _ = event_tx.send(SessionTransportEvent::BackgroundShellStarted {
+                            task_id,
+                            session_id,
+                            command,
+                            title,
+                        });
+                    }
+                    crate::tool::background::BackgroundEvent::Completed(outcome) => {
+                        let _ = event_tx.send(SessionTransportEvent::BackgroundShellCompleted {
+                            task_id: outcome.task_id.clone(),
+                        });
+                        let _ = control_tx.send(SessionEngineControl::Command(
+                            SessionEngineCommand::BackgroundShellCompleted { outcome },
+                        ));
+                    }
                 }
-                crate::tool::background::BackgroundEvent::Completed(outcome) => {
-                    let _ = event_tx.send(SessionTransportEvent::BackgroundShellCompleted {
-                        task_id: outcome.task_id.clone(),
-                    });
-                    let _ = control_tx.send(SessionEngineControl::Command(
-                        SessionEngineCommand::BackgroundShellCompleted { outcome },
-                    ));
-                }
-            }
-        }));
+            }),
+        );
         let title_event_tx = event_tx.clone();
         let ingress = SessionEngineIngress {
             control_tx: control_tx.clone(),
@@ -1002,8 +1005,13 @@ where
 }
 
 fn session_title_from_records(records: &[crate::transcript::TranscriptRecord]) -> Option<String> {
+    let session_id = records.first().map(|record| record.session_id.as_str());
     records.iter().rev().find_map(|record| match &record.event {
-        TranscriptEvent::SessionTitle { title } => Some(title.clone()),
+        TranscriptEvent::SessionTitle { title } => Some(
+            session_id
+                .map(|session_id| crate::redact::restore_session_text(session_id, title))
+                .unwrap_or_else(|| title.clone()),
+        ),
         _ => None,
     })
 }
@@ -2134,7 +2142,10 @@ async fn run_engine_loop(
                                 auto_review_service.clear_sticky();
                                 Ok(SessionTransportEvent::SessionResumed {
                                     session_id: session_id.clone(), branch_id: snapshot.branch_id,
-                                    messages: crate::session::restore::restored_messages_from_protocol_frames(&snapshot.snapshot.active_protocol_frames()),
+                                    messages: restored_redacted_messages(
+                                        &session_id,
+                                        &snapshot.snapshot.active_protocol_frames(),
+                                    ),
                                     records, evidence_count: snapshot.snapshot.evidence.len(), model_id: Some(agent.route_display_name()), token_usage: None,
                                     runtime_context,
                                     expert_models: config.expert_default_routes.iter().map(|(name, route)| (name.clone(), route.display_name())).collect(),
@@ -2196,10 +2207,10 @@ async fn run_engine_loop(
                             };
                         let resumed_event_session_id = prepared_install.session().session_id.clone();
                         let resumed_event_branch_id = prepared_install.session().snapshot.branch_id.clone();
-                        let resumed_event_messages =
-                            crate::session::restore::restored_messages_from_protocol_frames(
-                                &prepared_install.session().snapshot.snapshot.active_protocol_frames(),
-                            );
+                        let resumed_event_messages = restored_redacted_messages(
+                            &resumed_event_session_id,
+                            &prepared_install.session().snapshot.snapshot.active_protocol_frames(),
+                        );
                         let resumed_event_records = prepared_install.session().snapshot.records.clone();
                         let resumed_event_evidence_count =
                             prepared_install.session().snapshot.snapshot.evidence.len();
@@ -3286,3 +3297,16 @@ pub(crate) fn format_background_subagent_completion(
 #[cfg(test)]
 #[path = "../../tests/internal/session/engine/tests.rs"]
 mod tests;
+
+fn restored_redacted_messages(
+    session_id: &str,
+    frames: &[crate::protocol_frames::ProtocolFrame],
+) -> Vec<crate::agent::ConversationMessage> {
+    let mut messages = crate::session::restore::restored_messages_from_protocol_frames(frames);
+    if let Some(values) = crate::redact::installed()
+        .and_then(|redactor| crate::redact::session_restore_map(&redactor, Some(session_id)))
+    {
+        crate::redact::restore_messages(&values, &mut messages);
+    }
+    messages
+}

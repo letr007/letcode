@@ -91,8 +91,13 @@ fn clipboard_image_attachment(path: &Path) -> Option<UserImageAttachment> {
 }
 
 pub(crate) fn session_title_from_records(records: &[TranscriptRecord]) -> Option<String> {
+    let session_id = records.first().map(|record| record.session_id.as_str());
     records.iter().rev().find_map(|record| match &record.event {
-        TranscriptEvent::SessionTitle { title } => Some(title.clone()),
+        TranscriptEvent::SessionTitle { title } => Some(
+            session_id
+                .map(|session_id| crate::redact::restore_session_text(session_id, title))
+                .unwrap_or_else(|| title.clone()),
+        ),
         _ => None,
     })
 }

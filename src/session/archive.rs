@@ -814,6 +814,7 @@ pub(crate) fn delete_session_family(sessions_dir: &Path, session_id: &str) -> Re
         remove_file_if_present(&family_live_transcript(sessions_dir, session_id, id));
         remove_file_if_present(&family_transcript_archive(sessions_dir, session_id, id));
         remove_file_if_present(&archive_index::artifacts_path(sessions_dir, id));
+        remove_file_if_present(&sessions_dir.join("maps").join(format!("{id}.json")));
         let live_artifacts = sessions_dir.join("artifacts").join(id);
         if let Err(error) = fs::remove_dir_all(&live_artifacts)
             && error.kind() != std::io::ErrorKind::NotFound

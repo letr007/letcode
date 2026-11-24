@@ -1164,7 +1164,7 @@ impl TuiRuntime {
             SessionTransportEvent::SessionTitleUpdated { session_id, title }
                 if self.state.session_id.as_deref() == Some(session_id) =>
             {
-                self.session_title = Some(title.clone());
+                self.session_title = Some(crate::redact::restore_session_text(session_id, title));
             }
             SessionTransportEvent::UserMessage(user_message) => {
                 self.session_turn_active = true;
