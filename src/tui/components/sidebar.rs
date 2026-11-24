@@ -18,7 +18,6 @@ pub fn render_sidebar(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, t
     let style = surface::surface_style(theme, surface::SurfaceKind::Element);
     frame.render_widget(Clear, area);
     frame.render_widget(Block::new().style(style), area);
-    render_panel_guide(frame, area, theme);
     state.last_sidebar_bounds = area;
 
     let inner = Rect::new(
@@ -927,18 +926,6 @@ fn mcp_server_line(
                 .add_modifier(Modifier::BOLD),
         ),
     ])
-}
-
-fn render_panel_guide(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    for y in area.y..area.bottom() {
-        if let Some(cell) = frame.buffer_mut().cell_mut((area.x, y)) {
-            cell.set_symbol("▎");
-            cell.set_style(Style::default().fg(theme.accent).bg(theme.element_bg));
-        }
-    }
 }
 
 fn permission_color(permission: &str, theme: Theme) -> Color {

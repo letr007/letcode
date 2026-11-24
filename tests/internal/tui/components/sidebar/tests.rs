@@ -190,13 +190,6 @@ fn context_breakdown_excludes_current_output_tokens() {
             .count(),
         19
     );
-    assert_eq!(
-        bar_cells
-            .iter()
-            .filter(|cell| "▉▊▋▌▍▎▏".contains(cell.symbol()))
-            .count(),
-        1
-    );
     assert!(rendered.contains("Remaining       10.0k"), "{rendered}");
 }
 
@@ -350,9 +343,7 @@ fn context_details_leave_room_for_mcp_and_todos() {
         .position(|row| row.contains("MCP"))
         .expect("MCP heading");
     assert!(
-        rows[mcp_row.saturating_sub(1)]
-            .trim_matches(|ch: char| ch == '▎' || ch.is_whitespace())
-            .is_empty(),
+        rows[mcp_row.saturating_sub(1)].trim().is_empty(),
         "{rows:?}"
     );
     assert!(rendered.contains("Todos  1"), "{rendered}");
