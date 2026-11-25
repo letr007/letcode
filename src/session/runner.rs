@@ -405,7 +405,7 @@ where {
         self.record(|recorder| recorder.record_session_redaction(redaction_enabled))?;
         let sender = self.event_tx.clone();
         let response = agent
-            .run_stream_content_with_interactions_async(
+            .run_prepared_stream_content_with_interactions_async(
                 UserMessageContent::default(),
                 move |delta| {
                     let sender = sender.clone();
@@ -577,7 +577,6 @@ where {
     ) -> Result<String>
 where {
         let prompt_content = prompt.content.clone();
-        let prompt_text = prompt_content.text.clone();
         if self.child_session_id.is_none()
             && let Some(transcript) = &self.transcript
         {
@@ -623,8 +622,14 @@ where {
         }
         agent.prepare_subagent_runtime()?;
         self.install_member_message_recorder(agent);
-        let redaction_enabled = crate::redact::active().is_some();
-        agent.set_pending_redaction_enabled(redaction_enabled);
+        let prompt_content = match agent.prepare_user_content(prompt_content).await {
+            Ok(content) => content,
+            Err(error) => {
+                self.finish_with_error(error)?;
+                unreachable!()
+            }
+        };
+        let redaction_enabled = agent.pending_redaction_enabled();
         self.record(|recorder| recorder.record_session_redaction(redaction_enabled))
             .or_else(|error| self.finish_with_error(error))?;
         if record_user_prompt {
@@ -656,7 +661,7 @@ where {
                 .session_title_event_tx
                 .clone()
                 .or_else(|| self.event_tx.clone());
-            let prompt = prompt_text.clone();
+            let prompt = prompt_content.text.clone();
             let title_redaction_enabled = redaction_enabled;
             let title_session_id = session_id.clone();
             tokio::spawn(async move {
@@ -721,7 +726,7 @@ where {
         let required_turn_close =
             agent.subagents_policy().mode == crate::config::SubagentMode::Swarm;
         let response = agent
-            .run_stream_content_with_interactions_async(
+            .run_prepared_stream_content_with_interactions_async(
                 prompt_content.clone(),
                 move |delta| {
                     let sender = sender.clone();
@@ -1363,9 +1368,18 @@ where {
         let origin = self.permission_origin.clone();
         let parent_call = self.parent_tool_call_id.clone();
         agent.set_member_message_recorder(Arc::new(move |message| {
+            let display = match &transcript {
+                Some(transcript) => {
+                    let recorder = transcript
+                        .lock()
+                        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+                    crate::redact::restore_session_text(recorder.session_id(), message)
+                }
+                None => message.to_string(),
+            };
             let submission = UserMessageSubmission::new(
                 crate::subagent::generate_message_id(),
-                UserMessageContent::from(message),
+                UserMessageContent::from(display),
             );
             let event =
                 SessionTransportEvent::UserMessage(UserMessageEvent::from_submission(submission));
@@ -1619,6 +1633,9 @@ fn restore_for_display(
     };
     let mut restored = event.clone();
     match &mut restored {
+        AgentEvent::ReasoningDone { text, .. } => {
+            *text = crate::redact::restore_text(&values, text);
+        }
         AgentEvent::ToolCallStarted { args, .. } => {
             crate::redact::restore_value(&values, args);
         }

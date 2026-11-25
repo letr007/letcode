@@ -127,13 +127,17 @@ pub async fn run_child_prompt(
             recorder.record_user_message(message)
         })
     }));
+    let prompt = agent
+        .prepare_user_content(crate::user_content::UserMessageContent::from(prompt))
+        .await?;
     record_transcript(&transcript, |recorder| {
-        recorder.record_user_message(prompt.clone())
+        recorder.record_session_redaction(agent.pending_redaction_enabled())?;
+        recorder.record_user_message_content(prompt.clone())
     })?;
 
     let response = agent
-        .run_stream_async(
-            &prompt,
+        .run_prepared_stream_content_with_interactions_async(
+            prompt,
             |_| async { Ok(()) },
             {
                 let transcript = Arc::clone(&transcript);
@@ -199,6 +203,12 @@ pub async fn run_child_prompt(
                         Ok(PermissionApproval::Deny)
                     }
                 }
+            },
+            |request| async move {
+                Err(anyhow!(
+                    "question tool requires an interactive runtime; received {} question(s)",
+                    request.questions.len()
+                ))
             },
         )
         .await;

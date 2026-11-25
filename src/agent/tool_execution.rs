@@ -413,7 +413,7 @@ pub(super) async fn cancel_parallel_calls_best_effort<E, Efut>(
 
 pub(super) async fn finalize_parallel_tool_call<E, Efut>(
     agent: &mut Agent,
-    record: &ToolExecutionRecord,
+    record: &mut ToolExecutionRecord,
     on_event: &mut E,
 ) -> Result<()>
 where
@@ -427,7 +427,7 @@ where
         })
         .await?;
     }
-    let output = agent.mask_tool_result_at_creation(&record.output).await?;
+    let output = agent.prepare_tool_history_output(record).await?;
     on_event(AgentEvent::ToolCallFinished {
         call_id: record.call_id.clone(),
         name: record.tool_name.clone(),
@@ -648,16 +648,17 @@ where
         .map(|call| (call.call_id.clone(), call.name.clone()))
         .collect::<Vec<_>>();
     let mut cancellation = None;
-    while let Some((index, batch_record)) = pending.next().await {
+    while let Some((index, mut batch_record)) = pending.next().await {
         let call = &calls[index];
         unfinished.retain(|(call_id, _)| call_id != &call.call_id);
+        let span = batch_record.span();
         let result = async {
-            finalize_subagent_tool_call(agent, call, &batch_record.record, on_event).await?;
+            finalize_subagent_tool_call(agent, call, &mut batch_record.record, on_event).await?;
             agent
                 .record_tool_call_result(call, batch_record.record.clone(), on_event)
                 .await
         }
-        .instrument(batch_record.span())
+        .instrument(span)
         .await;
         match result {
             Ok(ToolCallRecordOutcome::Completed) => batch_record.finish(&Ok(())),
@@ -684,7 +685,7 @@ where
 pub(super) async fn finalize_subagent_tool_call<E, Efut>(
     agent: &mut Agent,
     call: &HistoryToolCall,
-    record: &ToolExecutionRecord,
+    record: &mut ToolExecutionRecord,
     on_event: &mut E,
 ) -> Result<()>
 where
@@ -879,7 +880,7 @@ where
             &call.name,
             format!("unknown or unavailable tool: {}", call.name),
         );
-        let record = ToolExecutionRecord::new(
+        let mut record = ToolExecutionRecord::new(
             call,
             Some(args),
             permission_class,
@@ -887,7 +888,7 @@ where
             None,
             output,
         );
-        emit_finished(agent, on_event, call, &record).await?;
+        emit_finished(agent, on_event, call, &mut record).await?;
         return Ok(record);
     }
 
@@ -896,7 +897,7 @@ where
             &call.name,
             agent.tools.scope().rejection_message(&call.name),
         );
-        let record = ToolExecutionRecord::new(
+        let mut record = ToolExecutionRecord::new(
             call,
             Some(args),
             permission_class,
@@ -904,7 +905,7 @@ where
             Some(ToolExecutionRejection::ToolScopeDenied),
             output,
         );
-        emit_finished(agent, on_event, call, &record).await?;
+        emit_finished(agent, on_event, call, &mut record).await?;
         return Ok(record);
     }
 
@@ -918,7 +919,7 @@ where
         match crate::tool::prepare_writable_leaf(path) {
             Ok(prepared) => Some(prepared),
             Err(error) => {
-                let record = ToolExecutionRecord::new(
+                let mut record = ToolExecutionRecord::new(
                     call,
                     Some(args),
                     permission_class,
@@ -926,7 +927,7 @@ where
                     None,
                     ToolResult::err(&call.name, error.to_string()),
                 );
-                emit_finished(agent, on_event, call, &record).await?;
+                emit_finished(agent, on_event, call, &mut record).await?;
                 return Ok(record);
             }
         }
@@ -942,7 +943,7 @@ where
         {
             Ok(prepared) => Some(prepared),
             Err(error) => {
-                let record = ToolExecutionRecord::new(
+                let mut record = ToolExecutionRecord::new(
                     call,
                     Some(args),
                     permission_class,
@@ -950,7 +951,7 @@ where
                     None,
                     ToolResult::err(&call.name, error.to_string()),
                 );
-                emit_finished(agent, on_event, call, &record).await?;
+                emit_finished(agent, on_event, call, &mut record).await?;
                 return Ok(record);
             }
         }
@@ -967,7 +968,7 @@ where
             prepared_writable_leaf.as_ref(),
             prepared_apply_patch.as_ref(),
         ) {
-            let record = ToolExecutionRecord::new(
+            let mut record = ToolExecutionRecord::new(
                 call,
                 Some(args),
                 permission_class,
@@ -975,7 +976,7 @@ where
                 Some(ToolExecutionRejection::DelegationScopeDenied),
                 ToolResult::err(&call.name, message),
             );
-            emit_finished(agent, on_event, call, &record).await?;
+            emit_finished(agent, on_event, call, &mut record).await?;
             return Ok(record);
         }
         if is_delegation_path_scoped_tool(&call.name) {
@@ -1121,7 +1122,7 @@ where
                     Ok(context) => context,
                     Err(error) => {
                         let output = ToolResult::err(&call.name, error.to_string());
-                        let record = ToolExecutionRecord::new(
+                        let mut record = ToolExecutionRecord::new(
                             call,
                             Some(args),
                             permission_class,
@@ -1129,7 +1130,7 @@ where
                             None,
                             output,
                         );
-                        emit_finished(agent, on_event, call, &record).await?;
+                        emit_finished(agent, on_event, call, &mut record).await?;
                         return Ok(record);
                     }
                 };
@@ -1205,25 +1206,16 @@ where
                             })
                             .await?;
                         }
-                        let mut output = timed_out_tool_result(&call.name, timeout_secs);
-                        if let Some(data) = output.data.as_mut() {
-                            agent.mask_value_at_creation(data).await?;
-                        }
-                        on_event(AgentEvent::ToolCallFinished {
-                            call_id: call.call_id.clone(),
-                            name: call.name.clone(),
-                            ok: false,
-                            output: output.clone(),
-                        })
-                        .await?;
-                        return Ok(ToolExecutionRecord::new(
+                        let mut record = ToolExecutionRecord::new(
                             call,
                             Some(args),
                             permission_class,
                             ToolExecutionStatus::TimedOut,
                             None,
-                            output,
-                        ));
+                            timed_out_tool_result(&call.name, timeout_secs),
+                        );
+                        emit_finished(agent, on_event, call, &mut record).await?;
+                        return Ok(record);
                     }
                 };
                 while let Some((stream, chunk)) = delta_rx.recv().await {
@@ -1243,22 +1235,16 @@ where
                 .await?;
         }
 
-        on_event(AgentEvent::ToolCallFinished {
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            ok: output.ok,
-            output: agent.mask_tool_result_at_creation(&output).await?,
-        })
-        .await?;
-
-        Ok(ToolExecutionRecord::new(
+        let mut record = ToolExecutionRecord::new(
             call,
             Some(args),
             permission_class,
             ToolExecutionStatus::Executed,
             None,
             output,
-        ))
+        );
+        emit_finished(agent, on_event, call, &mut record).await?;
+        Ok(record)
     } else {
         let returned_to_the_requester = auto_return_reason.is_some();
         let output = if matches!(permission_decision, PermissionDecision::Deny) {
@@ -1280,7 +1266,7 @@ where
         } else {
             ToolExecutionRejection::PermissionDeniedByUser
         };
-        let record = ToolExecutionRecord::new(
+        let mut record = ToolExecutionRecord::new(
             call,
             Some(args),
             permission_class,
@@ -1288,7 +1274,7 @@ where
             Some(rejection),
             output,
         );
-        emit_finished(agent, on_event, call, &record).await?;
+        emit_finished(agent, on_event, call, &mut record).await?;
         Ok(record)
     }
 }
@@ -1346,35 +1332,29 @@ where
             call.arguments_json
         ),
     );
-    let output = agent.mask_tool_result_at_creation(&output).await?;
-    on_event(AgentEvent::ToolCallFinished {
-        call_id: call.call_id.clone(),
-        name: call.name.clone(),
-        ok: false,
-        output: output.clone(),
-    })
-    .await?;
-    Ok(ToolExecutionRecord::new(
+    let mut record = ToolExecutionRecord::new(
         call,
         None,
         permission_class_for_tool_call(&agent.tools, &call.name),
         ToolExecutionStatus::Rejected,
         Some(ToolExecutionRejection::InvalidJsonArguments),
         output,
-    ))
+    );
+    emit_finished(agent, on_event, call, &mut record).await?;
+    Ok(record)
 }
 
 async fn emit_finished<E, Efut>(
     agent: &Agent,
     on_event: &mut E,
     call: &HistoryToolCall,
-    record: &ToolExecutionRecord,
+    record: &mut ToolExecutionRecord,
 ) -> Result<()>
 where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    let output = agent.mask_tool_result_at_creation(&record.output).await?;
+    let output = agent.prepare_tool_history_output(record).await?;
     on_event(AgentEvent::ToolCallFinished {
         call_id: call.call_id.clone(),
         name: call.name.clone(),

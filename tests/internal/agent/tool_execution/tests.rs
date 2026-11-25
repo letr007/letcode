@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 fn test_parallel_batch_record(call: &HistoryToolCall) -> ParallelBatchRecord {
     ParallelBatchRecord {
         record: ToolExecutionRecord {
+            history_output: None,
             call_id: call.call_id.clone(),
             tool_name: call.name.clone(),
             permission_class: crate::permission::ToolPermissionClass::Read,

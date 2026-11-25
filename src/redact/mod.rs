@@ -514,11 +514,15 @@ pub(crate) fn mask_item(
                 *reasoning = masker.mask_tracked(reasoning, &cancel)?;
             }
             for call in calls {
-                call.arguments_json = masker.mask_tracked(&call.arguments_json, &cancel)?;
+                let mut arguments = serde_json::from_str(&call.arguments_json)?;
+                masker.mask_value(&mut arguments, &cancel)?;
+                call.arguments_json = serde_json::to_string(&arguments)?;
             }
         }
         crate::request_builder::HistoryItem::ToolOutput { output_json, .. } => {
-            *output_json = masker.mask_tracked(output_json, &cancel)?;
+            let mut output = serde_json::from_str(output_json)?;
+            masker.mask_value(&mut output, &cancel)?;
+            *output_json = serde_json::to_string(&output)?;
         }
     }
     map.lock()

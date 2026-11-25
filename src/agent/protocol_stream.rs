@@ -206,10 +206,12 @@ where
             return Ok(result);
         };
         agent.reload_runtime_snapshot_from_provider()?;
+        user_content = agent
+            .prepare_user_content(UserMessageContent::from(message))
+            .await?;
         agent.member_message_recorder.as_ref().ok_or_else(|| {
             anyhow!("member user recording is unavailable in this execution entry")
-        })?(&message)?;
-        user_content = UserMessageContent::from(message);
+        })?(&user_content.text)?;
     }
 }
 
@@ -238,7 +240,8 @@ where
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);
     if !user_content.has_no_parts()
-        && let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content))
+        && let Err(error) =
+            agent.append_prepared_history_item(HistoryItem::user_content(user_content))
     {
         agent.turn.current_turn_start_index = previous_turn_start_index;
         return Err(error);
@@ -461,10 +464,11 @@ where
         Efut: Future<Output = Result<()>>,
         Afut: Future<Output = Result<PermissionApproval>>,
     {
-        let record = batch_record.record.clone();
+        let mut record = batch_record.record.clone();
         let mut first_error = None;
         if let Err(error) =
-            tool_execution::finalize_parallel_tool_call(self.agent, &record, self.on_event).await
+            tool_execution::finalize_parallel_tool_call(self.agent, &mut record, self.on_event)
+                .await
         {
             first_error = Some(error);
         }
@@ -613,24 +617,37 @@ where
         if text.is_empty() && calls.is_empty() {
             return Ok(false);
         }
+        let mut item = HistoryItem::AssistantTurn {
+            text: (!text.is_empty()).then_some(text),
+            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+            replay,
+            calls,
+        };
         self.agent
-            .append_history_item(HistoryItem::AssistantTurn {
-                text: (!text.is_empty()).then_some(text.clone()),
-                reasoning_content: (!reasoning.is_empty()).then_some(reasoning.clone()),
-                replay: replay.clone(),
-                calls: calls.clone(),
-            })
+            .mask_history_item_at_creation(&mut item)
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        self.agent
+            .append_prepared_history_item(item.clone())
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
+        let HistoryItem::AssistantTurn {
+            text,
+            reasoning_content,
+            replay,
+            calls,
+        } = item
+        else {
+            unreachable!()
+        };
         if calls.is_empty() {
-            (self.on_event)(AgentEvent::AssistantMessage { content: text })
-                .await
-                .map_err(|error| {
-                    runtime_failure(crate::model_runtime::FailurePhase::Finish, error)
-                })?;
+            (self.on_event)(AgentEvent::AssistantMessage {
+                content: text.unwrap_or_default(),
+            })
+            .await
+            .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
         } else {
             (self.on_event)(AgentEvent::AssistantToolCallBatch {
-                text: (!text.is_empty()).then_some(text),
-                reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+                text,
+                reasoning_content,
                 reasoning_wire: replay.and_then(|value| value.payload_json()),
                 calls,
             })
@@ -1053,7 +1070,9 @@ where
                 self.reasoning_summary_items.insert(item_id.clone());
                 (self.on_event)(AgentEvent::ReasoningDone {
                     item_id: reasoning_summary_presentation_id(item_id, *summary_index),
-                    text: text.clone(),
+                    text: self.agent.prepare_text(text).map_err(|error| {
+                        runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                    })?,
                 })
                 .await
                 .map_err(|error| {
@@ -1069,7 +1088,9 @@ where
                 ) {
                     (self.on_event)(AgentEvent::ReasoningDone {
                         item_id: item_id.clone(),
-                        text: displayed_text.to_string(),
+                        text: self.agent.prepare_text(displayed_text).map_err(|error| {
+                            runtime_failure(crate::model_runtime::FailurePhase::Transport, error)
+                        })?,
                     })
                     .await
                     .map_err(|error| {
@@ -1439,8 +1460,9 @@ where
         let (text, _, _, _) = assistant_history_parts(&partial.assistant);
         let pending = pending_ordered.iter().cloned().collect::<BTreeMap<_, _>>();
         let continuation = build_stream_interrupt_continuation(&text, &pending);
-        self.agent
-            .append_history_item(HistoryItem::internal_continuation(continuation.clone()))
+        let continuation = self
+            .agent
+            .append_internal_continuation(continuation)
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
         (self.on_event)(AgentEvent::ModelStreamIssue {
             kind: ModelStreamIssueKind::Recovering,

@@ -1383,6 +1383,7 @@ fn test_tool_call(name: &str, arguments_json: &str) -> HistoryToolCall {
 
 fn test_execution_record(tool_name: &str, output: ToolResult) -> ToolExecutionRecord {
     ToolExecutionRecord {
+        history_output: None,
         call_id: format!("call-{tool_name}"),
         tool_name: tool_name.into(),
         permission_class: crate::permission::ToolPermissionClass::Read,
@@ -3596,6 +3597,7 @@ mod integration_tests {
             }
         });
         let wait_record = ToolExecutionRecord {
+            history_output: None,
             call_id: "wait-dedupe-1".into(),
             tool_name: tool_names::TOOL_AGENT_WAIT.into(),
             permission_class: crate::permission::ToolPermissionClass::Preview,
@@ -5792,6 +5794,9 @@ fn builtin_tool_schemas_avoid_root_level_composition() {
         }
     }
 }
+
+#[path = "agent_redaction_tests.rs"]
+mod redaction_tests;
 
 static REDACT_TEST_LOCK: Mutex<()> = Mutex::new(());
 

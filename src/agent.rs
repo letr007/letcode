@@ -125,6 +125,7 @@ pub(crate) struct ToolExecutionRecord {
     #[allow(dead_code)]
     pub rejection: Option<ToolExecutionRejection>,
     pub output: ToolResult,
+    pub history_output: Option<ToolResult>,
     pub effects: ToolEffects,
 }
 
@@ -1058,6 +1059,11 @@ impl Agent {
         self.pending_redaction_enabled = Some(enabled);
     }
 
+    pub(crate) fn pending_redaction_enabled(&self) -> bool {
+        self.pending_redaction_enabled
+            .expect("user content is prepared")
+    }
+
     fn preview_final_logical_request(
         &self,
         build: &crate::request_builder::BuildResult,
@@ -1126,10 +1132,43 @@ impl Agent {
         self.runtime_snapshot.session_id.as_deref()
     }
 
-    pub(crate) async fn mask_value_at_creation(&self, value: &mut serde_json::Value) -> Result<()> {
-        if !self.turn.redaction_enabled {
-            return Ok(());
+    pub(crate) async fn prepare_user_content(
+        &mut self,
+        content: UserMessageContent,
+    ) -> Result<UserMessageContent> {
+        let redactor = crate::redact::active();
+        self.set_pending_redaction_enabled(redactor.is_some());
+        let Some(redactor) = redactor else {
+            return Ok(content);
+        };
+        let session_id = self.runtime_snapshot.session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut item = HistoryItem::user_content(content);
+            crate::redact::mask_item(&redactor, &mut item, session_id.as_deref())?;
+            let HistoryItem::UserMessage { content } = item else {
+                unreachable!()
+            };
+            Ok(content)
+        })
+        .await
+        .map_err(|error| anyhow!("masking task failed: {error}"))?
+    }
+
+    pub(crate) fn prepare_text(&self, text: &str) -> Result<String> {
+        match crate::redact::active() {
+            Some(redactor) => crate::redact::mask_text(&redactor, self.session_id(), text),
+            None => Ok(text.to_string()),
         }
+    }
+
+    fn mask_history_item_at_creation(&self, item: &mut HistoryItem) -> Result<()> {
+        if let Some(redactor) = crate::redact::active() {
+            crate::redact::mask_item(&redactor, item, self.session_id())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn mask_value_at_creation(&self, value: &mut serde_json::Value) -> Result<()> {
         let Some(redactor) = crate::redact::active() else {
             return Ok(());
         };
@@ -1163,6 +1202,20 @@ impl Agent {
             };
         }
         Ok(output)
+    }
+
+    async fn prepare_tool_history_output(
+        &self,
+        record: &mut ToolExecutionRecord,
+    ) -> Result<ToolResult> {
+        if record.history_output.is_none() {
+            record.history_output = Some(self.mask_tool_result_at_creation(&record.output).await?);
+        }
+        Ok(record
+            .history_output
+            .as_ref()
+            .expect("prepared tool output")
+            .clone())
     }
 
     pub(crate) fn runtime_context(&self) -> Result<crate::runtime_context::RuntimeActiveContext> {
@@ -2816,7 +2869,12 @@ impl Agent {
         self.protocol_append_state.has_incomplete_tool_call_groups()
     }
 
-    pub(super) fn append_history_item(&mut self, item: HistoryItem) -> Result<()> {
+    pub(super) fn append_history_item(&mut self, mut item: HistoryItem) -> Result<()> {
+        self.mask_history_item_at_creation(&mut item)?;
+        self.append_prepared_history_item(item)
+    }
+
+    pub(crate) fn append_prepared_history_item(&mut self, item: HistoryItem) -> Result<()> {
         // RuntimeSnapshot is the single source of truth. Append via a derived
         // ProtocolFrame and rebuild the snapshot, preserving frame identity.
         let mut frame = crate::protocol_frames::ProtocolFrame::derived(
@@ -2864,17 +2922,8 @@ impl Agent {
     fn append_protocol_frame_to_snapshot(
         &mut self,
         mut frame: crate::protocol_frames::ProtocolFrame,
-        mut item: HistoryItem,
+        item: HistoryItem,
     ) -> Result<()> {
-        if self.turn.redaction_enabled
-            && let Some(redactor) = crate::redact::active()
-        {
-            crate::redact::mask_item(
-                &redactor,
-                &mut item,
-                self.runtime_snapshot.session_id.as_deref(),
-            )?;
-        }
         let active_protocol_frame_count = self
             .runtime_snapshot
             .frames
@@ -3344,6 +3393,44 @@ impl Agent {
         Afut: Future<Output = Result<PermissionApproval>> + Send,
         Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
     {
+        let user_content = self.prepare_user_content(user_content).await?;
+        self.run_prepared_stream_content_with_interactions_async(
+            user_content,
+            on_delta,
+            on_event,
+            approve,
+            ask_question,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_prepared_stream_content_with_interactions_async<
+        F,
+        E,
+        A,
+        Q,
+        Dfut,
+        Efut,
+        Afut,
+        Qfut,
+    >(
+        &mut self,
+        user_content: UserMessageContent,
+        on_delta: F,
+        on_event: E,
+        approve: A,
+        ask_question: Q,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Dfut + Send,
+        E: FnMut(AgentEvent) -> Efut + Send,
+        A: FnMut(PermissionRequest) -> Afut + Send,
+        Q: FnMut(QuestionRequest) -> Qfut + Send + 'static,
+        Dfut: Future<Output = Result<()>> + Send,
+        Efut: Future<Output = Result<()>> + Send,
+        Afut: Future<Output = Result<PermissionApproval>> + Send,
+        Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
+    {
         let mut question_handler_guard =
             QuestionHandlerGuard::install(self, Some(Self::wrap_question_handler(ask_question)));
 
@@ -3670,12 +3757,13 @@ impl Agent {
                         )
                         .await?;
                         let mut records = records.into_iter().enumerate();
-                        while let Some((offset, batch_record)) = records.next() {
+                        while let Some((offset, mut batch_record)) = records.next() {
                             let call = &calls[index + offset];
+                            let span = batch_record.span();
                             let result = async {
                                 tool_execution::finalize_parallel_tool_call(
                                     self,
-                                    &batch_record.record,
+                                    &mut batch_record.record,
                                     on_event,
                                 )
                                 .await?;
@@ -3686,7 +3774,7 @@ impl Agent {
                                 )
                                 .await
                             }
-                            .instrument(batch_record.span())
+                            .instrument(span)
                             .await;
                             match result {
                                 Ok(ToolCallRecordOutcome::Completed) => {
@@ -3778,7 +3866,7 @@ impl Agent {
     async fn record_tool_call_result<E, Efut>(
         &mut self,
         call: &HistoryToolCall,
-        record: ToolExecutionRecord,
+        mut record: ToolExecutionRecord,
         on_event: &mut E,
     ) -> Result<ToolCallRecordOutcome>
     where
@@ -3793,11 +3881,12 @@ impl Agent {
             "tool call completed"
         );
 
-        let output_json = serde_json::to_string(&record.output.for_text_history())?;
-        self.append_history_item(HistoryItem::ToolOutput {
+        let output = self.prepare_tool_history_output(&mut record).await?;
+        let output_json = serde_json::to_string(&output.for_text_history())?;
+        self.append_prepared_history_item(HistoryItem::ToolOutput {
             call_id: call.call_id.clone(),
             output_json,
-            images: record.output.images.clone(),
+            images: output.images,
         })?;
         self.reconcile_loaded_skill_material()?;
         if let Some(usage) = self.projected_token_usage() {
@@ -4045,7 +4134,7 @@ impl Agent {
                 *continuation_count += 1;
                 self.turn.counters.continuations = *continuation_count;
                 let text = "Continue the current task internally. Do not repeat finished work. Use the todo list as working context when present; decide yourself when to disable auto-continue.".to_string();
-                self.append_history_item(HistoryItem::internal_continuation(text.clone()))?;
+                let text = self.append_internal_continuation(text)?;
                 on_event(AgentEvent::InternalContinuation {
                     text,
                     source: crate::transcript::InternalContinuationSource::AutoContinue,
@@ -4280,8 +4369,14 @@ impl Agent {
         }
     }
 
-    pub(crate) fn append_internal_continuation(&mut self, text: String) -> Result<()> {
-        self.append_history_item(HistoryItem::internal_continuation(text))
+    pub(crate) fn append_internal_continuation(&mut self, text: String) -> Result<String> {
+        let mut item = HistoryItem::internal_continuation(text);
+        self.mask_history_item_at_creation(&mut item)?;
+        self.append_prepared_history_item(item.clone())?;
+        let HistoryItem::InternalContinuation { text } = item else {
+            unreachable!()
+        };
+        Ok(text)
     }
 
     pub(crate) fn begin_internal_continuation_turn(&mut self) -> Result<()> {
@@ -4302,6 +4397,7 @@ impl Agent {
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("agent__{}", result.agent_name));
         let record = ToolExecutionRecord {
+            history_output: None,
             call_id: format!("background-{}", result.run_id),
             tool_name: parent_tool.clone(),
             permission_class: crate::permission::ToolPermissionClass::Preview,
@@ -4628,6 +4724,7 @@ impl ToolExecutionRecord {
             status,
             rejection,
             output,
+            history_output: None,
             effects,
         }
     }

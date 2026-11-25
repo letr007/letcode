@@ -383,7 +383,7 @@ where
             Some(HistoryItem::InternalContinuation { text: last }) if last == &text
         )
     {
-        agent.append_history_item(HistoryItem::internal_continuation(text.clone()))?;
+        let text = agent.append_internal_continuation(text)?;
         on_event(AgentEvent::InternalContinuation {
             text,
             source: crate::transcript::InternalContinuationSource::CompactionReminder,

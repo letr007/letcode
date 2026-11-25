@@ -1766,6 +1766,7 @@ async fn run_engine_loop(
                         if let Err(error) = agent
                             .begin_internal_continuation_turn()
                             .and_then(|()| {
+                                let prompt = agent.prepare_text(&prompt)?;
                                 transcript
                                     .lock()
                                     .map_err(|_| anyhow!("transcript recorder poisoned"))
@@ -1775,7 +1776,7 @@ async fn run_engine_loop(
                                             crate::transcript::InternalContinuationSource::ShellCompletion,
                                         )
                                     })
-                                    .and_then(|()| agent.append_internal_continuation(prompt))
+                                    .and_then(|()| agent.append_prepared_history_item(crate::request_builder::HistoryItem::internal_continuation(prompt)))
                             })
                         {
                             let _ = session_transport_tx.send(SessionTransportEvent::Error(
@@ -1832,6 +1833,7 @@ async fn run_engine_loop(
                     if let Err(error) = agent
                         .begin_internal_continuation_turn()
                         .and_then(|()| {
+                            let prompt = agent.prepare_text(&prompt)?;
                             transcript
                                 .lock()
                                 .map_err(|_| anyhow!("transcript recorder poisoned"))
@@ -1841,7 +1843,7 @@ async fn run_engine_loop(
                                         crate::transcript::InternalContinuationSource::SubagentCompletion,
                                     )
                                 })
-                                .and_then(|()| agent.append_internal_continuation(prompt))
+                                .and_then(|()| agent.append_prepared_history_item(crate::request_builder::HistoryItem::internal_continuation(prompt)))
                         })
                     {
                         let _ = session_transport_tx.send(SessionTransportEvent::Error(
