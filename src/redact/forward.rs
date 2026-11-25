@@ -145,6 +145,7 @@ impl Weights {
 
         let mut qkv = vec![0f32; n * HIDDEN * 3];
         let mut attn = vec![0f32; n * HIDDEN];
+        let mut heads = vec![0f32; n * HIDDEN * 3];
         let mut proj = vec![0f32; n * HIDDEN];
         let mut up = vec![0f32; n * INTERMEDIATE];
         let mut down = vec![0f32; n * HIDDEN];
@@ -155,7 +156,7 @@ impl Weights {
             layer
                 .qkv
                 .gemm(&quantized, n, scale, zp, Some(&layer.qkv_bias), &mut qkv);
-            attention(&qkv, n, &mut attn);
+            attention(&qkv, n, &mut heads, &mut attn);
 
             let (scale, zp) = quantize_into(&mut quantized, &attn);
             layer.out.gemm(&quantized, n, scale, zp, None, &mut proj);
@@ -170,11 +171,24 @@ impl Weights {
 
             let (scale, zp) = quantize_into(&mut quantized, &h);
             layer.up.gemm(&quantized, n, scale, zp, None, &mut up);
-            for r in 0..n {
-                for c in 0..INTERMEDIATE {
-                    let x = up[r * INTERMEDIATE + c] + layer.up_bias[c];
-                    up[r * INTERMEDIATE + c] = gelu(x) * layer.smooth[c];
+            let activate = |up: &mut [f32]| {
+                for row in up.chunks_mut(INTERMEDIATE) {
+                    for (c, value) in row.iter_mut().enumerate() {
+                        let x = *value + layer.up_bias[c];
+                        *value = gelu(x) * layer.smooth[c];
+                    }
                 }
+            };
+            let workers = threads(n);
+            if workers == 1 {
+                activate(&mut up);
+            } else {
+                std::thread::scope(|s| {
+                    for chunk in up.chunks_mut(n.div_ceil(workers) * INTERMEDIATE) {
+                        let activate = &activate;
+                        s.spawn(move || activate(chunk));
+                    }
+                });
             }
 
             let (scale, zp) = quantize_into(&mut quantized, &up);
@@ -301,60 +315,82 @@ fn erf(x: f32) -> f32 {
     sign * y
 }
 
-fn attention(qkv: &[f32], n: usize, out: &mut [f32]) {
+fn attention(qkv: &[f32], n: usize, heads: &mut [f32], out: &mut [f32]) {
     let stride = HIDDEN * 3;
-    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-    let chunk = n.div_ceil(threads(n));
-    std::thread::scope(|s| {
-        for (index, piece) in out.chunks_mut(chunk * HIDDEN).enumerate() {
-            let r0 = index * chunk;
-            let r1 = r0 + piece.len() / HIDDEN;
-            s.spawn(move || {
-                let mut scores = vec![0f32; n];
-                for r in r0..r1 {
-                    let dst = &mut piece[(r - r0) * HIDDEN..(r - r0 + 1) * HIDDEN];
-                    for head in 0..HEADS {
-                        let q_off = head * HEAD_DIM;
-                        let mut max = f32::NEG_INFINITY;
-                        for (j, slot) in scores.iter_mut().enumerate() {
-                            // SAFETY: `qkv` holds n rows of `stride` floats, and
-                            // the offsets stay inside the head's own slice.
-                            let dot = unsafe {
-                                let q = qkv.as_ptr().add(r * stride + q_off);
-                                let k = qkv.as_ptr().add(j * stride + HIDDEN + q_off);
-                                dot32(q, k)
-                            };
-                            let v = dot * scale;
-                            *slot = v;
-                            if v > max {
-                                max = v;
-                            }
-                        }
-                        let mut sum = 0f32;
-                        for slot in scores.iter_mut() {
-                            *slot = (*slot - max).exp();
-                            sum += *slot;
-                        }
-                        let dst = &mut dst[q_off..q_off + HEAD_DIM];
-                        dst.fill(0.0);
-                        for (j, &p) in scores.iter().enumerate() {
-                            let p = p / sum;
-                            // SAFETY: as above, the V slice of row j is in range.
-                            let v = unsafe {
-                                std::slice::from_raw_parts(
-                                    qkv.as_ptr().add(j * stride + HIDDEN * 2 + q_off),
-                                    HEAD_DIM,
-                                )
-                            };
-                            for (slot, &x) in dst.iter_mut().zip(v) {
-                                *slot += p * x;
-                            }
-                        }
-                    }
-                }
-            });
+    let head_stride = n * HEAD_DIM;
+    let (q, kv) = heads.split_at_mut(n * HIDDEN);
+    let (k, v) = kv.split_at_mut(n * HIDDEN);
+    for head in 0..HEADS {
+        let off = head * HEAD_DIM;
+        for r in 0..n {
+            let dst = head * head_stride + r * HEAD_DIM;
+            q[dst..dst + HEAD_DIM].copy_from_slice(&qkv[r * stride + off..][..HEAD_DIM]);
+            k[dst..dst + HEAD_DIM].copy_from_slice(&qkv[r * stride + HIDDEN + off..][..HEAD_DIM]);
+            v[dst..dst + HEAD_DIM]
+                .copy_from_slice(&qkv[r * stride + HIDDEN * 2 + off..][..HEAD_DIM]);
         }
-    });
+    }
+
+    let workers = threads(n);
+    if workers == 1 {
+        attend(q, k, v, n);
+    } else {
+        let chunk = HEADS.div_ceil(workers) * head_stride;
+        std::thread::scope(|s| {
+            for ((q, k), v) in q
+                .chunks_mut(chunk)
+                .zip(k.chunks(chunk))
+                .zip(v.chunks(chunk))
+            {
+                s.spawn(move || attend(q, k, v, n));
+            }
+        });
+    }
+
+    for head in 0..HEADS {
+        let off = head * HEAD_DIM;
+        for r in 0..n {
+            let src = head * head_stride + r * HEAD_DIM;
+            out[r * HIDDEN + off..][..HEAD_DIM].copy_from_slice(&q[src..src + HEAD_DIM]);
+        }
+    }
+}
+
+fn attend(q: &mut [f32], k: &[f32], v: &[f32], n: usize) {
+    let head_stride = n * HEAD_DIM;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let mut scores = vec![0f32; n];
+    for ((q, k), v) in q
+        .chunks_mut(head_stride)
+        .zip(k.chunks(head_stride))
+        .zip(v.chunks(head_stride))
+    {
+        for query in q.chunks_mut(HEAD_DIM) {
+            let mut max = f32::NEG_INFINITY;
+            for (j, slot) in scores.iter_mut().enumerate() {
+                // SAFETY: each query and key contains HEAD_DIM floats.
+                let dot = unsafe { dot32(query.as_ptr(), k.as_ptr().add(j * HEAD_DIM)) };
+                let value = dot * scale;
+                *slot = value;
+                if value > max {
+                    max = value;
+                }
+            }
+            let mut sum = 0f32;
+            for slot in &mut scores {
+                *slot = (*slot - max).exp();
+                sum += *slot;
+            }
+            let mut values = [0f32; HEAD_DIM];
+            for (&p, value) in scores.iter().zip(v.chunks_exact(HEAD_DIM)) {
+                let p = p / sum;
+                for c in 0..HEAD_DIM {
+                    values[c] += p * value[c];
+                }
+            }
+            query.copy_from_slice(&values);
+        }
+    }
 }
 
 /// # Safety

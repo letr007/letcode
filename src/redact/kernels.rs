@@ -92,31 +92,91 @@ impl QMatrix {
         debug_assert_eq!(a.len(), rows * self.k);
         debug_assert_eq!(out.len(), rows * self.cols);
         let cols = self.cols;
-        let work = |r0: usize, r1: usize, out: &mut [f32], acc: &mut Vec<i32>| {
-            for r in r0..r1 {
-                let row = &a[r * self.k..(r + 1) * self.k];
-                let sum_a: i32 = row.iter().map(|&v| i32::from(v)).sum();
-                self.kernel(row, acc);
-                let dst = &mut out[(r - r0) * cols..(r - r0 + 1) * cols];
-                for c in 0..cols {
-                    let v = acc[c] - azp * self.col_sum[c] - self.zp[c] * sum_a
-                        + self.k as i32 * azp * self.zp[c];
-                    dst[c] = v as f32 * a_scale * self.scale[c] + bias.map_or(0.0, |b| b[c]);
+        let work = |r0: usize, r1: usize, out: &mut [f32], acc: &mut [i32]| {
+            let mut first = r0;
+            while first + 4 <= r1 {
+                let block = &a[first * self.k..(first + 4) * self.k];
+                self.kernel_rows(block, acc);
+                for r in 0..4 {
+                    self.dequant_row(
+                        &block[r * self.k..(r + 1) * self.k],
+                        &acc[r * cols..(r + 1) * cols],
+                        a_scale,
+                        azp,
+                        bias,
+                        &mut out[(first + r - r0) * cols..(first + r - r0 + 1) * cols],
+                    );
                 }
+                first += 4;
+            }
+            for r in first..r1 {
+                let row = &a[r * self.k..(r + 1) * self.k];
+                self.kernel(row, &mut acc[..cols]);
+                self.dequant_row(
+                    row,
+                    &acc[..cols],
+                    a_scale,
+                    azp,
+                    bias,
+                    &mut out[(r - r0) * cols..(r - r0 + 1) * cols],
+                );
             }
         };
-        let chunk_rows = rows.div_ceil(threads(rows));
+        let workers = threads(rows);
+        if workers == 1 {
+            let mut acc = vec![0i32; 4 * cols];
+            work(0, rows, out, &mut acc);
+            return;
+        }
+        let chunk_rows = rows.div_ceil(workers);
         std::thread::scope(|s| {
             for (index, piece) in out.chunks_mut(chunk_rows * cols).enumerate() {
                 let r0 = index * chunk_rows;
                 let r1 = r0 + piece.len() / cols;
                 let work = &work;
                 s.spawn(move || {
-                    let mut acc = vec![0i32; cols];
+                    let mut acc = vec![0i32; 4 * cols];
                     work(r0, r1, piece, &mut acc);
                 });
             }
         });
+    }
+
+    fn dequant_row(
+        &self,
+        a: &[u8],
+        acc: &[i32],
+        a_scale: f32,
+        azp: i32,
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) {
+        let sum_a: i32 = a.iter().map(|&v| i32::from(v)).sum();
+        for c in 0..self.cols {
+            let v = acc[c] - azp * self.col_sum[c] - self.zp[c] * sum_a
+                + self.k as i32 * azp * self.zp[c];
+            out[c] = v as f32 * a_scale * self.scale[c] + bias.map_or(0.0, |b| b[c]);
+        }
+    }
+
+    fn kernel_rows(&self, a: &[u8], out: &mut [i32]) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("dotprod")
+                && self.k.is_multiple_of(4)
+                && self.cols.is_multiple_of(16)
+            {
+                // SAFETY: dotprod is present, four input rows and 16-column tiles fit without padding.
+                unsafe { self.kernel_dotprod_rows(a, out) };
+                return;
+            }
+        }
+        for r in 0..4 {
+            self.kernel(
+                &a[r * self.k..(r + 1) * self.k],
+                &mut out[r * self.cols..(r + 1) * self.cols],
+            );
+        }
     }
 
     // VNNI would double this, but on a hybrid Intel CPU a thread scheduled onto
@@ -252,6 +312,53 @@ impl QMatrix {
 
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon,dotprod")]
+    unsafe fn kernel_dotprod_rows(&self, a: &[u8], out: &mut [i32]) {
+        use std::arch::aarch64::*;
+
+        for tile in (0..self.cols / TILE_COLS).step_by(4) {
+            let mut acc = [[vdupq_n_s32(0); 4]; 4];
+            for group in 0..self.k_groups {
+                let mut av = [vdupq_n_s8(0); 4];
+                for (r, slot) in av.iter_mut().enumerate() {
+                    // SAFETY: `k` is a multiple of 4, so each of the four rows has a full 4-byte group at `group * 4`.
+                    let bits = unsafe {
+                        a.as_ptr()
+                            .add(r * self.k + group * 4)
+                            .cast::<u32>()
+                            .read_unaligned()
+                    };
+                    *slot = vreinterpretq_s8_u32(vdupq_n_u32(bits.to_le() ^ 0x8080_8080));
+                }
+                for (g, column) in acc.iter_mut().enumerate() {
+                    // SAFETY: `cols` is a multiple of 16, so this tile group lies inside the blocked layout.
+                    let w = unsafe {
+                        vld1q_s8(
+                            self.blocked
+                                .as_ptr()
+                                .add(((tile + g) * self.k_groups + group) * 16),
+                        )
+                    };
+                    for (value, av) in column.iter_mut().zip(av) {
+                        // SAFETY: `kernel_dotprod_rows` carries the dotprod feature.
+                        *value = unsafe { dot(*value, av, w) };
+                    }
+                }
+            }
+            for (g, column) in acc.iter().enumerate() {
+                for (r, value) in column.iter().enumerate() {
+                    let col = (tile + g) * TILE_COLS;
+                    // SAFETY: `out` holds four rows of `cols`, and the tile group ends inside each row.
+                    unsafe { vst1q_s32(out.as_mut_ptr().add(r * self.cols + col), *value) };
+                    for c in 0..TILE_COLS {
+                        out[r * self.cols + col + c] += 128 * self.col_sum[col + c];
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon,dotprod")]
     unsafe fn kernel_dotprod(&self, a: &[u8], out: &mut [i32]) {
         use std::arch::aarch64::*;
 
@@ -358,26 +465,58 @@ mod tests {
 
     #[test]
     fn the_packed_kernel_matches_the_scalar_one() {
-        let (k, cols) = (18, 21);
-        let mut state = 0x2545_f491u32;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            (state % 255) as i32 - 127
-        };
-        let w: Vec<i8> = (0..k * cols).map(|_| next() as i8).collect();
-        let matrix =
-            QMatrix::new(k, cols, w, vec![0.5; cols], vec![0; cols]).expect("the matrix builds");
-        for row in 0..3u8 {
-            let a: Vec<u8> = (0..k)
-                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(row))
+        for (k, cols, rows) in [(8, 32, 5), (18, 21, 5)] {
+            let mut state = 0x2545_f491u32;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state % 255) as i32 - 127
+            };
+            let w: Vec<i8> = (0..k * cols).map(|_| next() as i8).collect();
+            let scale: Vec<f32> = (0..cols).map(|c| 0.25 + c as f32 * 0.03).collect();
+            let zp: Vec<i32> = (0..cols).map(|c| c as i32 % 5 - 2).collect();
+            let matrix = QMatrix::new(k, cols, w, scale, zp).expect("the matrix builds");
+            let a: Vec<u8> = (0..rows * k)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
                 .collect();
-            let mut want = vec![0i32; cols];
-            matrix.kernel_scalar(&a, &mut want);
-            let mut got = vec![0i32; cols];
-            matrix.kernel(&a, &mut got);
-            assert_eq!(want, got);
+
+            let mut want_acc = vec![0i32; rows * cols];
+            for r in 0..rows {
+                matrix.kernel_scalar(
+                    &a[r * k..(r + 1) * k],
+                    &mut want_acc[r * cols..(r + 1) * cols],
+                );
+            }
+            let mut got_acc = vec![0i32; 4 * cols];
+            for first in (0..rows / 4 * 4).step_by(4) {
+                matrix.kernel_rows(&a[first * k..(first + 4) * k], &mut got_acc);
+                assert_eq!(
+                    want_acc[first * cols..(first + 4) * cols],
+                    got_acc[..4 * cols]
+                );
+            }
+            for r in rows / 4 * 4..rows {
+                matrix.kernel(&a[r * k..(r + 1) * k], &mut got_acc[..cols]);
+                assert_eq!(want_acc[r * cols..(r + 1) * cols], got_acc[..cols]);
+            }
+
+            let (a_scale, azp) = (0.017, -3);
+            let bias: Vec<f32> = (0..cols).map(|c| c as f32 * 0.01).collect();
+            let mut got = vec![0f32; rows * cols];
+            matrix.gemm(&a, rows, a_scale, azp, Some(&bias), &mut got);
+            let mut want = vec![0f32; rows * cols];
+            for r in 0..rows {
+                let sum_a: i32 = a[r * k..(r + 1) * k].iter().map(|&v| i32::from(v)).sum();
+                for c in 0..cols {
+                    let v = want_acc[r * cols + c] - azp * matrix.col_sum[c] - matrix.zp[c] * sum_a
+                        + k as i32 * azp * matrix.zp[c];
+                    want[r * cols + c] = v as f32 * a_scale * matrix.scale[c] + bias[c];
+                }
+            }
+            let want_bits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(want_bits, got_bits);
         }
     }
 }

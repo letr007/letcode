@@ -112,6 +112,7 @@ fn parse_graph(data: &[u8], dir: &Path, graph: &mut Graph) -> Result<()> {
         }
     }
     graph.nodes = nodes;
+    let mut blobs = HashMap::new();
     for mut t in tensors {
         if let Some(external) = t.external.take() {
             let file = external
@@ -133,8 +134,14 @@ fn parse_graph(data: &[u8], dir: &Path, graph: &mut Graph) -> Result<()> {
                 .transpose()
                 .context("external data length")?;
             let path = dir.join(file);
-            let blob = std::fs::read(&path)
-                .with_context(|| format!("reading external data {}", path.display()))?;
+            let blob = match blobs.entry(path.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let blob = std::fs::read(&path)
+                        .with_context(|| format!("reading external data {}", path.display()))?;
+                    entry.insert(blob)
+                }
+            };
             let end = length.map_or(blob.len(), |l| offset + l);
             t.values = Values::Raw(
                 blob.get(offset..end)
