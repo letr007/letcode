@@ -1240,6 +1240,82 @@ fn terminal_events_seal_active_reasoning() {
 }
 
 #[test]
+fn stream_recovery_preserves_reasoning_and_tool_order() {
+    use crate::tui::events::{ReasoningDeltaEvent, ReasoningDoneEvent};
+    use crate::tui::timeline::{TimelineItem, ToolExecutionStatus};
+
+    for (child_session_id, viewing_child) in
+        [(None, false), (Some("child"), true), (Some("child"), false)]
+    {
+        let mut state = TuiState::default();
+        if viewing_child {
+            state.replace_child_timeline_from_records(&[], "parent", "child", "explorer", 0, 1, 1);
+        }
+        if child_session_id.is_some() {
+            state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::new(
+                "reasoning",
+                "parent reasoning",
+            )));
+        }
+        let apply = |state: &mut TuiState, event| {
+            if let Some(child_session_id) = child_session_id {
+                state.apply_child_session_event(child_session_id, event);
+            } else {
+                state.apply_event(event);
+            }
+        };
+        for event in [
+            SessionEvent::TurnStarted,
+            SessionEvent::ReasoningDelta(ReasoningDeltaEvent::new("reasoning", "first reasoning")),
+            SessionEvent::ToolPending(ToolPendingEvent::new("call-1", "fs__read")),
+            SessionEvent::ToolCancelled(ToolCancelledEvent::new("call-1", "fs__read")),
+            SessionEvent::ProcessIssue(ProcessIssueEvent::new("Model stream interrupted")),
+        ] {
+            apply(&mut state, event);
+        }
+        for event in [
+            SessionEvent::ReasoningDelta(ReasoningDeltaEvent::new("reasoning", "next reasoning")),
+            SessionEvent::ReasoningDone(ReasoningDoneEvent::new("reasoning", "next reasoning")),
+        ] {
+            let streaming = matches!(&event, SessionEvent::ReasoningDelta(_));
+            apply(&mut state, event);
+            let (timeline, phase) = if let Some(child_session_id) = child_session_id {
+                let child = state
+                    .child_timeline
+                    .as_ref()
+                    .or_else(|| state.child_timeline_cache.get(child_session_id))
+                    .expect("child timeline");
+                (&child.timeline, child.phase)
+            } else {
+                (&state.timeline, state.phase)
+            };
+            assert_eq!(phase, AppPhase::Running);
+            assert!(
+                matches!(
+                    timeline.items(),
+                    [TimelineItem::Reasoning(first), TimelineItem::Tool(tool), TimelineItem::Reasoning(next)]
+                        if first.text == "first reasoning"
+                            && !first.streaming
+                            && first.started_at.is_none()
+                            && first.duration_ms.is_some()
+                            && tool.status == ToolExecutionStatus::Cancelled
+                            && next.text == "next reasoning"
+                            && next.streaming == streaming
+                ),
+                "child={child_session_id:?}, viewing={viewing_child}, streaming={streaming}"
+            );
+        }
+        if child_session_id.is_some() {
+            assert!(matches!(
+                state.timeline.items(),
+                [TimelineItem::Reasoning(reasoning)]
+                    if reasoning.streaming && reasoning.text == "parent reasoning"
+            ));
+        }
+    }
+}
+
+#[test]
 fn compaction_lifecycle_only_commits_after_acknowledged_terminal_event() {
     let mut state = TuiState::default();
     state.apply_event(SessionEvent::CompactionStarted);

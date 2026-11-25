@@ -222,6 +222,9 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
             projection.timeline.finish_compaction(false);
         }
         SessionEvent::ProcessIssue(issue) => {
+            projection
+                .timeline
+                .seal_active_reasoning(std::time::Instant::now());
             *projection.phase = AppPhase::Running;
             *projection.toast = Some(ToastState::new(
                 issue.message,

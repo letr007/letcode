@@ -3301,6 +3301,16 @@ impl TuiState {
             }
             SessionEvent::RetryScheduled(_) => {}
             SessionEvent::ProcessIssue(issue) => {
+                if let Some(child) = self
+                    .child_timeline
+                    .as_mut()
+                    .filter(|child| child.session_id == child_session_id)
+                    .or_else(|| self.child_timeline_cache.get_mut(child_session_id))
+                {
+                    child
+                        .timeline
+                        .seal_active_reasoning(std::time::Instant::now());
+                }
                 self.show_toast(
                     child_feedback_message(agent_name, child_session_id, &issue.message),
                     ToastKind::Error,
