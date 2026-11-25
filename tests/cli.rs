@@ -32,6 +32,17 @@ const DISCOVER_CALL: &str = "peer-discover-call";
 const SEND_CALL: &str = "peer-greeting-call";
 const REPLY_CALL: &str = "peer-reply-call";
 
+const CREDENTIAL: &str = "dummy-cli-test-key";
+const CREDENTIAL_ENV: &str = "LETCODE_TEST_API_KEY";
+const WRITE_PROMPT: &str =
+    "Create notes.txt with fs__write, then rename the indented line with edit__apply_patch.";
+const WRITE_PATH: &str = "notes.txt";
+const WRITE_INITIAL: &str = "# 笔记标题\n\n\t初始行\n";
+const WRITE_FINAL: &str = "# 笔记标题\n\n\t修改行\n\n\n最后一行\n";
+const WRITE_CALL: &str = "write-notes-call";
+const PATCH_CALL: &str = "patch-notes-call";
+const WRITE_ANSWER: &str = "The notes file was written and patched.";
+
 type Requests = Arc<Mutex<Vec<Value>>>;
 
 struct Sandbox {
@@ -73,6 +84,22 @@ impl Sandbox {
     }
 
     fn configure(&self, server: &ModelServer) {
+        self.configure_with(
+            server,
+            "default",
+            &format!("credential = {}", json!(CREDENTIAL)),
+        );
+    }
+
+    fn configure_for_writes(&self, server: &ModelServer) {
+        self.configure_with(
+            server,
+            "yolo",
+            &format!("credential_env = {}", json!(CREDENTIAL_ENV)),
+        );
+    }
+
+    fn configure_with(&self, server: &ModelServer, mode: &str, auth: &str) {
         let config = format!(
             r#"active_provider = "local"
 
@@ -87,7 +114,7 @@ max_tool_calls = 4
 enabled = false
 
 [permissions]
-mode = "default"
+mode = {mode}
 
 [providers.local]
 protocol = "responses"
@@ -96,7 +123,7 @@ flavor = "standard"
 
 [providers.local.auth]
 type = "bearer"
-credential = "dummy-cli-test-key"
+{auth}
 
 [providers.local.endpoints]
 base_url = "http://{address}/v1"
@@ -107,6 +134,7 @@ tools = true
             sessions = json!(self.sessions.to_str().unwrap()),
             log = json!(self.home.join("letcode.log").to_str().unwrap()),
             address = server.address,
+            mode = json!(mode),
         );
         std::fs::write(&self.config, config).unwrap();
     }
@@ -140,6 +168,7 @@ tools = true
             .env("TMPDIR", &self.temp)
             .env("LANG", "C")
             .env("LC_ALL", "C")
+            .env(CREDENTIAL_ENV, CREDENTIAL)
             .current_dir(&self.workspace)
             .args(args)
             .stdin(Stdio::piped())
@@ -360,6 +389,7 @@ async fn capture_output(
 #[derive(Clone)]
 enum ModelScript {
     File { fail: bool },
+    Edit,
     Peer { reply_allowed: Arc<Notify> },
 }
 
@@ -456,6 +486,7 @@ async fn serve_request(
     requests: &Requests,
     script: &ModelScript,
 ) -> Result<(), String> {
+    let expected = format!("authorization: Bearer {}", CREDENTIAL);
     let mut bytes = Vec::new();
     let mut chunk = [0; 4096];
     let (header_end, content_length) = loop {
@@ -483,7 +514,7 @@ async fn serve_request(
             }
             if !headers
                 .lines()
-                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer dummy-cli-test-key"))
+                .any(|line| line.eq_ignore_ascii_case(&expected))
             {
                 return Err("missing dummy bearer credential".into());
             }
@@ -529,6 +560,8 @@ async fn serve_request(
             message("File discussion")
         } else if let ModelScript::Peer { reply_allowed } = script {
             peer_response(&request, reply_allowed).await?
+        } else if matches!(script, ModelScript::Edit) {
+            edit_response(&request)?
         } else if input.contains(FOLLOWUP) {
             message(RESUMED_ANSWER)
         } else if tool_output(&request).is_some() {
@@ -607,7 +640,7 @@ async fn peer_response(request: &Value, reply_allowed: &Notify) -> Result<Value,
                 let peers = result["data"]["peers"].as_array().unwrap();
                 assert_eq!(peers.len(), 1, "{result}");
                 assert_ne!(peers[0]["address"], result["data"]["self"]);
-                Ok(peer_call(
+                Ok(function_call(
                     SEND_CALL,
                     "peer__send",
                     json!({
@@ -628,11 +661,11 @@ async fn peer_response(request: &Value, reply_allowed: &Notify) -> Result<Value,
     }
     let text = user_text(user);
     if text == PEER_PROMPT {
-        Ok(peer_call(DISCOVER_CALL, "peer__discover", json!({})))
+        Ok(function_call(DISCOVER_CALL, "peer__discover", json!({})))
     } else if text.contains(PEER_GREETING) {
         let address = peer_source(&text);
         reply_allowed.notified().await;
-        Ok(peer_call(
+        Ok(function_call(
             REPLY_CALL,
             "peer__send",
             json!({
@@ -646,16 +679,63 @@ async fn peer_response(request: &Value, reply_allowed: &Notify) -> Result<Value,
     }
 }
 
+fn edit_response(request: &Value) -> Result<Value, String> {
+    if let Some(output) = call_output(request, PATCH_CALL) {
+        assert_eq!(output["ok"], true, "{output:#}");
+        assert_eq!(output["data"]["files_changed"], 1, "{output:#}");
+        assert_eq!(output["data"]["edits_applied"], 1, "{output:#}");
+        return Ok(message(WRITE_ANSWER));
+    }
+    if let Some(output) = call_output(request, WRITE_CALL) {
+        assert_eq!(output["ok"], true, "{output:#}");
+        assert_eq!(output["data"]["path"], WRITE_PATH, "{output:#}");
+        assert_eq!(
+            output["data"]["bytes_written"],
+            WRITE_INITIAL.len(),
+            "{output:#}"
+        );
+        return Ok(function_call(
+            PATCH_CALL,
+            "edit__apply_patch",
+            json!({
+                "edits": [{
+                    "path": WRITE_PATH,
+                    "find": "\t初始行\n",
+                    "replace": "\t修改行\n\n\n最后一行\n",
+                    "replace_all": false,
+                }]
+            }),
+        ));
+    }
+    let text = user_text(latest_user(request).0);
+    if !text.contains(WRITE_PROMPT) {
+        return Err(format!("unexpected edit model input: {text}"));
+    }
+    Ok(function_call(
+        WRITE_CALL,
+        "fs__write",
+        json!({"path": WRITE_PATH, "content": WRITE_INITIAL}),
+    ))
+}
+
+fn call_output(request: &Value, call_id: &str) -> Option<Value> {
+    request["input"]
+        .as_array()?
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+        .map(|item| serde_json::from_str(item["output"].as_str().unwrap()).unwrap())
+}
+
+fn function_call(call_id: &str, name: &str, arguments: Value) -> Value {
+    json!({"type":"function_call", "id":format!("fc_{call_id}"), "call_id":call_id, "name":name, "arguments":arguments.to_string()})
+}
+
 fn peer_source(text: &str) -> Value {
     let source = text.strip_prefix("[Peer message from ").unwrap();
     let (source, _) = source
         .split_once(". The source is routing metadata.]\n")
         .unwrap();
     serde_json::from_str(source).unwrap()
-}
-
-fn peer_call(call_id: &str, name: &str, arguments: Value) -> Value {
-    json!({"type":"function_call", "id":format!("fc_{call_id}"), "call_id":call_id, "name":name, "arguments":arguments.to_string()})
 }
 
 fn message(text: &str) -> Value {
@@ -814,6 +894,78 @@ async fn one_shot_tool_result_is_persisted_and_resumed_by_another_process() {
         records
             .iter()
             .any(|record| record["kind"] == "assistant_turn" && record["text"] == RESUMED_ANSWER)
+    );
+}
+
+#[tokio::test]
+async fn write_and_patch_flow_lands_on_disk_and_in_the_journal() {
+    let sandbox = Sandbox::new();
+    let server = ModelServer::scripted(ModelScript::Edit).await;
+    sandbox.configure_for_writes(&server);
+    let target = sandbox.workspace.join(WRITE_PATH);
+    assert!(!target.exists());
+
+    let output = sandbox
+        .run(&["-p", WRITE_PROMPT, "--json"], "", Some(&server.requests))
+        .await;
+    assert_success(&output);
+    let result = json_stdout(&output, &server.requests);
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["response"], WRITE_ANSWER);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), WRITE_FINAL);
+
+    let requests = server.main_requests();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    assert!(requests[0]["input"].to_string().contains(WRITE_PROMPT));
+    for (index, call_id, name) in [
+        (1_usize, WRITE_CALL, "fs__write"),
+        (2_usize, PATCH_CALL, "edit__apply_patch"),
+    ] {
+        let call = requests[index]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call" && item["call_id"] == call_id)
+            .unwrap_or_else(|| panic!("missing {call_id}: {requests:#?}"));
+        assert_eq!(call["name"], name);
+        let tool = call_output(&requests[index], call_id)
+            .unwrap_or_else(|| panic!("missing {call_id} output: {requests:#?}"));
+        assert_eq!(tool["ok"], true, "{tool:#}");
+    }
+    assert_eq!(
+        call_output(&requests[1], WRITE_CALL).unwrap()["data"]["bytes_written"],
+        WRITE_INITIAL.len()
+    );
+    assert_eq!(
+        call_output(&requests[2], PATCH_CALL).unwrap()["data"]["files_changed"],
+        1
+    );
+
+    let session_id = result["session_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .unwrap();
+    let (_, _, records) = sandbox.journal(session_id);
+    assert!(records.iter().any(
+        |record| record["kind"] == "user_message" && record.to_string().contains(WRITE_PROMPT)
+    ));
+    for (call_id, name) in [(WRITE_CALL, "fs__write"), (PATCH_CALL, "edit__apply_patch")] {
+        let tool = records
+            .iter()
+            .find(|record| record["kind"] == "tool_call_finished" && record["call_id"] == call_id)
+            .unwrap_or_else(|| panic!("missing {call_id}: {records:#?}"));
+        assert_eq!(tool["name"], name);
+        assert_eq!(tool["ok"], true, "{tool:#}");
+    }
+    let patch = records
+        .iter()
+        .find(|record| record["kind"] == "tool_call_finished" && record["call_id"] == PATCH_CALL)
+        .unwrap();
+    assert_eq!(patch["output"]["data"]["files_changed"], 1, "{patch:#}");
+    assert!(
+        records
+            .iter()
+            .any(|record| record["kind"] == "assistant_turn" && record["text"] == WRITE_ANSWER)
     );
 }
 

@@ -581,81 +581,82 @@ fn credential_debug_output_is_redacted_but_request_value_is_preserved() {
 }
 
 #[test]
-fn credential_snapshot_is_immutable_after_environment_mutation() {
-    let key = "LETcode_GROUP03A_SNAPSHOT";
-    unsafe { std::env::set_var(key, "first-secret") };
+fn resolved_credentials_are_independent_of_configuration_updates() {
     let value = runtime_config(
         "vendor",
-        &format!("type = \"bearer\"\ncredential_env = \"{key}\""),
+        "type = \"bearer\"\ncredential = \"first-secret\"",
         "",
         "",
     );
-    let config = RuntimeConfig::from_toml(&value).unwrap();
+    let mut config = RuntimeConfig::from_toml(&value).unwrap();
     let first = config.resolve(&ProtocolRegistry::builtins()).unwrap();
-    unsafe { std::env::set_var(key, "second-secret") };
+    config.providers.get_mut("vendor").unwrap().auth.credential = Some("second-secret".into());
     let second = config.resolve(&ProtocolRegistry::builtins()).unwrap();
-    assert_eq!(
-        first
-            .route("vendor", "model")
-            .unwrap()
-            .auth
-            .credential
-            .as_deref(),
-        Some("first-secret")
-    );
+    for (catalog, expected) in [(&first, "first-secret"), (&second, "second-secret")] {
+        assert_eq!(
+            catalog
+                .route("vendor", "model")
+                .unwrap()
+                .auth
+                .credential
+                .as_deref(),
+            Some(expected)
+        );
+    }
     assert_ne!(first.fingerprint(), second.fingerprint());
-    unsafe { std::env::remove_var(key) };
-}
-
-#[test]
-fn default_provider_environment_credential_is_snapshotted() {
-    let key = "GROUP03A_DEFAULT_ENV_ONLY";
-    unsafe { std::env::set_var(key, "default-first") };
-    let value = runtime_config(
-        "default-env-vendor",
-        &format!("type = \"bearer\"\ncredential_env = \"{key}\""),
-        "",
-        "",
-    );
-    let config = RuntimeConfig::from_toml(&value).unwrap();
-    let first = config.resolve(&ProtocolRegistry::builtins()).unwrap();
-    unsafe { std::env::set_var(key, "default-second") };
-    assert_eq!(
-        first
-            .route("default-env-vendor", "model")
-            .unwrap()
-            .auth
-            .credential
-            .as_deref(),
-        Some("default-first")
-    );
-    unsafe { std::env::remove_var(key) };
 }
 
 mod integration_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{Duration, timeout};
+
+    const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+    async fn read_headers(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "request ended before headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            assert!(
+                bytes.len() <= 16 * 1024,
+                "request headers exceed fixture limit"
+            );
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                return String::from_utf8(bytes[..end].to_vec()).unwrap();
+            }
+        }
+    }
+
+    async fn serve_response(listener: TcpListener, parts: &[&[u8]]) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_headers(&mut stream).await;
+        for part in parts {
+            stream.write_all(part).await.unwrap();
+        }
+        stream.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn provider_requests_identify_letcode_unless_a_header_overrides_it() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let url = format!("http://{address}/v1/responses");
-        let server = tokio::spawn(async move {
+        let server = async {
             let mut seen = Vec::new();
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let mut buffer = vec![0u8; 4096];
-                let read = stream.read(&mut buffer).await.unwrap();
-                seen.push(String::from_utf8_lossy(&buffer[..read]).to_lowercase());
+                seen.push(read_headers(&mut stream).await.to_lowercase());
                 stream
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
                     .await
                     .unwrap();
             }
             seen
-        });
+        };
 
         let transport =
             ProviderTransport::new_for_endpoint(&RuntimeTransportConfig::default(), Some(&url))
@@ -673,23 +674,27 @@ mod integration_tests {
                 "codex_cli_rs/9.9.9 (Plan9; vax) vt100/1 (codex_cli_rs; 9.9.9)".to_string(),
             )]),
         ];
-        for headers in &sent {
-            let request = transport
-                .request(
-                    reqwest::Method::POST,
-                    &url,
-                    "vendor",
-                    &auth,
-                    headers,
-                    &BTreeMap::new(),
-                )
-                .unwrap()
-                .build()
-                .unwrap();
-            let _ = transport.client().execute(request).await;
-        }
-
-        let seen = server.await.unwrap();
+        let client = async {
+            for headers in &sent {
+                let request = transport
+                    .request(
+                        reqwest::Method::POST,
+                        &url,
+                        "vendor",
+                        &auth,
+                        headers,
+                        &BTreeMap::new(),
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let response = transport.client().execute(request).await.unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+            }
+        };
+        let (seen, ()) = timeout(IO_TIMEOUT, async { tokio::join!(server, client) })
+            .await
+            .expect("provider request deadline exceeded");
         assert!(
             seen[0].contains(&format!("user-agent: {}", user_agent().to_lowercase())),
             "{}",
@@ -706,14 +711,12 @@ mod integration_tests {
 
     #[tokio::test]
     async fn transport_errors_redact_request_metadata() {
-        let transport = ProviderTransport::new_for_endpoint(
-            &RuntimeTransportConfig {
-                connect_timeout_secs: 1,
-                ..RuntimeTransportConfig::default()
-            },
-            Some("http://127.0.0.1:1"),
-        )
-        .unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("http://{}/model", listener.local_addr().unwrap());
+        let server = serve_response(listener, &[]);
+        let transport =
+            ProviderTransport::new_for_endpoint(&RuntimeTransportConfig::default(), Some(&url))
+                .unwrap();
         let auth = RuntimeAuthConfig {
             scheme: AuthScheme::Query,
             name: Some("api-token".into()),
@@ -723,14 +726,19 @@ mod integration_tests {
         let request = transport
             .request(
                 reqwest::Method::GET,
-                "http://127.0.0.1:1/unreachable",
+                &url,
                 "vendor",
                 &auth,
                 &BTreeMap::from([(String::from("x-configured"), String::from("header secret"))]),
                 &BTreeMap::from([(String::from("trace"), String::from("query value"))]),
             )
             .unwrap();
-        let failure = transport.send(request, &auth).await.unwrap_err();
+        let ((), failure) = timeout(IO_TIMEOUT, async {
+            tokio::join!(server, transport.send(request, &auth))
+        })
+        .await
+        .expect("transport failure deadline exceeded");
+        let failure = failure.unwrap_err();
         assert_eq!(failure.status, None);
         assert_eq!(failure.retry_hint, RetryHint::Retryable);
         for representation in [
@@ -748,27 +756,15 @@ mod integration_tests {
 
     #[tokio::test]
     async fn local_chunked_transport_response_preserves_boundary_metadata() {
-        use std::io::Write;
-        use std::net::TcpListener;
-        use std::thread;
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = std::io::Read::read(&mut stream, &mut request);
-            for part in [
-                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nX-Test: boundary\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
-                b"5\r\nfirst\r\n".as_slice(),
-                b"6\r\nsecond\r\n".as_slice(),
-                b"0\r\n\r\n".as_slice(),
-            ] {
-                stream.write_all(part).unwrap();
-                stream.flush().unwrap();
-                thread::yield_now();
-            }
-        });
+        let parts: &[&[u8]] = &[
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nX-Test: boundary\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"5\r\nfirst\r\n",
+            b"6\r\nsecond\r\n",
+            b"0\r\n\r\n",
+        ];
+        let server = serve_response(listener, parts);
         let transport = ProviderTransport::new_for_endpoint(
             &RuntimeTransportConfig::default(),
             Some(&format!("http://{address}")),
@@ -790,42 +786,32 @@ mod integration_tests {
                 &BTreeMap::from([(String::from("trace"), String::from("one"))]),
             )
             .unwrap();
-        let mut response = transport.send(request, &auth).await.unwrap();
-        assert_eq!(response.status, 429);
-        assert_eq!(
-            response.headers.get("x-test"),
-            Some(&String::from("boundary"))
-        );
-        assert_eq!(response.retry_hint(), RetryHint::RetryAfterSeconds(7));
-        let mut body = Vec::new();
-        while let Some(chunk) = response.next_chunk().await {
-            body.extend_from_slice(&chunk.unwrap());
-        }
-        assert_eq!(body, b"firstsecond");
-        assert!(!body.windows(3).any(|window| window == b"5\r\n"));
-        assert!(!body.windows(3).any(|window| window == b"6\r\n"));
-        server.join().unwrap();
+        let client = async {
+            let mut response = transport.send(request, &auth).await.unwrap();
+            assert_eq!(response.status, 429);
+            assert_eq!(
+                response.headers.get("x-test"),
+                Some(&String::from("boundary"))
+            );
+            assert_eq!(response.retry_hint(), RetryHint::RetryAfterSeconds(7));
+            let mut body = Vec::new();
+            while let Some(chunk) = response.next_chunk().await {
+                body.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(body, b"firstsecond");
+        };
+        timeout(IO_TIMEOUT, async { tokio::join!(server, client) })
+            .await
+            .expect("chunked response deadline exceeded");
     }
 
     #[tokio::test]
     async fn truncated_response_chunk_preserves_status_and_retry_hint() {
-        use std::io::Write;
-        use std::net::TcpListener;
-        use std::thread;
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = std::io::Read::read(&mut stream, &mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfirst",
-                )
-                .unwrap();
-            stream.flush().unwrap();
-        });
+        let server = serve_response(listener, &[
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfirst",
+        ]);
         let transport = ProviderTransport::new_for_endpoint(
             &RuntimeTransportConfig::default(),
             Some(&format!("http://{address}")),
@@ -847,18 +833,22 @@ mod integration_tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-        let mut response = transport.send(request, &auth).await.unwrap();
-        assert_eq!(response.status, 429);
-        let mut failure = None;
-        while let Some(chunk) = response.next_chunk().await {
-            if let Err(error) = chunk {
-                failure = Some(error);
-                break;
+        let client = async {
+            let mut response = transport.send(request, &auth).await.unwrap();
+            assert_eq!(response.status, 429);
+            let mut failure = None;
+            while let Some(chunk) = response.next_chunk().await {
+                if let Err(error) = chunk {
+                    failure = Some(error);
+                    break;
+                }
             }
-        }
-        let failure = failure.expect("truncated body must fail while reading chunks");
-        assert_eq!(failure.status, Some(429));
-        assert_eq!(failure.retry_hint, RetryHint::RetryAfterSeconds(7));
-        server.join().unwrap();
+            let failure = failure.expect("truncated body must fail while reading chunks");
+            assert_eq!(failure.status, Some(429));
+            assert_eq!(failure.retry_hint, RetryHint::RetryAfterSeconds(7));
+        };
+        timeout(IO_TIMEOUT, async { tokio::join!(server, client) })
+            .await
+            .expect("truncated response deadline exceeded");
     }
 }

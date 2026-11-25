@@ -1,60 +1,11 @@
 use super::*;
 use anyhow::Context;
 use serde_json::json;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
 use tokio::time::{sleep, timeout};
 
-#[cfg(unix)]
-fn process_fixture_dir(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("letcode-{name}-{unique}"));
-    std::fs::create_dir_all(&path).expect("create process fixture directory");
-    path
-}
-#[cfg(unix)]
-async fn wait_for_file(path: &std::path::Path) {
-    timeout(Duration::from_secs(2), async {
-        while !path.exists() {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()));
-}
-#[cfg(unix)]
-async fn assert_file_does_not_appear(path: &std::path::Path) {
-    let appeared = timeout(Duration::from_millis(300), async {
-        loop {
-            if path.exists() {
-                return;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(
-        appeared.is_err(),
-        "unexpected side effect: {}",
-        path.display()
-    );
-}
-#[cfg(unix)]
-fn delayed_side_effect_command(
-    ready: &std::path::Path,
-    release: &std::path::Path,
-    marker: &std::path::Path,
-) -> String {
-    format!(
-        "touch {}; (while [ ! -e {} ]; do :; done; touch {}) & wait",
-        ready.display(),
-        release.display(),
-        marker.display()
-    )
-}
 #[cfg(windows)]
 #[test]
 fn windows_shells_prefer_powershell_7_then_fall_back() {
@@ -238,25 +189,64 @@ mod integration_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_streaming_shell_command_kills_process_group() {
-        let dir = process_fixture_dir("streaming-drop");
-        let ready = dir.join("ready");
-        let release = dir.join("release");
-        let marker = dir.join("marker");
-        let script = delayed_side_effect_command(&ready, &release, &marker);
-        let task = tokio::spawn(async move {
-            let mut emit = |_stream, _chunk| Ok(());
-            run_shell(&script, 30, false, false, None, None, &mut emit).await
+        let (ready, pids) = tokio::sync::oneshot::channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut ready = Some(ready);
+            let mut output = String::new();
+            let mut emit = |stream, chunk: String| {
+                if stream == ToolOutputStream::Stdout {
+                    output.push_str(&chunk);
+                    if let Some((line, _)) = output.split_once('\n')
+                        && let Some(ready) = ready.take()
+                    {
+                        ready.send(line.to_string()).unwrap();
+                    }
+                }
+                Ok(())
+            };
+            run_shell(
+                "sleep 30 & printf '%s %s\\n' \"$$\" \"$!\"; wait",
+                30,
+                false,
+                false,
+                None,
+                None,
+                &mut emit,
+            )
+            .await
         });
-        wait_for_file(&ready).await;
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("task should be cancelled")
-                .is_cancelled()
-        );
-        std::fs::write(&release, "go").expect("release side effect");
-        assert_file_does_not_appear(&marker).await;
-        let _ = std::fs::remove_dir_all(dir);
+        let pids = timeout(Duration::from_secs(5), pids)
+            .await
+            .expect("shell readiness deadline exceeded")
+            .expect("shell reports its process IDs")
+            .split_whitespace()
+            .map(|pid| pid.parse::<libc::pid_t>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2);
+        assert!(pids.iter().all(|pid| *pid > 0));
+        tasks.abort_all();
+        assert!(tasks.join_next().await.unwrap().unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let exited = pids.iter().all(|pid| {
+                    if unsafe { libc::kill(*pid, 0) } == 0 {
+                        return false;
+                    }
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ESRCH)
+                    );
+                    true
+                });
+                if exited {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("shell process group did not exit: {pids:?}"));
     }
 }
 

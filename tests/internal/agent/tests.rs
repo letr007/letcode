@@ -5822,10 +5822,10 @@ fn request_assembly_never_masks() {
 }
 
 #[test]
+#[ignore = "requires LETCODE_PII_MODEL_DIR pointing to the local PII model"]
 fn a_masked_frame_stays_masked_across_switches() {
-    let Ok(model_dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
-        return;
-    };
+    let model_dir =
+        std::env::var("LETCODE_PII_MODEL_DIR").expect("LETCODE_PII_MODEL_DIR is required");
     let _guard = REDACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let config_dir =
         std::env::temp_dir().join(format!("letcode-redact-switch-{}", std::process::id()));

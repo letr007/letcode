@@ -411,6 +411,7 @@ fn observed_error(error: &ErrorEvent) -> String {
 mod integration_tests {
     use super::*;
     include!("messaging_tests.rs");
+    include!("question_round_trip_tests.rs");
 
     #[test]
     fn dropped_runs_emit_one_child_terminal_each_and_skip_finished_runs() {

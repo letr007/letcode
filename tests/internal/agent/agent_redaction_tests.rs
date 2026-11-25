@@ -15,10 +15,10 @@ fn install_test_redactor(model_dir: &str) -> (tempfile::TempDir, RedactGlobals) 
 }
 
 #[test]
+#[ignore = "requires LETCODE_PII_MODEL_DIR pointing to the local PII model"]
 fn mixed_history_keeps_its_representation_in_requests_and_journal() {
-    let Ok(model_dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
-        return;
-    };
+    let model_dir =
+        std::env::var("LETCODE_PII_MODEL_DIR").expect("LETCODE_PII_MODEL_DIR is required");
     let _lock = REDACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (config, _globals) = install_test_redactor(&model_dir);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -130,10 +130,10 @@ fn mixed_history_keeps_its_representation_in_requests_and_journal() {
 }
 
 #[test]
+#[ignore = "requires LETCODE_PII_MODEL_DIR pointing to the local PII model"]
 fn tool_history_preserves_json_types_and_the_prepared_output() {
-    let Ok(model_dir) = std::env::var("LETCODE_PII_MODEL_DIR") else {
-        return;
-    };
+    let model_dir =
+        std::env::var("LETCODE_PII_MODEL_DIR").expect("LETCODE_PII_MODEL_DIR is required");
     let _lock = REDACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (config, _globals) = install_test_redactor(&model_dir);
     tokio::runtime::Runtime::new().unwrap().block_on(async {

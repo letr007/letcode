@@ -5,7 +5,6 @@ use super::*;
 use crate::model_runtime::{GenerationSupport, RouteCapabilities};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn config(provider: &str, model: &str, extra: &str) -> String {
@@ -713,25 +712,24 @@ fn protocol_settings_are_typed_and_fingerprints_redact_and_detect_credentials() 
 
 #[test]
 fn projected_provider_uses_resolved_credential_snapshot() {
-    let _guard = lock_env();
-    let env_name = "LETCODE_CONFIG_SNAPSHOT_TEST_KEY";
-    unsafe { env::set_var(env_name, "first-secret") };
-    let path = write_temp_config(config("openai", "model", "").replace(
-        "credential = \"secret-value\"",
-        &format!("credential_env = {env_name:?}"),
-    ));
-    let loaded = AppConfig::load_from_path(&path).expect("environment credential resolves");
-    unsafe { env::set_var(env_name, "second-secret") };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("letcode.toml");
+    let original = config("openai", "model", "");
+    fs::write(&path, &original).unwrap();
+    let loaded = AppConfig::load_from_path(&path).unwrap();
+    fs::write(&path, original.replace("secret-value", "changed-secret")).unwrap();
+    let reloaded = AppConfig::load_from_path(&path).unwrap();
 
-    assert_eq!(loaded.providers["openai"].api_key, "first-secret");
-    assert_eq!(
-        loaded.runtime_catalog.providers["openai"]
-            .auth
-            .credential
-            .as_deref(),
-        Some("first-secret")
-    );
-    unsafe { env::remove_var(env_name) };
+    for (config, expected) in [(&loaded, "secret-value"), (&reloaded, "changed-secret")] {
+        assert_eq!(config.providers["openai"].api_key, expected);
+        assert_eq!(
+            config.runtime_catalog.providers["openai"]
+                .auth
+                .credential
+                .as_deref(),
+            Some(expected)
+        );
+    }
 }
 
 #[test]
@@ -1815,16 +1813,4 @@ fn write_temp_config(contents: impl AsRef<str>) -> PathBuf {
     let path = base.join("letcode.toml");
     fs::write(&path, contents.as_ref()).unwrap();
     path
-}
-
-fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-#[allow(dead_code)]
-fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    env_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
