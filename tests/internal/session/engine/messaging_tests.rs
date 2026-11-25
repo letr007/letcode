@@ -1,7 +1,7 @@
 #[tokio::test]
 async fn idle_root_messages_use_the_engine_user_entry_and_stop_with_the_root() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {

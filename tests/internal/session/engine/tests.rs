@@ -319,9 +319,7 @@ async fn serve_responses_stub(listener: tokio::net::TcpListener) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut served = 0usize;
-    while let Ok(Ok((mut stream, _))) =
-        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
-    {
+    while let Ok((mut stream, _)) = listener.accept().await {
         let mut request = Vec::new();
         let mut chunk = [0u8; 4096];
         let (header_end, content_length) = loop {
@@ -3438,12 +3436,18 @@ max_output_tokens = 4096
                     to: peer_address.clone(),
                     message: "peer input".into(),
                 });
+                let mut accepted = Vec::new();
                 ingress.submit_transitional(if cancel_active { prompt("target") } else { peer() }).unwrap();
                 loop {
-                    if open_tool_call_batch_recorded(&transcript).unwrap_or(false) {
-                        break;
+                    match events.recv().await.unwrap() {
+                        SessionTransportEvent::QueuedPromptAccepted { prompt } => accepted.push(prompt.id),
+                        SessionTransportEvent::ToolStarted(tool) if tool.name == "test__hold" => break,
+                        SessionTransportEvent::TurnFinished { outcome } => {
+                            panic!("turn ended before the holding tool started: {outcome:?}");
+                        }
+                        SessionTransportEvent::Error(error) => panic!("{}", observed_error(&error)),
+                        _ => {}
                     }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 if cancel_active {
                     ingress.submit_transitional(peer()).unwrap();
@@ -3451,7 +3455,6 @@ max_output_tokens = 4096
                     ingress.submit_transitional(prompt("target")).unwrap();
                 }
                 ingress.cancel_prompt("target").unwrap();
-                let mut accepted = Vec::new();
                 loop {
                     match events.recv().await.unwrap() {
                         SessionTransportEvent::QueuedPromptAccepted { prompt } => accepted.push(prompt.id),
