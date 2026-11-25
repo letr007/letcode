@@ -370,7 +370,6 @@ fn format_composition_label(
         "system" => "sidebar.context_system",
         "tools" => "sidebar.context_tools",
         "skills" => "sidebar.context_skills",
-        "context" => "sidebar.context_material",
         "messages" => "sidebar.context_messages",
         _ => "sidebar.context_other",
     })
@@ -675,7 +674,6 @@ fn context_composition_color(
         "system" => theme.notice,
         "tools" => theme.warning,
         "skills" => theme.success,
-        "context" => theme.approval,
         "messages" => theme.user,
         _ => [theme.accent, theme.success, theme.error][index % 3],
     }
@@ -691,12 +689,6 @@ fn composition_category(value: &str) -> &'static str {
         || value.starts_with("DeveloperPrelude:")
     {
         "system"
-    } else if value == "context"
-        || value.starts_with("RuntimeContext:")
-        || value.starts_with("ContextMaterial:")
-        || value.starts_with("ContextIndex:")
-    {
-        "context"
     } else if value == "messages"
         || value.starts_with("TranscriptFrame:")
         || value.starts_with("CurrentTurn:")

@@ -998,8 +998,8 @@ fn composition_category(kind: PromptContributorKind) -> &'static str {
         PromptContributorKind::SkillMaterial => "skills",
         PromptContributorKind::RuntimeContext
         | PromptContributorKind::ContextMaterial
-        | PromptContributorKind::ContextIndex => "context",
-        PromptContributorKind::TranscriptFrame
+        | PromptContributorKind::ContextIndex
+        | PromptContributorKind::TranscriptFrame
         | PromptContributorKind::CurrentTurn
         | PromptContributorKind::Other => "messages",
     }

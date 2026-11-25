@@ -93,12 +93,9 @@ fn journal_transaction_lines(
     let transaction_count = records.len();
     let base_revision = records[0].base_revision;
     let resulting_revision = records.last().unwrap().resulting_revision;
-    let mut payload = Vec::new();
     let mut lines = Vec::new();
     for record in &records {
         let serialized = serialize_journal_record(record).unwrap();
-        payload.extend(&serialized);
-        payload.push(b'\n');
         lines.push(String::from_utf8(serialized).unwrap());
     }
     lines.push(
@@ -109,8 +106,6 @@ fn journal_transaction_lines(
             transaction_count,
             base_revision,
             resulting_revision,
-            payload_length: payload.len(),
-            payload_digest: journal_payload_digest(&payload),
         })
         .unwrap(),
     );
@@ -683,13 +678,6 @@ mod transactions {
             *mismatched_schema_lines.last_mut().unwrap() =
                 serde_json::to_string(&mismatched_commit).unwrap();
             fs::write(&path, mismatched_schema_lines.join("\n") + "\n").unwrap();
-            assert!(read_records(&path).is_err());
-
-            let mut corrupt_commit: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-            corrupt_commit["payload_digest"] = Value::String("wrong".into());
-            let mut corrupt_lines = lines.clone();
-            *corrupt_lines.last_mut().unwrap() = serde_json::to_string(&corrupt_commit).unwrap();
-            fs::write(&path, corrupt_lines.join("\n") + "\n").unwrap();
             assert!(read_records(&path).is_err());
 
             let mut lines = lines;

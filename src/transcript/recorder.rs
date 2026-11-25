@@ -22,8 +22,7 @@ use crate::user_content::UserMessageContent;
 
 use super::journal::{
     FileJournalSink, JOURNAL_SCHEMA_VERSION, JOURNAL_TRANSACTION_COMMIT, JournalRecordEnvelope,
-    JournalSink, JournalTransactionCommit, journal_payload_digest, journal_scope_for,
-    serialize_journal_record,
+    JournalSink, JournalTransactionCommit, journal_scope_for, serialize_journal_record,
 };
 use super::model::normalize_transcript_event_for_v2;
 
@@ -1596,7 +1595,7 @@ impl TranscriptRecorder {
             unix_timestamp_ms()
         );
         let timestamp_ms = unix_timestamp_ms();
-        let mut payload = Vec::new();
+        let mut buffer = Vec::new();
         let mut index_records = Vec::with_capacity(count);
         for (index, (event, context_branch_id)) in events.iter().cloned().enumerate() {
             let event = normalize_transcript_event_for_v2(event)?;
@@ -1620,8 +1619,8 @@ impl TranscriptRecorder {
                 transaction_count: Some(count),
                 record,
             };
-            payload.extend(serialize_journal_record(&envelope)?);
-            payload.push(b'\n');
+            buffer.extend(serialize_journal_record(&envelope)?);
+            buffer.push(b'\n');
         }
         let commit = JournalTransactionCommit {
             schema_version: JOURNAL_SCHEMA_VERSION,
@@ -1630,10 +1629,7 @@ impl TranscriptRecorder {
             transaction_count: count,
             base_revision,
             resulting_revision,
-            payload_length: payload.len(),
-            payload_digest: journal_payload_digest(&payload),
         };
-        let mut buffer = payload;
         serde_json::to_writer(&mut buffer, &commit)?;
         buffer.push(b'\n');
         Ok((buffer, index_records, resulting_revision))

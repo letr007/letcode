@@ -103,7 +103,7 @@ pub struct TranscriptAssistantTurn {
 
 ## 事务与落盘机制
 
-需要原子写入的一组事件使用事务封装。每个记录行携带相同的 `transaction_id`、连续递增的 `transaction_index` 和一致的总数 `transaction_count`。数据写入完毕后，必须追加一条 `journal_entry = "transaction_commit"` 提交记录，记录基础版本、结束版本、数据总字节数与内容校验和。
+需要原子写入的一组事件使用事务封装。每个记录行携带相同的 `transaction_id`、连续递增的 `transaction_index` 和一致的总数 `transaction_count`。数据写入完毕后，必须追加一条 `journal_entry = "transaction_commit"` 提交记录，记录基础版本与结束版本。
 
 读取器只解析已包含提交记录的完整事务。未完成提交的事务尾部对投影层不可见，也不能作为会话恢复的安全端点。
 

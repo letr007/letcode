@@ -79,6 +79,7 @@ impl Sandbox {
 [global]
 sessions_dir = {sessions}
 log_file = {log}
+redact = false
 max_iterations = 6
 max_tool_calls = 4
 

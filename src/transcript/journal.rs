@@ -44,8 +44,6 @@ pub struct JournalTransactionCommit {
     pub(crate) transaction_count: usize,
     pub(crate) base_revision: u64,
     pub(crate) resulting_revision: u64,
-    pub(crate) payload_length: usize,
-    pub(crate) payload_digest: String,
 }
 
 pub(crate) const JOURNAL_TRANSACTION_COMMIT: &str = "transaction_commit";
@@ -107,7 +105,7 @@ pub fn serialize_journal_record(envelope: &JournalRecordEnvelope) -> Result<Vec<
 }
 
 pub(crate) fn journal_payload_digest(bytes: &[u8]) -> String {
-    // A deterministic corruption guard, not a cryptographic integrity mechanism.
+    // Change detection between reads, not a cryptographic integrity mechanism.
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -258,7 +256,6 @@ pub fn parse_records_content(
                                 transaction_id: transaction_id.clone(),
                                 transaction_count,
                                 base_revision: entry.envelope.as_ref().unwrap().base_revision,
-                                payload: Vec::new(),
                                 entries: Vec::new(),
                             });
                         ensure!(
@@ -277,10 +274,6 @@ pub fn parse_records_content(
                             transaction_index < transaction_count,
                             "transcript transaction index exceeds its count"
                         );
-                        pending
-                            .payload
-                            .extend(serialize_journal_record(entry.envelope.as_ref().unwrap())?);
-                        pending.payload.push(b'\n');
                         pending.entries.push(entry);
                     }
                     None => {
@@ -338,11 +331,6 @@ pub fn parse_records_content(
                     commit.resulting_revision
                         == commit.base_revision + u64::try_from(commit.transaction_count).unwrap(),
                     "transcript transaction commit revision does not match count"
-                );
-                ensure!(
-                    commit.payload_length == pending.payload.len()
-                        && commit.payload_digest == journal_payload_digest(&pending.payload),
-                    "transcript transaction commit payload does not match records"
                 );
                 records.extend(pending.entries);
             }
@@ -421,7 +409,6 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
                         transaction_id: transaction_id.clone(),
                         transaction_count,
                         base_revision: entry.envelope.as_ref().unwrap().base_revision,
-                        payload: Vec::new(),
                         entries: Vec::new(),
                     });
                     ensure!(
@@ -440,10 +427,6 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
                         transaction_index < transaction_count,
                         "transcript transaction index exceeds its count"
                     );
-                    pending
-                        .payload
-                        .extend(serialize_journal_record(entry.envelope.as_ref().unwrap())?);
-                    pending.payload.push(b'\n');
                     pending.entries.push(entry);
                 }
                 None => ensure!(
@@ -498,11 +481,6 @@ pub fn scan_transcript_content(path: &Path, content: &str) -> Result<TranscriptC
                         == commit.base_revision + u64::try_from(commit.transaction_count).unwrap(),
                     "transcript transaction commit revision does not match count"
                 );
-                ensure!(
-                    commit.payload_length == pending.payload.len()
-                        && commit.payload_digest == journal_payload_digest(&pending.payload),
-                    "transcript transaction commit payload does not match records"
-                );
             }
         }
     }
@@ -522,7 +500,6 @@ pub(crate) struct PendingTransaction {
     pub(crate) transaction_id: String,
     pub(crate) transaction_count: usize,
     pub(crate) base_revision: u64,
-    payload: Vec<u8>,
     entries: Vec<JournalEntry>,
 }
 
