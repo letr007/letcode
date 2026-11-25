@@ -704,7 +704,7 @@ impl TuiRuntime {
                 .cancel_pending_question("question cancelled because the session engine stopped");
             self.state.mark_child_sessions_disconnected();
             self.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
-                "TUI session event stream closed unexpectedly",
+                self.state.t("runtime.session_stream_closed"),
             )));
             if terminalize {
                 self.apply_session_transport_event(SessionTransportEvent::TurnFinished {
@@ -912,6 +912,12 @@ impl TuiRuntime {
 
     fn localized_notice(&self, event: SessionTransportEvent) -> SessionTransportEvent {
         match event {
+            SessionTransportEvent::ProcessIssue(issue) => {
+                SessionTransportEvent::ProcessIssue(self.state.localized_process_issue(issue))
+            }
+            SessionTransportEvent::Error(error) => {
+                SessionTransportEvent::Error(self.state.localized_error(error))
+            }
             SessionTransportEvent::Notice(notice) => {
                 SessionTransportEvent::Notice(self.state.localized_notice(notice))
             }
@@ -919,12 +925,23 @@ impl TuiRuntime {
                 child_session_id,
                 agent_name,
                 parent_tool_call_id,
-                event: SessionEvent::Notice(notice),
+                event,
             } => SessionTransportEvent::ChildSessionEvent {
                 child_session_id,
                 agent_name,
                 parent_tool_call_id,
-                event: SessionEvent::Notice(self.state.localized_notice(notice)),
+                event: match event {
+                    SessionEvent::Notice(notice) => {
+                        SessionEvent::Notice(self.state.localized_notice(notice))
+                    }
+                    SessionEvent::ProcessIssue(issue) => {
+                        SessionEvent::ProcessIssue(self.state.localized_process_issue(issue))
+                    }
+                    SessionEvent::Error(error) => {
+                        SessionEvent::Error(self.state.localized_error(error))
+                    }
+                    event => event,
+                },
             },
             event => event,
         }
@@ -3605,7 +3622,10 @@ impl TuiRuntime {
                 let attached = self.state.add_composer_skill(selected.id);
                 self.state.close_dialog();
                 if !attached {
-                    self.show_toast("Skill already attached", ToastKind::Info);
+                    self.show_toast(
+                        self.state.t("runtime.skill_already_attached"),
+                        ToastKind::Info,
+                    );
                 }
                 Ok(None)
             }

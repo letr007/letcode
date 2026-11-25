@@ -1075,6 +1075,7 @@ pub struct ModelFailure {
     pub status: Option<u16>,
     pub code: Option<String>,
     pub retry_hint: RetryHint,
+    pub retry_exhausted_attempts: Option<usize>,
     detail: String,
 }
 
@@ -1086,6 +1087,7 @@ impl ModelFailure {
             status: None,
             code: None,
             retry_hint: RetryHint::Never,
+            retry_exhausted_attempts: None,
             detail: String::new(),
         }
     }

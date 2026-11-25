@@ -827,7 +827,7 @@ pub(super) fn retry_lifecycle_event(retry: LlmRetryLifecycle) -> RetryLifecycleE
         attempt: retry.attempt,
         max_attempts: retry.max_attempts,
         delay_secs: retry.delay_secs,
-        error: retry.error,
+        failure: retry.failure,
     }
 }
 

@@ -236,6 +236,8 @@ fn missing_api_key_error_emits_error_then_one_turn_finished() {
         rx.try_recv(),
         Ok(SessionTransportEvent::Error(error))
             if error.message == "API key is not set for the selected provider. Set EXPERT_API_KEY."
+                && error.message_id == Some(crate::session::ErrorId::MissingApiKey)
+                && error.args == vec![("hint".to_string(), "Set EXPERT_API_KEY.".to_string())]
     ));
     assert!(matches!(
         rx.try_recv(),

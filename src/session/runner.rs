@@ -952,14 +952,19 @@ where {
                                     )?;
                                 }
                                 AgentEvent::ModelStreamIssue {
+                                    kind,
                                     message,
                                     detail,
                                     action,
                                 } => {
+                                    let message_id = match kind {
+                                        crate::agent::ModelStreamIssueKind::Recovering => crate::session::NoticeId::StreamRecovering,
+                                        crate::agent::ModelStreamIssueKind::LengthLimit => crate::session::NoticeId::OutputLengthLimit,
+                                    };
                                     let issue = ProcessIssueEvent {
-                                        message,
-                                        detail,
-                                        action: Some(action),
+                                        message: [Some(message), detail, Some(action)]
+                                            .into_iter().flatten().collect::<Vec<_>>().join(" "),
+                                        message_id: Some(message_id),
                                     };
                                     send_scoped_event(
                                         &sender,
@@ -1451,15 +1456,14 @@ where {
 }
 
 fn error_event(error: &anyhow::Error) -> ErrorEvent {
-    let event = ErrorEvent::new(format!("{error:#}"));
-    let Some(detail) = error
-        .downcast_ref::<crate::model_runtime::ModelFailure>()
-        .map(|failure| failure.detail())
-        .filter(|detail| !detail.is_empty())
-    else {
-        return event;
-    };
-    event.with_details(detail)
+    let mut event = ErrorEvent::new(format!("{error:#}"));
+    if let Some(failure) = error.downcast_ref::<crate::model_runtime::ModelFailure>() {
+        event.model_failure = Some(failure.clone());
+        if !failure.detail().is_empty() {
+            event = event.with_details(failure.detail());
+        }
+    }
+    event
 }
 
 /// Live text holds only what the journal does not yet: drop the accumulated tail

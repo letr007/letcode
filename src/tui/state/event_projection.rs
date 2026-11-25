@@ -54,9 +54,7 @@ pub(super) fn apply_projected_session_event(projection: EventProjection<'_>, eve
         }
         SessionEvent::RetryScheduled(retry) => {
             *projection.phase = AppPhase::Running;
-            let notice = RetryNoticeState::from_lifecycle(retry);
-            *projection.toast = Some(notice.sticky_toast());
-            *projection.retry = Some(notice);
+            *projection.retry = Some(RetryNoticeState::from_lifecycle(retry));
         }
         SessionEvent::RetryStarted(_) => {
             *projection.retry = None;

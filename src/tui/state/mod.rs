@@ -196,7 +196,7 @@ pub struct RetryNoticeState {
     pub attempt: usize,
     pub max_attempts: usize,
     pub delay_secs: u64,
-    pub error: String,
+    pub failure: crate::model_runtime::ModelFailure,
     started_at: std::time::Instant,
 }
 
@@ -222,7 +222,7 @@ impl RetryNoticeState {
             attempt: event.attempt,
             max_attempts: event.max_attempts,
             delay_secs: event.delay_secs,
-            error: event.error,
+            failure: event.failure,
             started_at,
         }
     }
@@ -232,24 +232,19 @@ impl RetryNoticeState {
             .saturating_sub(now.saturating_duration_since(self.started_at).as_secs())
     }
 
-    fn toast_message_at(&self, now: std::time::Instant) -> String {
-        format!(
-            "Retrying in {}s · attempt {} of {}",
-            self.secs_remaining_at(now),
-            self.attempt,
-            self.max_attempts
-        )
-    }
-
-    fn sticky_toast(&self) -> ToastState {
-        self.sticky_toast_at(std::time::Instant::now())
-    }
-
-    fn sticky_toast_at(&self, now: std::time::Instant) -> ToastState {
-        ToastState::new(
-            self.toast_message_at(now),
-            ToastKind::Error,
-            ToastState::DEFAULT_TICKS,
+    fn toast_message_at(
+        &self,
+        now: std::time::Instant,
+        translator: &crate::tui::i18n::Translator,
+    ) -> String {
+        translator.t_fmt(
+            "runtime.retry_scheduled",
+            &[
+                ("seconds", &self.secs_remaining_at(now).to_string()),
+                ("attempt", &self.attempt.to_string()),
+                ("max_attempts", &self.max_attempts.to_string()),
+                ("reason", &translator.model_failure_summary(&self.failure)),
+            ],
         )
     }
 }
@@ -1678,6 +1673,37 @@ impl TuiState {
             notice.message = message;
         }
         notice
+    }
+
+    pub fn localized_error(
+        &self,
+        mut error: crate::session::ErrorEvent,
+    ) -> crate::session::ErrorEvent {
+        if let Some(failure) = &error.model_failure {
+            let diagnostic = error.message.clone();
+            error.message = self.translator().model_failure_message(failure);
+            error.details = Some(match error.details {
+                Some(details) => format!("{diagnostic}\n{details}"),
+                None => diagnostic,
+            });
+        } else if let Some(message_id) = error.message_id
+            && let Some(message) = self.t_opt_fmt(message_id.key(), &error.args)
+        {
+            error.message = message;
+        }
+        error
+    }
+
+    pub fn localized_process_issue(
+        &self,
+        mut issue: crate::session::ProcessIssueEvent,
+    ) -> crate::session::ProcessIssueEvent {
+        if let Some(message_id) = issue.message_id
+            && let Some(message) = self.t_opt(message_id.key())
+        {
+            issue.message = message;
+        }
+        issue
     }
 
     pub fn set_model(&mut self, model_id: impl Into<String>, model_label: impl Into<String>) {
@@ -3570,20 +3596,19 @@ impl TuiState {
             }
             return false;
         };
-        self.toast = Some(match &scope {
-            RetryToastScope::Parent => retry.sticky_toast_at(now),
+        let message = retry.toast_message_at(now, &self.translator());
+        let message = match &scope {
+            RetryToastScope::Parent => message,
             RetryToastScope::Child {
                 session_id,
                 agent_name,
-            } => {
-                let message = format!("{} · {}", retry.error, retry.toast_message_at(now));
-                ToastState::new(
-                    child_feedback_message(agent_name.as_deref(), session_id, &message),
-                    ToastKind::Error,
-                    ToastState::DEFAULT_TICKS,
-                )
-            }
-        });
+            } => child_feedback_message(agent_name.as_deref(), session_id, &message),
+        };
+        self.toast = Some(ToastState::new(
+            message,
+            ToastKind::Info,
+            ToastState::DEFAULT_TICKS,
+        ));
         self.retry_toast_scope = Some(scope);
         true
     }

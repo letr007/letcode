@@ -20,6 +20,13 @@ fn model_failure_detail_reaches_error_event_and_recorded_message() {
     let event = error_event(&error);
     assert!(event.message.contains("status 400"));
     assert_eq!(
+        event
+            .model_failure
+            .as_ref()
+            .and_then(|failure| failure.status),
+        Some(400)
+    );
+    assert_eq!(
         event.details.as_deref(),
         Some("provider says the request field is invalid")
     );

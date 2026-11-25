@@ -982,7 +982,7 @@ where
                 .as_ref()
                 .map_or(1, |retry| retry.max_attempts),
             delay_secs: delay.as_secs(),
-            error: failure.to_string(),
+            failure: failure.clone(),
         };
         (self.on_event)(AgentEvent::LlmRetryScheduled(retry.clone()))
             .await
@@ -1443,6 +1443,7 @@ where
             .append_history_item(HistoryItem::internal_continuation(continuation.clone()))
             .map_err(|error| runtime_failure(crate::model_runtime::FailurePhase::Finish, error))?;
         (self.on_event)(AgentEvent::ModelStreamIssue {
+            kind: ModelStreamIssueKind::Recovering,
             message: STREAM_INTERRUPT_MESSAGE.into(),
             detail: Some("The model stream was interrupted; partial output was preserved.".into()),
             action: STREAM_INTERRUPT_ACTION.into(),
@@ -1468,6 +1469,7 @@ where
     ) -> std::result::Result<TurnContinuationDecision, ModelFailure> {
         if result.terminal == TerminalStatus::Length {
             (self.on_event)(AgentEvent::ModelStreamIssue {
+                kind: ModelStreamIssueKind::LengthLimit,
                 message: "Model output reached the length limit".into(),
                 detail: Some("Partial output was preserved.".into()),
                 action: "Continue the turn to generate the remainder.".into(),

@@ -10,7 +10,6 @@ use crate::context_view::{
 };
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::RuntimeActiveContext;
-use crate::session::NoticeId;
 use crate::session::engine::{
     ActiveSessionOperation, InterruptRequest, ManualCompactionNavigation,
     ManualCompactionOperation, SessionEngineCommand, SessionEngineControl,
@@ -23,6 +22,7 @@ use crate::session::engine::{
 };
 use crate::session::restore::restored_session_token_usage;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
+use crate::session::{ErrorId, NoticeId, ProcessIssueEvent};
 use crate::session::{
     PermissionResponse, RunnerPermissionRequest, SessionTransportEvent, TokenUsageEvent,
     TurnOutcome,
@@ -31,7 +31,7 @@ use crate::transcript::sync_recorder_branch;
 use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
 };
-use crate::tui::events::NoticeEvent;
+use crate::tui::events::{ErrorEvent, NoticeEvent};
 use crate::tui::help::HelpAction;
 use crate::tui::runtime::session_cleanup::{empty_session_path, remove_current_empty_session};
 use crate::tui::state::MAX_CACHED_CHILD_TIMELINES;
@@ -1597,6 +1597,130 @@ fn notice_messages_follow_the_active_language() {
         runtime.state().toast().map(|toast| toast.message.as_str()),
         Some("Turn still running")
     );
+}
+
+#[test]
+fn error_and_process_issue_messages_follow_the_active_language() {
+    fn error_event() -> ErrorEvent {
+        let mut error = ErrorEvent::new("raw error")
+            .with_message_id(ErrorId::MissingApiKey)
+            .with_args([("hint", "run /login")]);
+        error.details = Some("trace".into());
+        error
+    }
+
+    fn issue_event() -> ProcessIssueEvent {
+        ProcessIssueEvent {
+            message: "raw issue".into(),
+            message_id: Some(NoticeId::StreamRecovering),
+        }
+    }
+
+    fn child_event(event: SessionEvent) -> SessionTransportEvent {
+        SessionTransportEvent::ChildSessionEvent {
+            child_session_id: "child-session".into(),
+            agent_name: Some("explorer".into()),
+            parent_tool_call_id: None,
+            event,
+        }
+    }
+
+    fn localized_error(event: SessionTransportEvent) -> ErrorEvent {
+        match event {
+            SessionTransportEvent::Error(error) => error,
+            _ => panic!("expected an error event"),
+        }
+    }
+
+    fn localized_issue(event: SessionTransportEvent) -> ProcessIssueEvent {
+        match event {
+            SessionTransportEvent::ProcessIssue(issue) => issue,
+            _ => panic!("expected a process issue event"),
+        }
+    }
+
+    fn localized_child_error(event: SessionTransportEvent) -> ErrorEvent {
+        match event {
+            SessionTransportEvent::ChildSessionEvent {
+                event: SessionEvent::Error(error),
+                ..
+            } => error,
+            _ => panic!("expected a child error event"),
+        }
+    }
+
+    fn localized_child_issue(event: SessionTransportEvent) -> ProcessIssueEvent {
+        match event {
+            SessionTransportEvent::ChildSessionEvent {
+                event: SessionEvent::ProcessIssue(issue),
+                ..
+            } => issue,
+            _ => panic!("expected a child process issue event"),
+        }
+    }
+
+    let mut runtime = runtime();
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::ZhCn));
+
+    let error =
+        localized_error(runtime.localized_notice(SessionTransportEvent::Error(error_event())));
+    assert_eq!(error.message, "当前服务商未配置 API 密钥。run /login");
+    assert_eq!(error.details.as_deref(), Some("trace"));
+
+    let child_error = localized_child_error(
+        runtime.localized_notice(child_event(SessionEvent::Error(error_event()))),
+    );
+    assert_eq!(child_error.message, error.message);
+    assert_eq!(child_error.details.as_deref(), Some("trace"));
+
+    let issue = localized_issue(
+        runtime.localized_notice(SessionTransportEvent::ProcessIssue(issue_event())),
+    );
+    assert_eq!(
+        issue.message,
+        "模型响应中断，已保留部分输出，正在继续生成。"
+    );
+
+    let child_issue = localized_child_issue(
+        runtime.localized_notice(child_event(SessionEvent::ProcessIssue(issue_event()))),
+    );
+    assert_eq!(child_issue.message, issue.message);
+
+    runtime
+        .state_mut()
+        .set_language(Some(crate::tui::i18n::Language::En));
+
+    let error =
+        localized_error(runtime.localized_notice(SessionTransportEvent::Error(error_event())));
+    assert_eq!(
+        error.message,
+        "No API key is configured for the selected provider. run /login"
+    );
+
+    let child_error = localized_child_error(
+        runtime.localized_notice(child_event(SessionEvent::Error(error_event()))),
+    );
+    assert_eq!(child_error.message, error.message);
+
+    let issue = localized_issue(
+        runtime.localized_notice(SessionTransportEvent::ProcessIssue(issue_event())),
+    );
+    assert_eq!(
+        issue.message,
+        "The model response was interrupted. Partial output was preserved; continuing generation."
+    );
+
+    let child_issue = localized_child_issue(
+        runtime.localized_notice(child_event(SessionEvent::ProcessIssue(issue_event()))),
+    );
+    assert_eq!(child_issue.message, issue.message);
+
+    let plain = localized_error(
+        runtime.localized_notice(SessionTransportEvent::Error(ErrorEvent::new("raw error"))),
+    );
+    assert_eq!(plain.message, "raw error");
 }
 
 #[test]
@@ -5769,7 +5893,7 @@ fn closed_session_transport_event_stream_terminalizes_running_state() {
     assert_eq!(runtime.state().phase, AppPhase::Error);
     assert!(runtime.state().timeline.items().iter().any(|item| matches!(
             item,
-            TimelineItem::Error(error) if error.message == "TUI session event stream closed unexpectedly"
+            TimelineItem::Error(error) if error.message == runtime.state().t("runtime.session_stream_closed")
         )));
 }
 
@@ -5807,7 +5931,7 @@ fn closed_session_transport_event_stream_reports_idle_engine_failure() {
             .filter(|item| matches!(
                 item,
                 TimelineItem::Error(error)
-                    if error.message == "TUI session event stream closed unexpectedly"
+                    if error.message == runtime.state().t("runtime.session_stream_closed")
             ))
             .count(),
         1
@@ -5834,7 +5958,7 @@ fn closed_session_transport_event_stream_reports_pending_idle_resume() {
     assert_eq!(runtime.state().phase, AppPhase::Error);
     assert!(runtime.state().timeline.items().iter().any(|item| matches!(
             item,
-            TimelineItem::Error(error) if error.message == "TUI session event stream closed unexpectedly"
+            TimelineItem::Error(error) if error.message == runtime.state().t("runtime.session_stream_closed")
         )));
 }
 

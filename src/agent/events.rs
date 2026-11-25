@@ -408,7 +408,13 @@ pub struct LlmRetryLifecycle {
     pub attempt: usize,
     pub max_attempts: usize,
     pub delay_secs: u64,
-    pub error: String,
+    pub failure: crate::model_runtime::ModelFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelStreamIssueKind {
+    Recovering,
+    LengthLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +504,7 @@ pub enum AgentEvent {
         text: String,
     },
     ModelStreamIssue {
+        kind: ModelStreamIssueKind,
         message: String,
         detail: Option<String>,
         action: String,

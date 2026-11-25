@@ -1,6 +1,6 @@
 use super::{
-    ErrorEvent, RuntimeCommand, SESSION_ENGINE_UNAVAILABLE_MESSAGE, SessionTransportEvent,
-    TuiRuntime, session_command_adapter::TuiSessionCommandAdapter,
+    ErrorEvent, RuntimeCommand, SessionTransportEvent, TuiRuntime,
+    session_command_adapter::TuiSessionCommandAdapter,
 };
 use crate::session::{SessionCommandHandler, SessionEngineIngress};
 
@@ -18,7 +18,7 @@ pub(super) fn dispatch_command(
 
 fn handle_session_engine_unavailable(runtime: &mut TuiRuntime) {
     runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
-        SESSION_ENGINE_UNAVAILABLE_MESSAGE,
+        runtime.state.t("runtime.session_engine_unavailable"),
     )));
     runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {
         outcome: crate::session::TurnOutcome::Aborted,

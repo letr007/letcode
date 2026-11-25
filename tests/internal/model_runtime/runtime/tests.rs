@@ -591,11 +591,11 @@ mod integration_tests {
 
     #[tokio::test]
     async fn text_oneshot_respects_retry_limits_and_preserves_provider_failure() {
-        for (enabled, max_attempts, hint, expected_attempts) in [
-            (true, 2, RetryHint::RetryAfterSeconds(0), 2),
-            (false, 3, RetryHint::RetryAfterSeconds(0), 1),
-            (true, 1, RetryHint::RetryAfterSeconds(0), 1),
-            (true, 3, RetryHint::Never, 1),
+        for (enabled, max_attempts, hint, expected_attempts, expected_exhausted) in [
+            (true, 2, RetryHint::RetryAfterSeconds(0), 2, Some(2)),
+            (false, 3, RetryHint::RetryAfterSeconds(0), 1, None),
+            (true, 1, RetryHint::RetryAfterSeconds(0), 1, Some(1)),
+            (true, 3, RetryHint::Never, 1, None),
         ] {
             let mut route = route("responses");
             let retry = route.retry.as_mut().unwrap();
@@ -623,7 +623,9 @@ mod integration_tests {
                 )
                 .await
                 .unwrap_err();
-            assert_eq!(error, failure);
+            let mut expected = failure.clone();
+            expected.retry_exhausted_attempts = expected_exhausted;
+            assert_eq!(error, expected);
             assert_eq!(resets, expected_attempts - 1);
             assert_eq!(
                 transport.responses.lock().unwrap().len(),
@@ -1283,6 +1285,44 @@ tools = true
         assert_eq!(driver.retries, vec![(0, 1, 2, Duration::from_secs(1))]);
         assert_eq!(driver.commits, vec![0]);
         assert_eq!(driver.finalized, 1);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_records_exhausted_physical_retry_attempts() {
+        let mut route = route("responses");
+        let retry = route.retry.as_mut().unwrap();
+        retry.max_attempts = 2;
+        retry.max_recovery_attempts = 0;
+        let runtime = ModelRuntime::new(Arc::new(QueueTransport {
+            responses: Mutex::new(
+                (0..2)
+                    .map(|_| {
+                        Err(
+                            ModelFailure::new(FailurePhase::Transport, FailureKind::Timeout)
+                                .with_retry_hint(RetryHint::Retryable),
+                        )
+                    })
+                    .collect(),
+            ),
+        }));
+        let mut driver = TestDriver {
+            requests: VecDeque::from([ModelRequestInput::new("model", Vec::new())]),
+            ..TestDriver::default()
+        };
+        let error = TurnOrchestrator::new(
+            runtime,
+            TurnLimits {
+                max_iterations: 2,
+                max_tool_calls: Some(0),
+            },
+        )
+        .run(&route, &mut driver)
+        .await
+        .unwrap_err();
+        assert_eq!(error.retry_exhausted_attempts, Some(2));
+        assert_eq!(driver.attempts_started, vec![(0, 1), (0, 2)]);
+        assert_eq!(driver.retries, vec![(0, 1, 2, Duration::from_secs(1))]);
+        assert!(driver.recoveries.is_empty());
     }
 
     #[tokio::test]

@@ -975,6 +975,7 @@ fn child_permission_events_project_into_active_parent_subagent_card() {
 #[test]
 fn child_feedback_respects_view_ownership_and_labels_errors() {
     let mut state = TuiState::default();
+    state.set_language(Some(crate::tui::i18n::Language::En));
     state.replace_child_timeline_from_records(
         &[],
         "parent-session",
@@ -1046,7 +1047,10 @@ fn child_feedback_respects_view_ownership_and_labels_errors() {
             attempt: 2,
             max_attempts: 3,
             delay_secs: 4,
-            error: "network request failed".into(),
+            failure: crate::model_runtime::ModelFailure::new(
+                crate::model_runtime::FailurePhase::Transport,
+                crate::model_runtime::FailureKind::Http,
+            ),
         }),
     );
     assert_eq!(
@@ -1054,8 +1058,8 @@ fn child_feedback_respects_view_ownership_and_labels_errors() {
             .toast()
             .map(|toast| (toast.message.as_str(), toast.kind)),
         Some((
-            "explorer · background-child: network request failed · Retrying in 4s · attempt 2 of 3",
-            ToastKind::Error
+            "explorer · background-child: Retrying in 4s · attempt 2/3\nThe connection to the provider failed",
+            ToastKind::Info
         ))
     );
     assert_eq!(
@@ -1077,7 +1081,7 @@ fn child_feedback_respects_view_ownership_and_labels_errors() {
     assert_eq!(
         state.toast().map(|toast| toast.message.as_str()),
         Some(
-            "explorer · background-child: network request failed · Retrying in 3s · attempt 2 of 3"
+            "explorer · background-child: Retrying in 3s · attempt 2/3\nThe connection to the provider failed"
         )
     );
     state.apply_child_session_event_with_agent(
@@ -1088,7 +1092,10 @@ fn child_feedback_respects_view_ownership_and_labels_errors() {
             attempt: 2,
             max_attempts: 3,
             delay_secs: 4,
-            error: "network request failed".into(),
+            failure: crate::model_runtime::ModelFailure::new(
+                crate::model_runtime::FailurePhase::Transport,
+                crate::model_runtime::FailureKind::Http,
+            ),
         }),
     );
     assert!(state.toast().is_none());
@@ -1117,11 +1124,16 @@ fn child_feedback_respects_view_ownership_and_labels_errors() {
 #[test]
 fn parent_retry_countdown_stays_live_until_retry_starts() {
     let mut state = TuiState::default();
+    state.set_language(Some(crate::tui::i18n::Language::En));
     let retry = RetryLifecycleEvent {
         attempt: 2,
         max_attempts: 4,
         delay_secs: 2,
-        error: "provider unavailable".into(),
+        failure: crate::model_runtime::ModelFailure::new(
+            crate::model_runtime::FailurePhase::Transport,
+            crate::model_runtime::FailureKind::Http,
+        )
+        .with_status(503),
     };
     let now = std::time::Instant::now();
     state.retry = Some(RetryNoticeState::from_lifecycle_at(retry.clone(), now));
@@ -1129,12 +1141,18 @@ fn parent_retry_countdown_stays_live_until_retry_starts() {
     state.refresh_live_presentations(now);
     assert_eq!(
         state.toast().map(|toast| toast.message.as_str()),
-        Some("Retrying in 2s · attempt 2 of 4")
+        Some("Retrying in 2s · attempt 2/4\nThe provider returned a server error (HTTP 503)")
     );
     state.refresh_live_presentations(now + std::time::Duration::from_secs(1));
     assert_eq!(
         state.toast().map(|toast| toast.message.as_str()),
-        Some("Retrying in 1s · attempt 2 of 4")
+        Some("Retrying in 1s · attempt 2/4\nThe provider returned a server error (HTTP 503)")
+    );
+    state.set_language(Some(crate::tui::i18n::Language::ZhCn));
+    state.refresh_live_presentations(now + std::time::Duration::from_secs(1));
+    assert_eq!(
+        state.toast().map(|toast| toast.message.as_str()),
+        Some("1 秒后进行第 2/4 次尝试\n服务商返回服务器错误（HTTP 503）")
     );
     state.apply_event(SessionEvent::RetryStarted(retry.clone()));
     assert!(state.toast().is_none());
@@ -1167,7 +1185,11 @@ fn child_retry_toast_clears_on_terminal_event() {
         attempt: 2,
         max_attempts: 4,
         delay_secs: 2,
-        error: "provider unavailable".into(),
+        failure: crate::model_runtime::ModelFailure::new(
+            crate::model_runtime::FailurePhase::Transport,
+            crate::model_runtime::FailureKind::Http,
+        )
+        .with_status(503),
     };
     state.apply_child_session_event_with_agent(
         "child-1",
@@ -1377,5 +1399,60 @@ fn compaction_non_success_and_terminal_events_clear_pending() {
     assert_eq!(
         state.toast().map(|toast| toast.message.as_str()),
         Some("Context limit reached; earlier context cannot be compacted safely yet.")
+    );
+}
+
+#[test]
+fn model_errors_show_localized_state_and_preserve_diagnostics() {
+    use crate::model_runtime::{FailureKind, FailurePhase, ModelFailure, RetryHint};
+    let mut failure = ModelFailure::new(FailurePhase::Transport, FailureKind::RateLimited)
+        .with_status(429)
+        .with_retry_hint(RetryHint::Retryable)
+        .with_detail("provider quota exceeded");
+    failure.retry_exhausted_attempts = Some(3);
+    let mut error =
+        crate::session::ErrorEvent::new(failure.to_string()).with_details(failure.detail());
+    error.model_failure = Some(failure.clone());
+    let mut state = TuiState::default();
+    state.set_language(Some(crate::tui::i18n::Language::ZhCn));
+    let localized = state.localized_error(error.clone());
+    assert_eq!(
+        localized.message,
+        "服务商正在限制请求（HTTP 429）\n已尝试 3 次，均未成功。自动重试已停止。\n请检查服务商配额，或稍后再试。"
+    );
+    assert!(
+        localized
+            .details
+            .as_deref()
+            .unwrap()
+            .contains("retry hint Retryable")
+    );
+    assert!(
+        localized
+            .details
+            .as_deref()
+            .unwrap()
+            .contains("provider quota exceeded")
+    );
+    state.set_language(Some(crate::tui::i18n::Language::En));
+    let localized = state.localized_error(error);
+    assert!(
+        localized
+            .message
+            .contains("All 3 attempts failed. Automatic retry has stopped.")
+    );
+    failure.retry_exhausted_attempts = None;
+    assert!(
+        state
+            .translator()
+            .model_failure_message(&failure)
+            .contains("This request has stopped.")
+    );
+    let rejected = ModelFailure::new(FailurePhase::Transport, FailureKind::Http).with_status(400);
+    assert!(
+        state
+            .translator()
+            .model_failure_message(&rejected)
+            .contains("Check the model configuration and error details.")
     );
 }

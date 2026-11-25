@@ -586,7 +586,17 @@ impl ModelRuntime {
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
-                Err(error) => return Err(error.failure),
+                Err(error) => {
+                    let mut failure = error.failure;
+                    if !observer.rejected_event
+                        && retryable_failure(&failure)
+                        && retry.enabled
+                        && attempt == retry.max_attempts
+                    {
+                        failure.retry_exhausted_attempts = Some(attempt);
+                    }
+                    return Err(failure);
+                }
             }
         }
     }
@@ -1469,7 +1479,16 @@ impl TurnOrchestrator {
                         });
                     }
                 }
-                Err(error) => return Err(error),
+                Err(mut error) => {
+                    if !error.partial.side_effects.observable()
+                        && retryable_failure(&error.failure)
+                        && retry.enabled
+                        && attempt == retry.max_attempts
+                    {
+                        error.failure.retry_exhausted_attempts = Some(attempt);
+                    }
+                    return Err(error);
+                }
             }
         }
     }

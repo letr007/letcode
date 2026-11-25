@@ -104,7 +104,7 @@ pub struct RetryLifecycleEvent {
     pub attempt: usize,
     pub max_attempts: usize,
     pub delay_secs: u64,
-    pub error: String,
+    pub failure: crate::model_runtime::ModelFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +369,12 @@ pub enum NoticeId {
     FastModeUnavailableForModel,
     HistoryNavigationFailed,
     HistoryNavigationUnavailable,
+    HistoryNothingToUndo,
+    HistoryAtStart,
+    HistoryTargetUnavailable,
+    HistoryNothingToRedo,
+    StreamRecovering,
+    OutputLengthLimit,
     ModelMissingFromCatalog,
     NoChildTranscripts,
     ProjectMemoryUnavailable,
@@ -386,6 +392,12 @@ impl NoticeId {
         Self::FastModeUnavailableForModel,
         Self::HistoryNavigationFailed,
         Self::HistoryNavigationUnavailable,
+        Self::HistoryNothingToUndo,
+        Self::HistoryAtStart,
+        Self::HistoryTargetUnavailable,
+        Self::HistoryNothingToRedo,
+        Self::StreamRecovering,
+        Self::OutputLengthLimit,
         Self::ModelMissingFromCatalog,
         Self::NoChildTranscripts,
         Self::ProjectMemoryUnavailable,
@@ -402,6 +414,12 @@ impl NoticeId {
             Self::FastModeUnavailableForModel => "notice.fast_mode_unavailable_for_model",
             Self::HistoryNavigationFailed => "notice.history_navigation_failed",
             Self::HistoryNavigationUnavailable => "notice.history_navigation_unavailable",
+            Self::HistoryNothingToUndo => "notice.history_nothing_to_undo",
+            Self::HistoryAtStart => "notice.history_at_start",
+            Self::HistoryTargetUnavailable => "notice.history_target_unavailable",
+            Self::HistoryNothingToRedo => "notice.history_nothing_to_redo",
+            Self::StreamRecovering => "notice.stream_recovering",
+            Self::OutputLengthLimit => "notice.output_length_limit",
             Self::ModelMissingFromCatalog => "notice.model_missing_from_catalog",
             Self::NoChildTranscripts => "notice.no_child_transcripts",
             Self::ProjectMemoryUnavailable => "notice.project_memory_unavailable",
@@ -458,8 +476,7 @@ impl NoticeEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessIssueEvent {
     pub message: String,
-    pub detail: Option<String>,
-    pub action: Option<String>,
+    pub message_id: Option<NoticeId>,
 }
 
 impl ProcessIssueEvent {
@@ -467,8 +484,7 @@ impl ProcessIssueEvent {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            detail: None,
-            action: None,
+            message_id: None,
         }
     }
 }
@@ -661,6 +677,24 @@ pub enum PermissionDecision {
 pub struct ErrorEvent {
     pub message: String,
     pub details: Option<String>,
+    pub message_id: Option<ErrorId>,
+    pub args: Vec<(String, String)>,
+    pub model_failure: Option<crate::model_runtime::ModelFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorId {
+    MissingApiKey,
+    ManualCompactionFailed,
+}
+
+impl ErrorId {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::MissingApiKey => "error.missing_api_key",
+            Self::ManualCompactionFailed => "error.manual_compaction_failed",
+        }
+    }
 }
 
 impl ErrorEvent {
@@ -668,7 +702,28 @@ impl ErrorEvent {
         Self {
             message: message.into(),
             details: None,
+            message_id: None,
+            args: Vec::new(),
+            model_failure: None,
         }
+    }
+
+    pub fn with_message_id(mut self, message_id: ErrorId) -> Self {
+        self.message_id = Some(message_id);
+        self
+    }
+
+    pub fn with_args<I, K, V>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.args = args
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+        self
     }
 
     pub fn with_details(mut self, details: impl Into<String>) -> Self {

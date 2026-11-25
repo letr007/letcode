@@ -31,7 +31,7 @@ use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
 use crate::session::{
-    AgentRunner, ErrorEvent, NoticeEvent, NoticeId, RuntimeContextDisposition,
+    AgentRunner, ErrorEvent, ErrorId, NoticeEvent, NoticeId, RuntimeContextDisposition,
     RuntimeContextUpdatedEvent, SessionCommand, SessionEvent, SessionTransportEvent,
     TokenUsageEvent, TurnOutcome,
 };
@@ -456,6 +456,8 @@ fn missing_api_key_error(api_key_hint: &str) -> ErrorEvent {
         "API key is not set for the selected provider. {}",
         api_key_hint
     ))
+    .with_message_id(ErrorId::MissingApiKey)
+    .with_args([("hint", api_key_hint)])
 }
 
 fn send_missing_api_key_error(
@@ -505,6 +507,20 @@ fn record_manual_compaction_error(
         }
     };
     ErrorEvent::new(message)
+}
+
+fn record_manual_compaction_failure(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    error: String,
+) -> ErrorEvent {
+    let message = format!("failed to compact context: {error}");
+    let mut event = record_manual_compaction_error(transcript, message.clone());
+    if event.message != message {
+        event.details = Some(std::mem::replace(&mut event.message, message));
+    }
+    event
+        .with_message_id(ErrorId::ManualCompactionFailed)
+        .with_args([("error", error)])
 }
 
 fn runtime_context_from_records(
@@ -990,10 +1006,7 @@ where
         }
         ManualCompactionOperation::Completed(Ok(ManualCompactionOutcome::NoProgress(_))) => {}
         ManualCompactionOperation::Completed(Err(error)) => {
-            let event = record_manual_compaction_error(
-                &transcript,
-                format!("failed to compact context: {error}"),
-            );
+            let event = record_manual_compaction_failure(&transcript, error.to_string());
             let _ = session_transport_tx.send(SessionTransportEvent::Error(event));
         }
     }

@@ -264,6 +264,48 @@ fn history_prepare_failure_prevents_navigation_commit() {
 }
 
 #[test]
+fn undo_at_history_start_reports_history_at_start() {
+    let transcript = temp_transcript();
+    {
+        let mut recorder = transcript.lock().expect("recorder");
+        recorder.record_user_message("first").expect("first user");
+    }
+    let mut agent = test_agent();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    assert_eq!(
+        SessionCoordinator::dispatch_idle_command(
+            SessionCommand::Undo,
+            &mut agent,
+            &transcript,
+            &tx,
+            None,
+            &ChildLiveText::default(),
+        )
+        .expect("first undo"),
+        IdleDispatch::HistoryNavigated
+    );
+    while rx.try_recv().is_ok() {}
+
+    assert_eq!(
+        SessionCoordinator::dispatch_idle_command(
+            SessionCommand::Undo,
+            &mut agent,
+            &transcript,
+            &tx,
+            None,
+            &ChildLiveText::default(),
+        )
+        .expect("dispatch"),
+        IdleDispatch::Handled
+    );
+    assert!(matches!(
+        rx.try_recv().expect("history notice"),
+        SessionTransportEvent::Notice(notice)
+            if notice.message_id == Some(NoticeId::HistoryAtStart)
+    ));
+}
+
+#[test]
 fn navigation_install_is_infallible_after_precommit_validation() {
     let transcript = temp_transcript();
     {

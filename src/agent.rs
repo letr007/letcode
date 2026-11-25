@@ -76,7 +76,7 @@ pub use events::{
     AgentEvent, CacheUsageReport, CompactionAttemptOutcome, CompactionBlocker,
     CompactionNoProgress, CompactionTrigger, ContextCompactionEvent, LlmRequestErrorClass,
     LlmRequestTelemetry, LlmRequestTelemetryPhase, LlmRetryLifecycle, ManualCompactionOutcome,
-    PromptCompositionEntry, ProviderUsageCompleteness, TokenUsageEstimate,
+    ModelStreamIssueKind, PromptCompositionEntry, ProviderUsageCompleteness, TokenUsageEstimate,
     ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
 #[cfg(test)]

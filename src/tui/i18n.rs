@@ -90,6 +90,72 @@ impl Translator {
         substitute(self.t(key), args)
     }
 
+    pub fn model_failure_summary(&self, failure: &crate::model_runtime::ModelFailure) -> String {
+        use crate::model_runtime::{FailureKind, FailurePhase};
+        let key = match failure.code.as_deref() {
+            Some("max_iterations") => "error.model_iteration_limit",
+            Some("max_tool_calls") => "error.model_tool_limit",
+            _ => match failure.kind {
+                FailureKind::InvalidRequest => "error.model_invalid_request",
+                FailureKind::UnsupportedProtocol => "error.model_unsupported_protocol",
+                FailureKind::Authentication => "error.model_authentication",
+                FailureKind::RateLimited => "error.model_rate_limited",
+                FailureKind::Timeout => "error.model_timeout",
+                FailureKind::Http if failure.status.is_some_and(|status| status >= 500) => {
+                    "error.model_unavailable"
+                }
+                FailureKind::Http
+                    if failure.status.is_none() && failure.phase == FailurePhase::Transport =>
+                {
+                    "error.model_connection"
+                }
+                FailureKind::Http => "error.model_http",
+                FailureKind::MalformedResponse => "error.model_malformed_response",
+                FailureKind::Internal => "error.model_internal",
+            },
+        };
+        let reason = self.t(key);
+        match failure.status {
+            Some(status) => self.t_fmt(
+                "error.with_status",
+                &[("reason", &reason), ("status", &status.to_string())],
+            ),
+            None => reason,
+        }
+    }
+
+    pub fn model_failure_message(&self, failure: &crate::model_runtime::ModelFailure) -> String {
+        use crate::model_runtime::FailureKind;
+        let reason = self.model_failure_summary(failure);
+        let stopped = match failure.retry_exhausted_attempts {
+            Some(attempts) => self.t_fmt(
+                "error.retry_exhausted",
+                &[("attempts", &attempts.to_string())],
+            ),
+            None => self.t("error.request_stopped"),
+        };
+        let action_key = match failure.code.as_deref() {
+            Some("max_iterations" | "max_tool_calls") => "error.action_continue",
+            _ => match failure.kind {
+                FailureKind::Authentication => "error.action_authentication",
+                FailureKind::RateLimited => "error.action_rate_limited",
+                FailureKind::Http
+                    if failure
+                        .status
+                        .is_some_and(|status| (400..500).contains(&status) && status != 408) =>
+                {
+                    "error.action_configuration"
+                }
+                FailureKind::Timeout | FailureKind::Http => "error.action_connection",
+                FailureKind::InvalidRequest | FailureKind::UnsupportedProtocol => {
+                    "error.action_configuration"
+                }
+                FailureKind::MalformedResponse | FailureKind::Internal => "error.action_details",
+            },
+        };
+        format!("{reason}\n{stopped}\n{}", self.t(action_key))
+    }
+
     /// [`Self::lookup`] with `{name}` placeholders replaced by `args`.
     pub fn lookup_fmt(&self, key: &str, args: &[(String, String)]) -> Option<String> {
         let args: Vec<(&str, &str)> = args

@@ -67,6 +67,38 @@ thread_local! {
     static FAIL_HISTORY_NAVIGATION_COMMIT: Cell<bool> = const { Cell::new(false) };
 }
 
+enum NavigationFailure {
+    NothingToUndo,
+    AtStart,
+    TargetUnavailable,
+    NothingToRedo,
+    Failed(anyhow::Error),
+}
+
+impl From<anyhow::Error> for NavigationFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl NavigationFailure {
+    fn into_notice(self) -> NoticeEvent {
+        match self {
+            Self::NothingToUndo => NoticeEvent::info("no session history entry to undo")
+                .with_message_id(NoticeId::HistoryNothingToUndo),
+            Self::AtStart => NoticeEvent::info("already at the start of session history")
+                .with_message_id(NoticeId::HistoryAtStart),
+            Self::TargetUnavailable => NoticeEvent::info("history target is unavailable")
+                .with_message_id(NoticeId::HistoryTargetUnavailable),
+            Self::NothingToRedo => NoticeEvent::info("no history entry available to redo")
+                .with_message_id(NoticeId::HistoryNothingToRedo),
+            Self::Failed(error) => NoticeEvent::info(error.to_string())
+                .with_message_id(NoticeId::HistoryNavigationFailed)
+                .with_args([("error", error.to_string())]),
+        }
+    }
+}
+
 impl SessionCoordinator {
     /// Execute an idle session command, emitting [`SessionTransportEvent`]s for the
     /// frontend bridge. Returns [`IdleDispatch::NotIdle`] when the command is
@@ -347,7 +379,7 @@ impl SessionCoordinator {
     where
         F: FnMut(&crate::transcript::transcript_projection::RuntimeRestoreSnapshot) -> Result<()>,
     {
-        let result = (|| -> Result<(u64, Vec<u64>)> {
+        let result = (|| -> Result<(u64, Vec<u64>), NavigationFailure> {
             let recorder = transcript
                 .lock()
                 .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
@@ -378,27 +410,27 @@ impl SessionCoordinator {
                         .rev()
                         .find(|entry| visible_sequences.contains(&entry.sequence))
                         .map(|entry| entry.sequence)
-                        .ok_or_else(|| anyhow::anyhow!("no session history entry to undo"))?
+                        .ok_or(NavigationFailure::NothingToUndo)?
                 }
             };
             if current == 0 {
-                anyhow::bail!("already at the start of session history");
+                return Err(NavigationFailure::AtStart);
             }
             let mut turn_root = entries
                 .iter()
                 .find(|entry| entry.sequence == current)
-                .ok_or_else(|| anyhow::anyhow!("current history target is unavailable"))?;
+                .ok_or(NavigationFailure::TargetUnavailable)?;
             while turn_root.kind
                 != crate::transcript::transcript_projection::SessionHistoryEntryKind::User
             {
                 let parent_id = turn_root
                     .parent_id
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("history parent is unavailable"))?;
+                    .ok_or(NavigationFailure::TargetUnavailable)?;
                 turn_root = entries
                     .iter()
                     .find(|entry| entry.id == parent_id)
-                    .ok_or_else(|| anyhow::anyhow!("history parent is unavailable"))?;
+                    .ok_or(NavigationFailure::TargetUnavailable)?;
             }
             let target = turn_root
                 .parent_id
@@ -420,10 +452,8 @@ impl SessionCoordinator {
                 redo_stack,
                 prepare_history,
             ),
-            Err(error) => {
-                let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                    error.to_string(),
-                )));
+            Err(failure) => {
+                let _ = event_tx.send(SessionTransportEvent::Notice(failure.into_notice()));
                 false
             }
         }
@@ -438,25 +468,25 @@ impl SessionCoordinator {
     where
         F: FnMut(&crate::transcript::transcript_projection::RuntimeRestoreSnapshot) -> Result<()>,
     {
-        let result = (|| -> Result<(u64, Vec<u64>)> {
+        let result = (|| -> Result<(u64, Vec<u64>), NavigationFailure> {
             let recorder = transcript
                 .lock()
                 .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
             let records = crate::transcript::read_records(recorder.path())?;
             let mut state =
                 crate::transcript::transcript_projection::history_navigation_state(&records)
-                    .ok_or_else(|| anyhow::anyhow!("no history entry available to redo"))?;
+                    .ok_or(NavigationFailure::NothingToRedo)?;
             let target = state
                 .redo_stack
                 .pop()
-                .ok_or_else(|| anyhow::anyhow!("no history entry available to redo"))?;
+                .ok_or(NavigationFailure::NothingToRedo)?;
             // Ensure a corrupt navigation event cannot make redo guess a sibling.
             if target != 0
                 && !crate::transcript::transcript_projection::project_session_history_tree(&records)
                     .iter()
                     .any(|entry| entry.sequence == target)
             {
-                anyhow::bail!("redo target is unavailable");
+                return Err(NavigationFailure::TargetUnavailable);
             }
             Ok((target, state.redo_stack))
         })();
@@ -470,10 +500,8 @@ impl SessionCoordinator {
                 redo_stack,
                 prepare_history,
             ),
-            Err(error) => {
-                let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
-                    error.to_string(),
-                )));
+            Err(failure) => {
+                let _ = event_tx.send(SessionTransportEvent::Notice(failure.into_notice()));
                 false
             }
         }

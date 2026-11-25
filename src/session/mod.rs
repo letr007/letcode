@@ -56,7 +56,7 @@ pub use engine::{
 pub use event::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
-    NoticeEvent, NoticeId, NoticeKind, PermissionDecision, PermissionRequestEvent,
+    ErrorId, NoticeEvent, NoticeId, NoticeKind, PermissionDecision, PermissionRequestEvent,
     PermissionResolutionEvent, ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
     RetryLifecycleEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent, SessionEvent,
     TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome,
