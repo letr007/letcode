@@ -160,6 +160,17 @@ impl QMatrix {
     }
 
     fn kernel_rows(&self, a: &[u8], out: &mut [i32]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2")
+                && self.k.is_multiple_of(2)
+                && self.cols.is_multiple_of(16)
+            {
+                // SAFETY: AVX2 is present, four input rows and 16-column tiles fit without padding.
+                unsafe { self.kernel_avx2_rows(a, out) };
+                return;
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         {
             if std::arch::is_aarch64_feature_detected!("dotprod")
@@ -215,6 +226,55 @@ impl QMatrix {
                 acc += i32::from(*x) * i32::from(w[c]);
             }
             *slot = acc;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn kernel_avx2_rows(&self, a: &[u8], out: &mut [i32]) {
+        use std::arch::x86_64::*;
+
+        for tile in (0..self.cols / TILE_COLS).step_by(2) {
+            let mut acc = [[_mm256_setzero_si256(); 4]; 2];
+            for pair in 0..self.k_groups {
+                let mut av = [_mm256_setzero_si256(); 4];
+                for (r, slot) in av.iter_mut().enumerate() {
+                    // SAFETY: each of the four rows has a full pair because k is even.
+                    let (lo, hi) = unsafe {
+                        let row = a.as_ptr().add(r * self.k + pair * 2);
+                        (i32::from(*row), i32::from(*row.add(1)))
+                    };
+                    *slot = _mm256_set1_epi32(lo | (hi << 16));
+                }
+                for (g, column) in acc.iter_mut().enumerate() {
+                    // SAFETY: cols is a multiple of 16, so both tiles are inside the blocked layout.
+                    let w = unsafe {
+                        _mm_loadu_si128(
+                            self.blocked
+                                .as_ptr()
+                                .add(((tile + g) * self.k_groups + pair) * 16)
+                                .cast(),
+                        )
+                    };
+                    let w = _mm256_cvtepi8_epi16(w);
+                    for (value, av) in column.iter_mut().zip(av) {
+                        *value = _mm256_add_epi32(*value, _mm256_madd_epi16(av, w));
+                    }
+                }
+            }
+            for (g, column) in acc.iter().enumerate() {
+                for (r, value) in column.iter().enumerate() {
+                    // SAFETY: out holds four rows of cols, and each tile has eight complete columns.
+                    unsafe {
+                        _mm256_storeu_si256(
+                            out.as_mut_ptr()
+                                .add(r * self.cols + (tile + g) * TILE_COLS)
+                                .cast(),
+                            *value,
+                        )
+                    };
+                }
+            }
         }
     }
 
@@ -435,6 +495,15 @@ pub(crate) fn threads(rows: usize) -> usize {
 
 // Scale covers the range through zero; the zero point rounds half to even.
 pub(crate) fn quantize_into(out: &mut Vec<u8>, x: &[f32]) -> (f32, i32) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is present; the kernel handles complete blocks and the remaining tail separately.
+        return unsafe { quantize_avx2(out, x) };
+    }
+    quantize_scalar(out, x)
+}
+
+fn quantize_scalar(out: &mut Vec<u8>, x: &[f32]) -> (f32, i32) {
     let mut min = 0.0f32;
     let mut max = 0.0f32;
     for &v in x {
@@ -459,21 +528,122 @@ pub(crate) fn quantize_into(out: &mut Vec<u8>, x: &[f32]) -> (f32, i32) {
     (scale, zp)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_avx2(out: &mut Vec<u8>, x: &[f32]) -> (f32, i32) {
+    use std::arch::x86_64::*;
+
+    let zero = _mm256_setzero_ps();
+    let mut lo = zero;
+    let mut hi = zero;
+    let (blocks, tail) = x.as_chunks::<8>();
+    for block in blocks {
+        // SAFETY: each block contains eight readable floats.
+        let v = unsafe { _mm256_loadu_ps(block.as_ptr()) };
+        lo = _mm256_min_ps(v, lo);
+        hi = _mm256_max_ps(v, hi);
+    }
+    let mut mins = [0.0f32; 8];
+    let mut maxs = [0.0f32; 8];
+    // SAFETY: both arrays hold eight floats, matching the vector width.
+    unsafe {
+        _mm256_storeu_ps(mins.as_mut_ptr(), lo);
+        _mm256_storeu_ps(maxs.as_mut_ptr(), hi);
+    }
+    let min = mins.iter().chain(tail).copied().fold(0.0f32, f32::min);
+    let max = maxs.iter().chain(tail).copied().fold(0.0f32, f32::max);
+    let scale = (max - min) / 255.0;
+    out.resize(x.len(), 0);
+    if scale <= 0.0 || !scale.is_finite() {
+        out.fill(0);
+        return (1.0, 0);
+    }
+    let zp = (-min / scale).round_ties_even().clamp(0.0, 255.0) as i32;
+    let scale8 = _mm256_set1_ps(scale);
+    let zp8 = _mm256_set1_ps(zp as f32);
+    let max8 = _mm256_set1_ps(255.0);
+    for (input, output) in blocks.iter().zip(out.as_chunks_mut::<8>().0) {
+        // SAFETY: input is an eight-float block.
+        let v = unsafe { _mm256_loadu_ps(input.as_ptr()) };
+        let q = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+            _mm256_div_ps(v, scale8),
+        );
+        let q = _mm256_add_ps(q, zp8);
+        let q = _mm256_min_ps(_mm256_max_ps(q, zero), max8);
+        let q = _mm256_cvttps_epi32(q);
+        let q = _mm_packus_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256::<1>(q));
+        let q = _mm_packus_epi16(q, _mm_setzero_si128());
+        // SAFETY: output holds the eight bytes written by storel.
+        unsafe { _mm_storel_epi64(output.as_mut_ptr().cast(), q) };
+    }
+    for (&v, dst) in tail.iter().zip(&mut out[blocks.len() * 8..]) {
+        let q = (v / scale).round_ties_even() + zp as f32;
+        *dst = q.clamp(0.0, 255.0) as u8;
+    }
+    (scale, zp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn quantization_matches_the_scalar_result() {
+        let mut cases = vec![
+            vec![],
+            vec![0.0; 17],
+            vec![-0.0; 17],
+            vec![3.0; 17],
+            vec![-3.0; 17],
+            vec![f32::NAN; 17],
+            vec![f32::INFINITY; 17],
+            vec![f32::NEG_INFINITY; 17],
+            vec![f32::MIN_POSITIVE; 17],
+            vec![f32::from_bits(1); 17],
+            vec![-f32::MAX, f32::MAX],
+            vec![0.0, 255.0, 0.5, 1.5, 2.5, 253.5, 254.5, f32::NAN, -0.0],
+            vec![-128.0, 127.0, -0.5, 0.5, 1.5, -1.5, -127.5, 126.5, f32::NAN],
+        ];
+        let mut state = 0x2545_f491u32;
+        for len in [1, 7, 8, 9, 31, 2049] {
+            let mut values = Vec::new();
+            for _ in 0..len {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                values.push(f32::from_bits(state));
+            }
+            cases.push(values.clone());
+            cases.push(values.into_iter().map(|v| v.sin() * 3.0).collect());
+        }
+        let mut want = vec![123; 4096];
+        let mut got = want.clone();
+        for values in cases {
+            let (want_scale, want_zp) = quantize_scalar(&mut want, &values);
+            let (got_scale, got_zp) = quantize_into(&mut got, &values);
+            assert_eq!(want_scale.to_bits(), got_scale.to_bits());
+            assert_eq!(want_zp, got_zp);
+            assert_eq!(want, got);
+        }
+    }
+
+    #[test]
     fn the_packed_kernel_matches_the_scalar_one() {
-        for (k, cols, rows) in [(8, 32, 5), (18, 21, 5)] {
+        for (k, cols, rows) in [
+            (6, 16, 4),
+            (8, 32, 5),
+            (18, 21, 5),
+            (7, 16, 5),
+            (384, 32, 65),
+        ] {
             let mut state = 0x2545_f491u32;
             let mut next = || {
                 state ^= state << 13;
                 state ^= state >> 17;
                 state ^= state << 5;
-                (state % 255) as i32 - 127
+                state as i8
             };
-            let w: Vec<i8> = (0..k * cols).map(|_| next() as i8).collect();
+            let w: Vec<i8> = (0..k * cols).map(|_| next()).collect();
             let scale: Vec<f32> = (0..cols).map(|c| 0.25 + c as f32 * 0.03).collect();
             let zp: Vec<i32> = (0..cols).map(|c| c as i32 % 5 - 2).collect();
             let matrix = QMatrix::new(k, cols, w, scale, zp).expect("the matrix builds");

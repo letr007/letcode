@@ -357,6 +357,23 @@ fn attention(qkv: &[f32], n: usize, heads: &mut [f32], out: &mut [f32]) {
 }
 
 fn attend(q: &mut [f32], k: &[f32], v: &[f32], n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is present; both implementations use the same slice bounds.
+        unsafe { attend_avx2(q, k, v, n) };
+        return;
+    }
+    attend_inner(q, k, v, n);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn attend_avx2(q: &mut [f32], k: &[f32], v: &[f32], n: usize) {
+    attend_inner(q, k, v, n);
+}
+
+#[inline(always)]
+fn attend_inner(q: &mut [f32], k: &[f32], v: &[f32], n: usize) {
     let head_stride = n * HEAD_DIM;
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
     let mut scores = vec![0f32; n];
@@ -382,7 +399,7 @@ fn attend(q: &mut [f32], k: &[f32], v: &[f32], n: usize) {
                 sum += *slot;
             }
             let mut values = [0f32; HEAD_DIM];
-            for (&p, value) in scores.iter().zip(v.chunks_exact(HEAD_DIM)) {
+            for (&p, value) in scores.iter().zip(v.as_chunks::<HEAD_DIM>().0) {
                 let p = p / sum;
                 for c in 0..HEAD_DIM {
                     values[c] += p * value[c];
