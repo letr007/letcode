@@ -1,7 +1,6 @@
 use crate::agent::ConversationMessage;
 #[cfg(test)]
 use crate::context_view::{self, ContextViewProjection};
-use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::ProtocolFrame;
 #[cfg(test)]
 use crate::protocol_frames::history_items_to_frames;
@@ -114,8 +113,6 @@ pub(crate) struct SessionRestoreSnapshot {
     pub messages: Vec<ConversationMessage>,
     #[allow(dead_code)] // Retained for the complete session restore projection.
     pub history: Vec<HistoryItem>,
-    #[allow(dead_code)] // Retained for evidence-aware session restoration.
-    pub evidence: Vec<EvidenceRecord>,
     #[allow(dead_code)] // Retained for model restoration compatibility.
     pub latest_model: Option<String>,
     #[allow(dead_code)] // Retained for turn-sequence restoration compatibility.
@@ -278,7 +275,6 @@ pub(crate) fn build_session_context_snapshot(
         .into_iter()
         .filter_map(super::history_item_to_conversation_message)
         .collect();
-    let evidence = crate::evidence::restore_evidence_records(&resolved.records)?;
     let latest_model = restore_latest_model_projection(&resolved.records);
     // Turn IDs are allocated across the append-only session, independently of
     // the branch/leaf used for lifecycle and active-turn restoration.
@@ -291,14 +287,13 @@ pub(crate) fn build_session_context_snapshot(
         records: resolved.records,
         messages,
         history,
-        evidence,
         latest_model,
         max_turn_id,
     })
 }
 
 /// Builds only the runtime context consumers of `RuntimeContextUpdated` need.
-/// History, evidence and composer frames are not part of that payload.
+/// History and composer frames are not part of that payload.
 pub(crate) fn project_runtime_active_context(
     session_id: &str,
     records: &[TranscriptRecord],

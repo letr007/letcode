@@ -198,7 +198,6 @@ pub(crate) fn project_job_board(
     child_dir: &Path,
     parent_records: &[TranscriptRecord],
 ) -> anyhow::Result<Vec<crate::transcript::JobBoardEntry>> {
-    use crate::subagent::StructuredSubagentResult;
     use crate::transcript::JobBoardEntry;
     let mut jobs = BTreeMap::<String, JobBoardAccumulator>::new();
     let owned_runs = parent_records
@@ -257,42 +256,6 @@ pub(crate) fn project_job_board(
                 entry.status = status.clone();
                 entry.summary = summary.clone();
                 entry.active = false;
-            }
-            TranscriptEvent::Evidence {
-                source:
-                    crate::evidence::EvidenceSource::Subagent {
-                        run_id,
-                        child_session_id,
-                        parent_tool,
-                        ..
-                    },
-                summary,
-                detail,
-                tags,
-                ..
-            } if owned_runs.contains(run_id) => {
-                let entry = jobs.entry(run_id.clone()).or_default();
-                entry.run_id = run_id.clone();
-                if entry.child_session_id.is_empty() {
-                    entry.child_session_id = child_session_id.clone();
-                }
-                if entry.agent_name.is_empty() {
-                    entry.agent_name = parent_tool
-                        .strip_prefix("agent__")
-                        .or_else(|| parent_tool.strip_prefix("system__"))
-                        .unwrap_or(parent_tool)
-                        .to_string();
-                }
-                if tags.iter().any(|tag| tag == "subagent_result") {
-                    entry.summary = summary.clone();
-                    if let Some(detail) = detail
-                        && let Ok(structured) =
-                            serde_json::from_str::<StructuredSubagentResult>(detail)
-                        && entry.status.is_empty()
-                    {
-                        entry.status = structured.status;
-                    }
-                }
             }
             _ => {}
         }

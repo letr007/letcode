@@ -1612,43 +1612,6 @@ mod restoration {
         }
 
         #[test]
-        fn evidence_records_round_trip_and_restore_from_transcript() {
-            let base_dir = std::env::temp_dir().join(format!(
-                "letcode-transcript-evidence-test-{}",
-                unix_timestamp_ms()
-            ));
-            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-            let draft = EvidenceDraft {
-                id: Some("ev-test".into()),
-                evidence_kind: EvidenceKind::FileExcerpt,
-                title: "read config".into(),
-                summary: "config has active provider".into(),
-                detail: Some("active_provider = openai".into()),
-                source: EvidenceSource::File {
-                    path: "letcode.toml".into(),
-                    start_line: Some(1),
-                    end_line: Some(1),
-                },
-                tags: vec!["letcode.toml".into()],
-            };
-
-            let record = recorder.record_evidence(draft).expect("record evidence");
-            assert_eq!(record.id, "ev-test");
-
-            let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-                .expect("read records");
-            let evidence = restore_session_evidence(&records).expect("restore evidence");
-            assert_eq!(evidence.len(), 1);
-            assert_eq!(evidence[0].id, "ev-test");
-            assert_eq!(evidence[0].summary, "config has active provider");
-            assert!(
-                restore_conversation_messages(&records)
-                    .expect("restore messages")
-                    .is_empty()
-            );
-        }
-
-        #[test]
         fn child_transcript_records_parent_attribution_without_affecting_parent_restore() {
             let base_dir = std::env::temp_dir().join(format!(
                 "letcode-transcript-child-test-{}",
@@ -1959,15 +1922,10 @@ fn read_records_accepts_legacy_prompt_composition_shapes() {
                 estimated_unaddressable_protected_tokens: 0,
                 estimated_retained_history_tokens: 10,
                 estimated_tools_tokens: 10,
-                estimated_evidence_tokens: 0,
                 estimated_required_fallback_tokens: 0,
                 original_history_items: 1,
                 retained_history_items: 1,
                 dropped_history_items: 0,
-                selected_evidence_items: 0,
-                dropped_evidence_items: 0,
-                selected_evidence_ids: Vec::new(),
-                evidence_fingerprint: String::new(),
                 truncated: false,
                 prompt_segment_count: 1,
                 prompt_contributor_count: 1,
@@ -2046,62 +2004,6 @@ fn read_records_accepts_legacy_prompt_composition_shapes() {
             assert_eq!(prompt_composition[0].segments, 1);
         }
         other => panic!("unexpected event: {other:?}"),
-    }
-}
-
-mod subagent_commit {
-    use super::*;
-
-    mod integration_tests {
-        use super::*;
-
-        #[test]
-        fn structured_subagent_result_and_evidence_commit_atomically() {
-            let base_dir = journal_test_dir("subagent-result-transaction");
-            let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-            let session_id = recorder.session_id().to_string();
-            let structured = StructuredSubagentResult {
-                status: "completed".into(),
-                summary: "done".into(),
-                malformed: false,
-                findings: Vec::new(),
-                files_read: Vec::new(),
-                files_changed: Vec::new(),
-                commands_run: Vec::new(),
-                validation: Vec::new(),
-                blockers: Vec::new(),
-                next_steps: Vec::new(),
-                run_id: "run-transaction".into(),
-                child_session_id: "child-transaction".into(),
-                raw_excerpt: None,
-            };
-            recorder
-                .record_subagent_result_structured(
-                    "run-transaction",
-                    &session_id,
-                    "turn-1",
-                    "child-transaction",
-                    "explorer",
-                    "completed",
-                    "done",
-                    Some(structured),
-                )
-                .expect("record structured result");
-
-            let records = read_records(recorder.path()).expect("read records");
-            assert_eq!(records.len(), 2);
-            assert!(matches!(
-                records[0].event,
-                TranscriptEvent::SubagentResult { .. }
-            ));
-            assert!(matches!(
-                &records[1].event,
-                TranscriptEvent::Evidence {
-                    source: EvidenceSource::Subagent { run_id, .. },
-                    ..
-                } if run_id == "run-transaction"
-            ));
-        }
     }
 }
 

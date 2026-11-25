@@ -36,16 +36,3 @@ fn writable_templates_match_catalog_contracts() {
         );
     }
 }
-
-#[test]
-fn reviewer_evidence_parent_tool_uses_system_prefix() {
-    assert_eq!(
-        subagent_evidence_parent_tool("reviewer").as_deref(),
-        Some("system__reviewer")
-    );
-    assert_eq!(
-        subagent_evidence_parent_tool("explorer").as_deref(),
-        Some(tool_names::TOOL_AGENT_EXPLORE)
-    );
-    assert!(subagent_evidence_parent_tool("nosuch").is_none());
-}

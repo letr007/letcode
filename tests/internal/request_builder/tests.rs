@@ -1,18 +1,8 @@
 use super::*;
 
-#[test]
-fn evidence_budget_tokens_preserves_saturating_15_percent_clamp() {
-    assert_eq!(evidence_budget_tokens(3_413), 512);
-    assert_eq!(evidence_budget_tokens(3_414), 512);
-    assert_eq!(evidence_budget_tokens(10_000), 1_500);
-    assert_eq!(evidence_budget_tokens(20_000), 3_000);
-    assert_eq!(evidence_budget_tokens(u64::MAX), 3_000);
-}
-
 use crate::agent::{ToolExecutionSummaryEvent, ValidationAdvisory};
 use crate::context_tree::ContextNodeStatus;
 use crate::context_view::{ContextBlockId, ContextViewStatus};
-use crate::evidence::{EvidenceKind, EvidenceRecord, EvidenceSource};
 use crate::runtime_context::RuntimeChildSession;
 use crate::tool::ToolResult;
 use crate::transcript::transcript_projection::{
@@ -170,7 +160,6 @@ fn disabled_model_images_do_not_affect_plan_size_and_fit_tight_budget() {
         history: &image_history(8),
         protected_start_index: 0,
         tools: &[],
-        evidence: &[],
     })
     .expect("placeholder projection should fit the tight budget");
     let large = build_test_request(TestRequestBuilderInput {
@@ -180,7 +169,6 @@ fn disabled_model_images_do_not_affect_plan_size_and_fit_tight_budget() {
         history: &image_history(80_000),
         protected_start_index: 0,
         tools: &[],
-        evidence: &[],
     })
     .expect("large disabled images should fit the same tight budget");
 
@@ -227,7 +215,6 @@ fn disabled_model_images_do_not_affect_plan_size_and_fit_tight_budget() {
         history: &image_history(8),
         protected_start_index: 0,
         tools: &[],
-        evidence: &[],
     })
     .expect("enabled image request should build with visual budget");
     let enabled_user = enabled
@@ -283,7 +270,6 @@ fn planner_image_projection_preserves_snapshot() {
         prelude: &[],
         snapshot: &snapshot,
         tools: &[],
-        frozen_evidence: None,
         protected_context_policy: ProtectedContextPolicy::from_configured_reserve(None, 0),
     })
     .expect("disabled image projection should fit");
@@ -296,24 +282,6 @@ fn deepseek_metadata() -> ModelRequestMetadata {
         reasoning_effort: Some(ModelReasoningEffort::High),
         max_output_tokens: Some(32_768),
         ..metadata(384_000)
-    }
-}
-
-fn evidence(id: &str, summary: &str, path: &str, sequence: u64) -> EvidenceRecord {
-    EvidenceRecord {
-        id: id.to_string(),
-        sequence,
-        timestamp_ms: 0,
-        evidence_kind: EvidenceKind::FileExcerpt,
-        title: format!("read {path}"),
-        summary: summary.to_string(),
-        detail: None,
-        source: EvidenceSource::File {
-            path: path.to_string(),
-            start_line: Some(1),
-            end_line: Some(3),
-        },
-        tags: vec![path.to_string()],
     }
 }
 
@@ -342,7 +310,6 @@ fn anthropic_logical_units_preserve_one_unit_per_prompt_segment() {
         ],
         protected_start_index: 2,
         tools: &[],
-        evidence: &[],
     })
     .expect("anthropic request builds");
 
@@ -371,7 +338,6 @@ fn deepseek_completions_preserves_skill_material_across_developer_messages() {
         history: &history,
         protected_start_index: 0,
         tools: &[],
-        evidence: &[],
     })
     .expect("deepseek chat request builds");
     let contains = |needle: &str| {
@@ -405,7 +371,6 @@ fn orphan_tool_outputs_fail_fast_when_building_chat_request() {
         history: &history,
         protected_start_index: 2,
         tools: &[],
-        evidence: &[],
     })
     .expect_err("orphan tool output must fail");
     assert!(error.to_string().contains("orphan tool output"));
@@ -426,7 +391,6 @@ fn truncates_oldest_history_but_keeps_protected_items() {
         history: &history,
         protected_start_index: 2,
         tools: &[],
-        evidence: &[],
     })
     .expect("request builds");
 
@@ -462,7 +426,6 @@ fn effective_input_limit_counts_tool_schema_tokens() {
         history: &history,
         protected_start_index: 0,
         tools: &tools,
-        evidence: &[],
     })
     .expect("effective-input-limited request with tools builds");
 
@@ -472,79 +435,6 @@ fn effective_input_limit_counts_tool_schema_tokens() {
         2_000
     );
     assert!(capped.budget.estimated_request_tokens <= 2_000);
-}
-
-#[test]
-fn evidence_is_dropped_when_current_turn_leaves_no_context_room() {
-    let model = metadata(1024);
-    let input_budget = model
-        .context_window_tokens()
-        .saturating_sub(model.output_reserve_tokens())
-        .saturating_sub(SAFETY_OVERHEAD_TOKENS)
-        .max(1);
-    let exact_fit = (0..10_000)
-        .map(|len| "x".repeat(len))
-        .find(|text| estimate_history_item_tokens(&HistoryItem::user(text.clone())) == input_budget)
-        .expect("should find exact fit for input budget");
-    let history = vec![HistoryItem::user(exact_fit)];
-    let evidence = vec![evidence(
-        "ev-1",
-        "src/evidence.rs defines compact evidence records",
-        "src/evidence.rs",
-        1,
-    )];
-
-    let result = build_test_request(TestRequestBuilderInput {
-        model_id: "gpt-test",
-        model,
-        prelude: &[],
-        history: &history,
-        protected_start_index: 0,
-        tools: &[],
-        evidence: &evidence,
-    })
-    .expect("request builds");
-
-    assert!(result.selected_evidence_ids.is_empty());
-    assert_eq!(result.budget.dropped_evidence_items, 1);
-}
-
-#[test]
-fn oversized_optional_evidence_is_dropped_instead_of_failing_protected_context() {
-    let model = metadata(1024);
-    let input_budget = model
-        .context_window_tokens()
-        .saturating_sub(model.output_reserve_tokens())
-        .saturating_sub(SAFETY_OVERHEAD_TOKENS)
-        .max(1);
-    let near_fit = (0..10_000)
-        .map(|len| "x".repeat(len))
-        .find(|text| {
-            estimate_history_item_tokens(&HistoryItem::user(text.clone()))
-                == input_budget.saturating_sub(1)
-        })
-        .expect("should find near fit for input budget");
-    let history = vec![HistoryItem::user(near_fit)];
-    let evidence = vec![evidence(
-        "ev-1",
-        "x ".repeat(200).as_str(),
-        "src/evidence.rs",
-        1,
-    )];
-
-    let result = build_test_request(TestRequestBuilderInput {
-        model_id: "gpt-test",
-        model,
-        prelude: &[],
-        history: &history,
-        protected_start_index: 0,
-        tools: &[],
-        evidence: &evidence,
-    })
-    .expect("optional evidence should be dropped instead of failing protected context");
-
-    assert!(result.selected_evidence_ids.is_empty());
-    assert_eq!(result.budget.dropped_evidence_items, 1);
 }
 
 #[test]
@@ -562,7 +452,6 @@ fn returns_error_when_protected_current_turn_exceeds_input_budget() {
         history: &history,
         protected_start_index: 2,
         tools: &[],
-        evidence: &[],
     })
     .expect_err("protected current turn should fail fast");
 
@@ -582,7 +471,6 @@ fn returns_error_when_protected_current_turn_exceeds_effective_input_limit() {
         history: &history,
         protected_start_index: 0,
         tools: &[],
-        evidence: &[],
     })
     .expect_err("effective-input-limited protected current turn should fail fast");
 
@@ -603,7 +491,6 @@ fn rejects_zero_effective_input_limit_metadata() {
         history: &[HistoryItem::user("current")],
         protected_start_index: 0,
         tools: &[],
-        evidence: &[],
     })
     .expect_err("zero effective input limit should fail fast");
 
@@ -684,7 +571,6 @@ fn planner_is_pure_deterministic_and_preserves_protected_tool_groups() {
         prelude: &[PromptMessage::system("system")],
         snapshot: &snapshot,
         tools: &[],
-        frozen_evidence: None,
         protected_context_policy: ProtectedContextPolicy::from_configured_reserve(None, 0),
     };
 
@@ -694,7 +580,6 @@ fn planner_is_pure_deterministic_and_preserves_protected_tool_groups() {
     assert_eq!(snapshot, before);
     assert_eq!(first.prompt_plan.segments, second.prompt_plan.segments);
     assert_eq!(first.budget, second.budget);
-    assert_eq!(first.selected_evidence_ids, second.selected_evidence_ids);
     assert_eq!(
         first.prompt_plan.stable_prefix_hash(),
         second.prompt_plan.stable_prefix_hash()
@@ -921,7 +806,6 @@ mod integration_tests {
             history: &current_history,
             protected_start_index: 0,
             tools: &[],
-            evidence: &snapshot.evidence,
         })
         .expect("request builds independently of restored projection");
         let rendered = result

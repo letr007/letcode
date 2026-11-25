@@ -7,7 +7,6 @@ use crate::agent::{
     TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
 use crate::context_tree::{ContextBlockRef, ContextNodeStatus, ContextSourceRef};
-use crate::evidence::{EvidenceKind, EvidenceSource};
 use crate::model_runtime::OpaqueReplayState;
 use crate::request_builder::{HistoryToolCall, ModelReasoningEffort};
 use crate::tool::ToolResult;
@@ -165,6 +164,8 @@ pub enum TranscriptEvent {
         agent_name: String,
         status: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_result: Option<crate::subagent::StructuredSubagentResult>,
     },
     HistorianExchange(HistorianExchangeEvent),
     ModelChanged {
@@ -316,17 +317,10 @@ pub enum TranscriptEvent {
         estimated_unaddressable_protected_tokens: u64,
         estimated_retained_history_tokens: u64,
         estimated_tools_tokens: u64,
-        estimated_evidence_tokens: u64,
         estimated_required_fallback_tokens: u64,
         original_history_items: usize,
         retained_history_items: usize,
         dropped_history_items: usize,
-        selected_evidence_items: usize,
-        dropped_evidence_items: usize,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        selected_evidence_ids: Vec<String>,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        evidence_fingerprint: String,
         truncated: bool,
         prompt_segment_count: usize,
         prompt_contributor_count: usize,
@@ -471,17 +465,6 @@ pub enum TranscriptEvent {
     TurnInterrupted {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<u64>,
-    },
-    Evidence {
-        id: String,
-        evidence_kind: EvidenceKind,
-        title: String,
-        summary: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-        source: EvidenceSource,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tags: Vec<String>,
     },
     ContextExperimentReturned {
         branch_id: String,

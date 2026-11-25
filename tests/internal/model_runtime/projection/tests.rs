@@ -118,8 +118,6 @@ fn history_replay_preserves_native_state_and_converts_foreign_messages() {
             selected_frames: &frames,
             segment_order_offset: 0,
             protected_suffix_len: 1,
-            evidence_message: None,
-            selected_evidence_ids: &[],
         });
         for target in ["responses", "anthropic", "completions"] {
             let route = replay_test_route(target);
@@ -207,7 +205,6 @@ fn disabled_parallel_tool_calls_stay_off_the_wire() {
                 model: model.clone(),
                 prelude: &[],
                 history: &history,
-                evidence: &[],
                 tools: &[],
                 protected_start_index: 0,
             })
@@ -290,7 +287,6 @@ tool_result_images = {tool_result_images}
                     model: model.clone(),
                     prelude: &[],
                     history: &history,
-                    evidence: &[],
                     tools: &[],
                     protected_start_index: 0,
                 })
@@ -343,7 +339,6 @@ tool_result_images = {tool_result_images}
                         model: model.clone(),
                         prelude: &[],
                         history: &missing,
-                        evidence: &[],
                         tools: &[],
                         protected_start_index: 0,
                     })
@@ -404,8 +399,6 @@ fn projection_preserves_replay_tools_images_and_cache_boundary() {
         selected_frames: &frames,
         segment_order_offset: 0,
         protected_suffix_len: 1,
-        evidence_message: None,
-        selected_evidence_ids: &[],
     });
     let metadata = ModelRequestMetadata {
         supports_tools: true,
@@ -479,8 +472,6 @@ fn skill_only_user_content_projects_to_a_text_marker() {
             selected_frames: &frames,
             segment_order_offset: 0,
             protected_suffix_len: 1,
-            evidence_message: None,
-            selected_evidence_ids: &[],
         });
         model_request_from_prompt_plan(
             &replay_test_route("anthropic"),

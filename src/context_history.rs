@@ -327,7 +327,7 @@ impl HistoryArchive {
             })
             .map(|f| {
                 format!(
-                    "[evidence:fact:{}] {}{}",
+                    "[fact:{}] {}{}",
                     f.id,
                     f.text,
                     if f.supersedes.is_empty() {
@@ -363,6 +363,26 @@ impl HistoryArchive {
             .flat_map(|p| p.facts.iter())
             .filter(|f| !removed.contains(&f.id) && !self.withdrawn_fact_ids.contains(&f.id))
             .map(|f| f.id.clone())
+            .collect()
+    }
+
+    /// Published facts newest first, skipping superseded and withdrawn ones.
+    pub fn facts_recent_first(&self) -> Vec<&HistoryFact> {
+        let removed: BTreeSet<_> = self
+            .publications
+            .values()
+            .flat_map(|p| {
+                p.withdrawn_fact_ids
+                    .iter()
+                    .chain(p.facts.iter().flat_map(|f| f.supersedes.iter()))
+            })
+            .collect();
+        self.publication_order
+            .iter()
+            .rev()
+            .filter_map(|id| self.publications.get(id))
+            .flat_map(|p| p.facts.iter().rev())
+            .filter(|f| !removed.contains(&f.id) && !self.withdrawn_fact_ids.contains(&f.id))
             .collect()
     }
 
@@ -535,51 +555,24 @@ pub fn source_entries(
             });
         }
     }
-    let evidence = crate::evidence::restore_evidence_records(records)?;
-    let active_facts: BTreeSet<_> = evidence
-        .iter()
-        .filter(|e| e.tags.iter().any(|t| t == "historian_fact"))
-        .map(|e| e.id.as_str())
-        .collect();
+    let archive = HistoryArchive::from_records(records)?;
+    let effective_facts: BTreeSet<_> = archive.effective_fact_ids(&[]).into_iter().collect();
     for record in records {
         if let crate::transcript::TranscriptEvent::HistoryPublished(p) = &record.event {
             for f in &p.facts {
-                let fact_id = format!("fact:{}", f.id);
                 entries.push(HistorySearchEntry {
-                    id: format!("evidence:{fact_id}"),
+                    id: format!("fact:{}", f.id),
                     kind: "fact",
                     source_ids: f.source_ids.clone(),
                     text: format!(
                         "{:?}\n{}\nEffective in this view: {}",
                         f.category,
                         f.text,
-                        active_facts.contains(fact_id.as_str())
+                        effective_facts.contains(&f.id)
                     ),
                 });
             }
         }
-    }
-    for e in evidence {
-        if e.tags.iter().any(|t| t == "historian_fact") {
-            continue;
-        }
-        let source_ids = match e.source {
-            crate::evidence::EvidenceSource::Transcript { sequence } => {
-                vec![format!("raw:{sequence}")]
-            }
-            _ => vec![],
-        };
-        entries.push(HistorySearchEntry {
-            id: format!("evidence:{}", e.id),
-            kind: "evidence",
-            text: format!(
-                "{}\n{}\n{}",
-                e.title,
-                e.summary,
-                e.detail.unwrap_or_default()
-            ),
-            source_ids,
-        });
     }
     Ok(entries)
 }

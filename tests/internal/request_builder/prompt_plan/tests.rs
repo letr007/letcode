@@ -26,8 +26,6 @@ fn prompt_plan_marks_stable_prefix_boundary() {
         ]),
         segment_order_offset: 0,
         protected_suffix_len: 1,
-        evidence_message: Some("Relevant evidence:\n- [ev-1] file_excerpt src/main.rs — summary"),
-        selected_evidence_ids: &["ev-1".to_string()],
     });
 
     assert_eq!(plan.stable_prefix_end, Some(1));
@@ -95,8 +93,6 @@ fn prompt_composition_groups_request_material_by_context_category() {
         ]),
         segment_order_offset: 0,
         protected_suffix_len: 0,
-        evidence_message: None,
-        selected_evidence_ids: &[],
     });
 
     let composition = plan.composition(321);
@@ -163,8 +159,6 @@ fn build_cache_test_plan(
         selected_frames: &history_items_to_frames(history),
         segment_order_offset: 0,
         protected_suffix_len,
-        evidence_message: None,
-        selected_evidence_ids: &[],
     })
 }
 

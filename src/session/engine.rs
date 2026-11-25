@@ -2146,7 +2146,7 @@ async fn run_engine_loop(
                                         &session_id,
                                         &snapshot.snapshot.active_protocol_frames(),
                                     ),
-                                    records, evidence_count: snapshot.snapshot.evidence.len(), model_id: Some(agent.route_display_name()), token_usage: None,
+                                    records, model_id: Some(agent.route_display_name()), token_usage: None,
                                     runtime_context,
                                     expert_models: config.expert_default_routes.iter().map(|(name, route)| (name.clone(), route.display_name())).collect(),
                                 })
@@ -2212,8 +2212,6 @@ async fn run_engine_loop(
                             &prepared_install.session().snapshot.snapshot.active_protocol_frames(),
                         );
                         let resumed_event_records = prepared_install.session().snapshot.records.clone();
-                        let resumed_event_evidence_count =
-                            prepared_install.session().snapshot.snapshot.evidence.len();
                         let fast_mode_auto_disabled = prepared_install.fast_mode_auto_disabled();
                         let resumed_permission_mode = prepared_install
                             .session()
@@ -2293,7 +2291,6 @@ async fn run_engine_loop(
                             branch_id: resumed_event_branch_id,
                             messages: resumed_event_messages,
                             records: resumed_event_records,
-                            evidence_count: resumed_event_evidence_count,
                             model_id: Some(agent.route_display_name()),
                             token_usage: Some(token_usage),
                             runtime_context,

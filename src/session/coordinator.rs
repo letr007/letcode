@@ -694,7 +694,6 @@ impl SessionCoordinator {
                     branch_id: snapshot.branch_id,
                     messages: restored_messages_from_protocol_frames(&protocol_frames),
                     records: snapshot.records,
-                    evidence_count: 0,
                     model_id: Some(agent.route_display_name()),
                     token_usage: None,
                     runtime_context,

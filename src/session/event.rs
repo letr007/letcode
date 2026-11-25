@@ -66,7 +66,6 @@ pub enum SessionEvent {
         session_id: String,
         branch_id: String,
         messages: Vec<ConversationMessage>,
-        evidence_count: usize,
         model_id: Option<String>,
         token_usage: Option<TokenUsageEvent>,
         runtime_context: RuntimeActiveContext,

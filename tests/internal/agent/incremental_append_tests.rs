@@ -1,21 +1,7 @@
 use super::*;
 
-fn evidence(id: &str) -> EvidenceRecord {
-    EvidenceRecord {
-        id: id.into(),
-        sequence: 1,
-        timestamp_ms: 0,
-        evidence_kind: crate::evidence::EvidenceKind::Decision,
-        title: "decision".into(),
-        summary: "preserve evidence".into(),
-        detail: Some("metadata".into()),
-        source: EvidenceSource::Transcript { sequence: 1 },
-        tags: vec!["phase1".into()],
-    }
-}
-
 #[test]
-fn incremental_agent_append_matches_cold_rebuild_with_metadata_and_evidence() {
+fn incremental_agent_append_matches_cold_rebuild_with_metadata() {
     let base = vec![
         HistoryItem::user("older request"),
         HistoryItem::assistant("older answer"),
@@ -67,18 +53,12 @@ fn incremental_agent_append_matches_cold_rebuild_with_metadata_and_evidence() {
             .append_history_item(item.clone())
             .expect("incremental append should succeed");
     }
-    incremental
-        .add_evidence(evidence("ev-1"))
-        .expect("evidence append should succeed");
-
     let mut cold = Agent::new("m1", 4, 4);
     cold.runtime_snapshot.context_scope_revision = 7;
     cold.runtime_snapshot.current_segment_id = Some(11);
     cold.runtime_snapshot.current_turn_id = Some(3);
     cold.turn.current_turn_start_index = Some(base.len());
     cold.set_history_for_test(full_history);
-    cold.add_evidence(evidence("ev-1"))
-        .expect("cold evidence append should succeed");
 
     assert_eq!(incremental.runtime_snapshot, cold.runtime_snapshot);
     assert_eq!(
@@ -93,5 +73,4 @@ fn incremental_agent_append_matches_cold_rebuild_with_metadata_and_evidence() {
             .turn_protected_frame_ids,
         cold.runtime_snapshot.compaction.turn_protected_frame_ids
     );
-    assert_eq!(incremental.evidence(), cold.evidence());
 }

@@ -23,9 +23,9 @@ impl ToolHandler for HistoryTool {
     }
     fn description(&self) -> &'static str {
         if self.expand {
-            "Read an archived history compartment's original messages, or a recorded evidence excerpt, by ID. Read-only: does not restore runtime state or execute historical tools. Results are character-paginated; evidence excerpts are not guaranteed complete original output."
+            "Read an archived history compartment's original messages, or a recorded project fact, by ID. Read-only: does not restore runtime state or execute historical tools. Results are character-paginated; source excerpts are not guaranteed to reproduce full original output."
         } else {
-            "Search the current session branch's raw conversation, archived compartments and evidence by text. Returns source IDs and bounded previews; use context__expand for details. Other sessions require an explicit session_id and retain their historical provenance."
+            "Search the current session branch's raw conversation, archived compartments and project facts by text. Returns source IDs and bounded previews; use context__expand for details. Other sessions require an explicit session_id and retain their historical provenance."
         }
     }
     fn parameters(&self) -> Value {

@@ -683,6 +683,7 @@ fn restored_subagent_results_close_background_cards() {
                 agent_name: "explorer".into(),
                 status: "completed".into(),
                 summary: "restore finished".into(),
+                structured_result: None,
             },
         ),
     ]);

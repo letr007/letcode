@@ -28,10 +28,7 @@ use crate::runtime_context::{PromptContributorKind, RuntimeSnapshot};
 #[cfg(test)]
 use crate::user_content::{UserImageAttachment, UserMessageContent};
 #[cfg(test)]
-use crate::{
-    evidence::EvidenceRecord, protocol_frames::history_items_to_frames,
-    runtime_context::RuntimeFrameIdSeed,
-};
+use crate::{protocol_frames::history_items_to_frames, runtime_context::RuntimeFrameIdSeed};
 use serde_json::Value;
 
 #[cfg(test)]
@@ -305,13 +302,6 @@ impl ProtectedContextPolicy {
     }
 }
 
-/// Provider-visible evidence rendering fixed for one logical turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FrozenEvidence {
-    pub message: Option<String>,
-    pub selected_ids: Vec<String>,
-}
-
 /// Test-only fixture input that is converted to a runtime snapshot.
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -322,15 +312,12 @@ pub(crate) struct TestRequestBuilderInput<'a> {
     pub history: &'a [HistoryItem],
     pub protected_start_index: usize,
     pub tools: &'a [ToolSpec],
-    pub evidence: &'a [EvidenceRecord],
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedPromptRequestInput {
     pub prompt_plan: PromptPlan,
     pub budget: BudgetReport,
-    pub selected_evidence_ids: Vec<String>,
-    pub selected_evidence_message: Option<String>,
 }
 
 /// Fixed reserve for the response budget when admitting a request.
@@ -358,13 +345,10 @@ pub struct BudgetReport {
     pub estimated_unaddressable_protected_tokens: u64,
     pub estimated_retained_history_tokens: u64,
     pub estimated_tools_tokens: u64,
-    pub estimated_evidence_tokens: u64,
     pub estimated_required_fallback_tokens: u64,
     pub original_history_items: usize,
     pub retained_history_items: usize,
     pub dropped_history_items: usize,
-    pub selected_evidence_items: usize,
-    pub dropped_evidence_items: usize,
     pub truncated: bool,
     pub plan_total_prompt_tokens: u64,
     pub plan_stable_prompt_tokens: u64,
@@ -402,9 +386,6 @@ pub struct BuildResult {
     pub budget: BudgetReport,
     #[allow(dead_code)]
     pub prompt_plan: PromptPlan,
-    #[allow(dead_code)]
-    pub selected_evidence_ids: Vec<String>,
-    pub selected_evidence_message: Option<String>,
 }
 
 /// Process-local, complete logical units used only to compare adjacent final
@@ -440,7 +421,6 @@ pub(crate) enum LogicalRequestUnitCategory {
     Assistant,
     ToolCall,
     ToolOutput,
-    Evidence,
     Composite,
 }
 
@@ -470,7 +450,6 @@ impl LogicalRequestUnitCategory {
             Self::Assistant => "assistant",
             Self::ToolCall => "tool_call",
             Self::ToolOutput => "tool_output",
-            Self::Evidence => "evidence",
             Self::Composite => "composite",
         }
     }
@@ -594,7 +573,6 @@ fn prompt_segment_category(segment: &prompt_plan::PromptSegment) -> LogicalReque
         PromptContributorKind::RuntimeContext
         | PromptContributorKind::ContextMaterial
         | PromptContributorKind::ContextIndex => LogicalRequestUnitCategory::RuntimeContext,
-        PromptContributorKind::Evidence => LogicalRequestUnitCategory::Evidence,
         PromptContributorKind::TranscriptFrame
         | PromptContributorKind::CurrentTurn
         | PromptContributorKind::Other => match &segment.content {
@@ -646,28 +624,11 @@ fn effective_input_budget_tokens_for_tool_tokens(
 
 #[cfg(test)]
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
-    build_request_with_policy(input, None, None)
+    build_request_with_policy(input, None)
 }
 
 pub(crate) fn build_request_with_policy(
     input: RequestBuilderInput<'_>,
-    frozen_evidence: Option<&FrozenEvidence>,
-    policy: Option<ProtectedContextPolicy>,
-) -> Result<BuildResult> {
-    build_request_with_frozen_and_policy(input, frozen_evidence, policy)
-}
-
-#[cfg(test)]
-pub(crate) fn build_request_with_frozen(
-    input: RequestBuilderInput<'_>,
-    frozen_evidence: Option<&FrozenEvidence>,
-) -> Result<BuildResult> {
-    build_request_with_frozen_and_policy(input, frozen_evidence, None)
-}
-
-fn build_request_with_frozen_and_policy(
-    input: RequestBuilderInput<'_>,
-    frozen_evidence: Option<&FrozenEvidence>,
     policy: Option<ProtectedContextPolicy>,
 ) -> Result<BuildResult> {
     let protected_context_policy = policy.unwrap_or_else(|| {
@@ -682,21 +643,16 @@ fn build_request_with_frozen_and_policy(
         prelude: input.prelude,
         snapshot: input.snapshot,
         tools: input.tools,
-        frozen_evidence,
         protected_context_policy,
     };
     let PlannedPrompt {
         prompt_plan,
         budget,
-        selected_evidence_ids,
-        selected_evidence_message,
     } = PromptPlanner::plan(planner_input)?;
     let prompt_plan = prompt_plan::canonicalize_prompt_plan(prompt_plan);
     build_request_from_selected_prompt(SelectedPromptRequestInput {
         prompt_plan,
         budget,
-        selected_evidence_ids,
-        selected_evidence_message,
     })
 }
 
@@ -708,7 +664,6 @@ pub(crate) fn build_test_request(input: TestRequestBuilderInput<'_>) -> Result<B
     let protected_start_index = input.protected_start_index;
 
     let mut snapshot = RuntimeSnapshot::new("test-request-builder");
-    snapshot.set_evidence(input.evidence.to_vec());
     for (ordinal, frame) in frames.iter().enumerate() {
         let stable_key = frame.stable_prompt_key();
         let runtime_frame = RuntimeFrame::new(
@@ -778,8 +733,6 @@ pub(crate) fn build_request_from_selected_prompt(
     Ok(BuildResult {
         budget: input.budget,
         prompt_plan: input.prompt_plan,
-        selected_evidence_ids: input.selected_evidence_ids,
-        selected_evidence_message: input.selected_evidence_message,
     })
 }
 
@@ -802,25 +755,16 @@ fn ensure_protected_context_within_budget(
     input_budget: u64,
     prelude_tokens: u64,
     protected_tokens: u64,
-    evidence_tokens: u64,
 ) -> Result<()> {
     history_budget::ensure_protected_context_within_budget(
         input_budget,
         prelude_tokens,
         protected_tokens,
-        evidence_tokens,
     )
 }
 
 fn validate_model_metadata(model: ModelRequestMetadata) -> Result<()> {
     history_budget::validate_model_metadata(model)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EvidenceBudgetReport {
-    estimated_evidence_tokens: u64,
-    selected_evidence_items: usize,
-    dropped_evidence_items: usize,
 }
 
 fn retain_history(
@@ -830,7 +774,6 @@ fn retain_history(
     protected_tokens: u64,
     model: ModelRequestMetadata,
     tools: &[ToolSpec],
-    evidence_budget: EvidenceBudgetReport,
     required_fallback_tokens: u64,
 ) -> (Vec<ProtocolFrame>, BudgetReport) {
     history_budget::retain_history(
@@ -840,17 +783,12 @@ fn retain_history(
         protected_tokens,
         model,
         tools,
-        evidence_budget,
         required_fallback_tokens,
     )
 }
 
-fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> String {
-    history_budget::current_user_query(history, protected_start_index)
-}
-
-pub(crate) fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
-    history_budget::evidence_budget_tokens(context_window_tokens)
+pub(crate) fn fact_budget_tokens(context_window_tokens: u64) -> u64 {
+    history_budget::fact_budget_tokens(context_window_tokens)
 }
 
 /// Small local SHA-256 implementation to keep fingerprinting dependency-free.

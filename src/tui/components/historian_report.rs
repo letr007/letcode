@@ -192,12 +192,7 @@ pub(crate) fn render_report(
                 }
             }
             if options.sources {
-                text(
-                    &mut doc,
-                    &format!("evidence:fact:{}", fact.id),
-                    muted,
-                    width,
-                );
+                text(&mut doc, &format!("fact:{}", fact.id), muted, width);
                 text(&mut doc, &fact.source_ids.join(", "), muted, width);
             }
             gap(&mut doc);

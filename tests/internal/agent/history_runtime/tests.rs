@@ -177,7 +177,6 @@ max_output_tokens=4096
             assert!(!records.iter().any(|r|matches!(r.event,TranscriptEvent::ContextCompaction(_))));
             let restored=crate::transcript::restore_session_history(&records).unwrap();
             assert!(restored.iter().any(|item|matches!(item,HistoryItem::UserMessage {content} if content.text.contains("New work"))));
-            assert!(!crate::evidence::restore_evidence_records(&records).unwrap().iter().any(|e| e.tags.iter().any(|t|t=="historian")), "internal work reports must not become project facts");
             agent.history_budget_limit=Some(128);
             let small=pending_application(&agent,true).unwrap().unwrap();
             assert!(small.publication_ids.is_empty() && small.baseline.is_empty());

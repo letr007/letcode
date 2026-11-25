@@ -17,7 +17,7 @@ Tools 模块将模型工具调用分发到本地处理器、子代理任务池�
 
 `explorer` 只读探索代码，`fixer` 实现和修复代码。`oracle` 分析根因与风险，`designer` 整理设计与接口，`librarian` 检索资料。`general` 处理限定范围的通用任务，可读取和修改文件。
 
-`reviewer` 和 `historian` 是内部专家，不提供委派工具。任务控制工具只管理已有任务。`context__search` 与 `context__expand` 检索历史记录和证据，不恢复旧运行时状态。
+`reviewer` 和 `historian` 是内部专家，不提供委派工具。任务控制工具只管理已有任务。`context__search` 与 `context__expand` 检索历史记录与事实记录，不恢复旧运行时状态。
 
 `peer__discover` 列出配置目录中登记的其他本机主会话，`peer__send` 通过单次短连接发送文本。两个工具只注册在主会话，子代理不继承。
 

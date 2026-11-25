@@ -1669,8 +1669,7 @@ where
             .budget
             .input_budget_tokens
             .saturating_sub(prepared.build.budget.estimated_prelude_tokens)
-            .saturating_sub(prepared.build.budget.estimated_protected_tokens)
-            .saturating_sub(prepared.build.budget.estimated_evidence_tokens),
+            .saturating_sub(prepared.build.budget.estimated_protected_tokens),
     );
     if agent.runtime_snapshot_provider.is_some() && prepared.build.budget.truncated {
         return compact_for_request_pressure(
@@ -1805,7 +1804,6 @@ fn build_oneshot_request(
             snapshot: &snapshot,
             tools: &[],
         },
-        None,
         Some(ProtectedContextPolicy { reserve_tokens: 0 }),
     )
 }

@@ -280,6 +280,7 @@ struct Repl {
     child: Child,
     stdin: ChildStdin,
     stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
     out_task: JoinHandle<Vec<u8>>,
     err_task: JoinHandle<Vec<u8>>,
 }
@@ -290,14 +291,13 @@ impl Repl {
         let stdin = child.stdin.take().unwrap();
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let out_task = tokio::spawn(capture_output(child.stdout.take().unwrap(), stdout.clone()));
-        let err_task = tokio::spawn(capture_output(
-            child.stderr.take().unwrap(),
-            Arc::new(Mutex::new(Vec::new())),
-        ));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let err_task = tokio::spawn(capture_output(child.stderr.take().unwrap(), stderr.clone()));
         Self {
             child,
             stdin,
             stdout,
+            stderr,
             out_task,
             err_task,
         }
@@ -315,8 +315,9 @@ impl Repl {
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "missing {text:?} in CLI stdout: {}",
-                String::from_utf8_lossy(&self.stdout.lock().unwrap())
+                "missing {text:?} in CLI stdout: {} stderr: {}",
+                String::from_utf8_lossy(&self.stdout.lock().unwrap()),
+                String::from_utf8_lossy(&self.stderr.lock().unwrap())
             )
         });
     }

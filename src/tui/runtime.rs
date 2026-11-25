@@ -1252,7 +1252,6 @@ impl TuiRuntime {
                 branch_id,
                 messages,
                 records,
-                evidence_count: _,
                 model_id,
                 token_usage,
                 runtime_context,

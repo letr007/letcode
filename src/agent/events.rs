@@ -3,7 +3,6 @@ use serde_json::Value;
 
 use super::{AdjacentRequestObservation, AutoContinueState, TodoItem};
 use crate::config::ApiProtocol;
-use crate::evidence::EvidenceRecord;
 use crate::request_builder::HistoryToolCall;
 use crate::tool::{ToolOutputStream, ToolResult};
 
@@ -231,7 +230,7 @@ pub struct CacheUsageReport {
 pub type PromptCompositionEntry = crate::request_builder::prompt_plan::PromptCompositionEntry;
 
 /// Safe, scalar-only provenance for one attempt of a logical model request.
-/// Prompt, tool, evidence, and provider payloads deliberately do not cross this boundary.
+/// Prompt, tool, and provider payloads deliberately do not cross this boundary.
 #[derive(Debug, Clone)]
 pub struct LlmRequestTelemetry {
     pub logical_request_id: String,
@@ -251,15 +250,10 @@ pub struct LlmRequestTelemetry {
     pub estimated_unaddressable_protected_tokens: u64,
     pub estimated_retained_history_tokens: u64,
     pub estimated_tools_tokens: u64,
-    pub estimated_evidence_tokens: u64,
     pub estimated_required_fallback_tokens: u64,
     pub original_history_items: usize,
     pub retained_history_items: usize,
     pub dropped_history_items: usize,
-    pub selected_evidence_items: usize,
-    pub dropped_evidence_items: usize,
-    pub selected_evidence_ids: Vec<String>,
-    pub evidence_fingerprint: String,
     pub truncated: bool,
     pub prompt_segment_count: usize,
     pub prompt_contributor_count: usize,
@@ -329,15 +323,10 @@ impl LlmRequestTelemetry {
                 .estimated_unaddressable_protected_tokens,
             estimated_retained_history_tokens: budget.estimated_retained_history_tokens,
             estimated_tools_tokens: budget.estimated_tools_tokens,
-            estimated_evidence_tokens: budget.estimated_evidence_tokens,
             estimated_required_fallback_tokens: budget.estimated_required_fallback_tokens,
             original_history_items: budget.original_history_items,
             retained_history_items: budget.retained_history_items,
             dropped_history_items: budget.dropped_history_items,
-            selected_evidence_items: budget.selected_evidence_items,
-            dropped_evidence_items: budget.dropped_evidence_items,
-            selected_evidence_ids: build.selected_evidence_ids.clone(),
-            evidence_fingerprint: evidence_fingerprint(build.selected_evidence_message.as_deref()),
             truncated: budget.truncated,
             prompt_segment_count: build.prompt_plan.segments.len(),
             prompt_contributor_count: build.prompt_plan.contributors.len(),
@@ -404,18 +393,6 @@ impl LlmRequestTelemetry {
         telemetry.error_class = Some(error_class);
         telemetry
     }
-}
-
-fn evidence_fingerprint(message: Option<&str>) -> String {
-    let mut bytes = b"frozen-evidence-v1\0".to_vec();
-    match message {
-        Some(message) => {
-            bytes.extend_from_slice(b"some\0");
-            bytes.extend_from_slice(message.as_bytes());
-        }
-        None => bytes.extend_from_slice(b"none"),
-    }
-    format!("fte-v1-{}", crate::request_builder::sha256_hex(&bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,7 +571,6 @@ pub enum AgentEvent {
         blocking: bool,
     },
     TurnFinalized(TurnFinalizedEvent),
-    EvidenceRecorded(EvidenceRecord),
 }
 
 fn is_zero(value: &usize) -> bool {

@@ -3524,7 +3524,6 @@ fn session_resumed_event_replaces_timeline_not_appends() {
                 content: "old prompt".into(),
             },
         }],
-        evidence_count: 2,
         model_id: None,
         token_usage: None,
         runtime_context: event_context("session-1", 1),
@@ -3574,7 +3573,6 @@ fn session_resume_projection_failure_clears_pending_and_reports_error() {
                 content: "old prompt".into(),
             },
         }],
-        evidence_count: 0,
         model_id: None,
         token_usage: None,
         runtime_context: event_context("session-1", 1),
@@ -3620,7 +3618,6 @@ fn session_resumed_event_restores_recorded_model() {
                 label: None,
             },
         }],
-        evidence_count: 0,
         model_id: Some("gpt-5.5-mini".into()),
         token_usage: Some(TokenUsageEvent::new(12_345, 64_000)),
         runtime_context: event_context("session-1", 1),
@@ -3676,7 +3673,6 @@ fn session_resume_expert_snapshot_clears_previous_session_route() {
         branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
         messages: Vec::new(),
         records: Vec::new(),
-        evidence_count: 0,
         model_id: Some("p/main".into()),
         token_usage: None,
         runtime_context: event_context("session-1", 1),
@@ -3773,7 +3769,6 @@ fn invalid_lifecycle_timeline_does_not_clear_parent_permission() {
                 content: "malformed lifecycle timeline".into(),
             },
         }],
-        evidence_count: 0,
         model_id: None,
         token_usage: None,
         runtime_context: event_context("new-session", 1),
@@ -4171,7 +4166,6 @@ fn resumed_session_restores_latest_todo_state_from_records() {
         branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
         messages: Vec::new(),
         records,
-        evidence_count: 0,
         model_id: None,
         token_usage: None,
         runtime_context: event_context("s", 2),
@@ -4218,7 +4212,6 @@ fn empty_todo_snapshot_clears_restored_todo_state() {
         branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
         messages: Vec::new(),
         records,
-        evidence_count: 0,
         model_id: None,
         token_usage: None,
         runtime_context: event_context("s", 2),
@@ -8781,7 +8774,7 @@ mod integration_tests {
 
         let mut agent = test_agent();
         agent
-            .restore_session_history(vec![HistoryItem::user("stale dangling")], Vec::new(), 0)
+            .restore_session_history(vec![HistoryItem::user("stale dangling")], 0)
             .expect("seed stale history");
 
         rehydrate_agent_from_transcript(&mut agent, &transcript).expect("rehydrate agent");
@@ -8797,18 +8790,14 @@ mod integration_tests {
     fn resumed_session_usage_uses_target_agent_and_drops_response_accounting() {
         let mut old_agent = test_agent();
         old_agent
-            .restore_session_history(
-                vec![HistoryItem::user("old session ".repeat(2_000))],
-                Vec::new(),
-                99,
-            )
+            .restore_session_history(vec![HistoryItem::user("old session ".repeat(2_000))], 99)
             .expect("restore old session");
         let old_usage = old_agent.session_token_usage().expect("old usage");
 
         let mut target_agent = test_agent();
         target_agent.set_model("target-model");
         target_agent
-            .restore_session_history(vec![HistoryItem::user("target session")], Vec::new(), 2)
+            .restore_session_history(vec![HistoryItem::user("target session")], 2)
             .expect("restore target session");
         let target_snapshot = target_agent.runtime_snapshot_for_test().clone();
         let prepared_usage =
@@ -8850,7 +8839,7 @@ mod integration_tests {
     fn failed_candidate_usage_preserves_agent() {
         let mut agent = test_agent();
         agent
-            .restore_session_history(vec![HistoryItem::user("old session")], Vec::new(), 7)
+            .restore_session_history(vec![HistoryItem::user("old session")], 7)
             .expect("restore old session");
         let model = agent.model().to_string();
         let history = agent.history_for_test().to_vec();

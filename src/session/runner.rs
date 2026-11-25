@@ -50,14 +50,12 @@ use formatting::{output_json, output_summary};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolBatchReconciliation {
-    active: bool,
     disposition: RuntimeContextDisposition,
 }
 
 impl Default for ToolBatchReconciliation {
     fn default() -> Self {
         Self {
-            active: false,
             disposition: RuntimeContextDisposition::Advance,
         }
     }
@@ -66,27 +64,10 @@ impl Default for ToolBatchReconciliation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolBatchReconciliationAction {
     None,
-    ProjectEvidence,
     FinishBatch(RuntimeContextDisposition),
 }
 
 impl ToolBatchReconciliation {
-    fn observe_event(&mut self, event: &AgentEvent) {
-        if matches!(
-            event,
-            AgentEvent::ToolCallPending { .. }
-                | AgentEvent::ToolCallStarted { .. }
-                | AgentEvent::ToolCallFinished { .. }
-                | AgentEvent::ToolCallCancelled { .. }
-        ) {
-            self.active = true;
-        }
-    }
-
-    fn should_project_evidence(&self) -> bool {
-        !self.active
-    }
-
     fn record_journal_effect(&mut self, effect: JournalEffect) {
         if effect.context_projection == ContextProjection::ReplaceScope {
             self.disposition = RuntimeContextDisposition::ReplaceScope;
@@ -104,17 +85,10 @@ impl ToolBatchReconciliation {
         event: &AgentEvent,
         journal_effect: JournalEffect,
     ) -> ToolBatchReconciliationAction {
-        let project_evidence =
-            matches!(event, AgentEvent::EvidenceRecorded(_)) && self.should_project_evidence();
-        if !matches!(event, AgentEvent::ToolCallBatchFinished) {
-            self.observe_event(event);
-        }
         self.record_journal_effect(journal_effect);
 
         if matches!(event, AgentEvent::ToolCallBatchFinished) {
             ToolBatchReconciliationAction::FinishBatch(self.finish())
-        } else if project_evidence {
-            ToolBatchReconciliationAction::ProjectEvidence
         } else {
             ToolBatchReconciliationAction::None
         }
@@ -948,18 +922,6 @@ where {
                                 AgentEvent::TurnStarted(event) => {
                                     let _ = event;
                                 }
-                                AgentEvent::EvidenceRecorded(_)
-                                    if reconciliation_action
-                                        == ToolBatchReconciliationAction::ProjectEvidence => {
-                                    emit_context_projection_updates(
-                                        &sender,
-                                        &transcript,
-                                        child_session_id.as_deref(),
-                                        agent_name.as_deref(),
-                                        parent_tool_call_id.as_deref(),
-                                    )?;
-                                }
-                                AgentEvent::EvidenceRecorded(_) => {}
                                 AgentEvent::ReasoningDelta { item_id, delta } => {
                                     send_scoped_event(
                                         &sender,

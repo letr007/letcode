@@ -1,7 +1,5 @@
 use super::*;
 use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
-#[cfg(test)]
-use crate::evidence::{EvidenceRecord, restore_evidence_records};
 use crate::request_builder::{HistoryItem, HistoryToolCall};
 #[cfg(test)]
 use anyhow::{Result, anyhow, ensure};
@@ -85,13 +83,6 @@ pub fn restore_latest_reasoning_effort(
     model_id: &str,
 ) -> Option<crate::request_builder::ModelReasoningEffort> {
     transcript_projection::restore_latest_reasoning_effort_projection(records, model_id)
-}
-
-#[cfg(test)]
-pub(crate) fn restore_session_evidence(
-    records: &[TranscriptRecord],
-) -> Result<Vec<EvidenceRecord>> {
-    restore_evidence_records(records)
 }
 
 pub fn restore_latest_todo_snapshot(records: &[TranscriptRecord]) -> Option<Vec<TodoItem>> {

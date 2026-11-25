@@ -157,7 +157,6 @@ pub(crate) struct PromptPlannerInput<'a> {
     pub prelude: &'a [PromptMessage],
     pub snapshot: &'a RuntimeSnapshot,
     pub tools: &'a [ToolSpec],
-    pub frozen_evidence: Option<&'a super::FrozenEvidence>,
     pub protected_context_policy: ProtectedContextPolicy,
 }
 
@@ -165,8 +164,6 @@ pub(crate) struct PromptPlannerInput<'a> {
 pub(crate) struct PlannedPrompt {
     pub prompt_plan: PromptPlan,
     pub budget: BudgetReport,
-    pub selected_evidence_ids: Vec<String>,
-    pub selected_evidence_message: Option<String>,
 }
 
 impl PromptPlanner {
@@ -193,87 +190,19 @@ impl PromptPlanner {
             )?;
 
         super::validate_model_metadata(input.model.clone())?;
-        let context_window = input.model.context_window_tokens();
-        let tools_tokens = if input.model.supports_tools {
-            super::estimate_tools_tokens(input.tools)
-        } else {
-            0
-        };
-        let input_budget =
-            super::effective_input_budget_tokens_for_tool_tokens(input.model.clone(), tools_tokens);
         let protected_start = effective_protected_start_index.min(effective_history.len());
         let protected_tokens =
             super::estimate_history_tokens(&effective_history[protected_start..]);
-        let prelude_tokens = super::estimate_prelude_tokens(&effective_prelude);
-        let evidence_budget = super::evidence_budget_tokens(context_window)
-            .min(input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens)));
-        let current_query =
-            super::current_user_query(&effective_history, effective_protected_start_index);
-        let frozen = input.frozen_evidence;
-        let (mut evidence_message, mut selected_evidence_ids, mut dropped_evidence_items) =
-            if let Some(frozen) = frozen {
-                let selected_current_evidence = input
-                    .snapshot
-                    .evidence
-                    .iter()
-                    .filter(|evidence| frozen.selected_ids.contains(&evidence.id))
-                    .count();
-                (
-                    frozen.message.clone(),
-                    frozen.selected_ids.clone(),
-                    input
-                        .snapshot
-                        .evidence
-                        .len()
-                        .saturating_sub(selected_current_evidence),
-                )
-            } else if evidence_budget > 0 {
-                crate::evidence::evidence_context_message(
-                    &input.snapshot.evidence,
-                    &current_query,
-                    evidence_budget,
-                )
-            } else {
-                (None, Vec::new(), input.snapshot.evidence.len())
-            };
-        let mut estimated_evidence_tokens = evidence_message
-            .as_deref()
-            .map(crate::evidence::estimate_evidence_tokens)
-            .unwrap_or(0);
-        let (frames, budget, protected_ceiling) = loop {
-            let selected_evidence_items = if frozen.is_some() {
-                input
-                    .snapshot
-                    .evidence
-                    .iter()
-                    .filter(|evidence| selected_evidence_ids.contains(&evidence.id))
-                    .count()
-            } else {
-                selected_evidence_ids.len()
-            };
-            match select_history_with_required_fallbacks(
-                input.snapshot,
-                &effective_prelude,
-                &effective_history_frames,
-                effective_protected_start_index,
-                protected_tokens,
-                input.model.clone(),
-                input.tools,
-                estimated_evidence_tokens,
-                selected_evidence_items,
-                dropped_evidence_items,
-                input.protected_context_policy,
-            ) {
-                Ok(selection) => break selection,
-                Err(_) if frozen.is_none() && evidence_message.is_some() => {
-                    evidence_message = None;
-                    selected_evidence_ids.clear();
-                    dropped_evidence_items = input.snapshot.evidence.len();
-                    estimated_evidence_tokens = 0;
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let (frames, budget, protected_ceiling) = select_history_with_required_fallbacks(
+            input.snapshot,
+            &effective_prelude,
+            &effective_history_frames,
+            effective_protected_start_index,
+            protected_tokens,
+            input.model.clone(),
+            input.tools,
+            input.protected_context_policy,
+        )?;
         super::validate_history_items_complete(
             &super::history_items_from_frames(&frames),
             Some(effective_protected_start_index),
@@ -287,8 +216,6 @@ impl PromptPlanner {
             protected_suffix_len: effective_history
                 .len()
                 .saturating_sub(effective_protected_start_index.min(effective_history.len())),
-            evidence_message: evidence_message.as_deref(),
-            selected_evidence_ids: &selected_evidence_ids,
         });
         let mut budget = budget;
         budget.estimated_protected_tokens = protected_tokens;
@@ -298,8 +225,6 @@ impl PromptPlanner {
         Ok(PlannedPrompt {
             prompt_plan,
             budget,
-            selected_evidence_ids,
-            selected_evidence_message: evidence_message,
         })
     }
 }
@@ -319,9 +244,6 @@ fn select_history_with_required_fallbacks(
     protected_tokens: u64,
     model: ModelRequestMetadata,
     tools: &[ToolSpec],
-    estimated_evidence_tokens: u64,
-    selected_evidence_items: usize,
-    dropped_evidence_items: usize,
     protected_context_policy: ProtectedContextPolicy,
 ) -> anyhow::Result<(Vec<ProtocolFrame>, BudgetReport, u64)> {
     let contributors = snapshot.active_prompt_payload_contributors();
@@ -336,11 +258,6 @@ fn select_history_with_required_fallbacks(
             protected_tokens,
             model.clone(),
             tools,
-            super::EvidenceBudgetReport {
-                estimated_evidence_tokens,
-                selected_evidence_items,
-                dropped_evidence_items,
-            },
             fallback_tokens,
         );
         let selected_ids = selected
@@ -384,7 +301,6 @@ fn select_history_with_required_fallbacks(
     let hard_protected_ceiling = budget
         .input_budget_tokens
         .saturating_sub(budget.estimated_prelude_tokens)
-        .saturating_sub(budget.estimated_evidence_tokens)
         .saturating_sub(budget.estimated_required_fallback_tokens);
     let protected_ceiling = if protected_context_policy.enabled() {
         hard_protected_ceiling.saturating_sub(protected_context_policy.reserve_tokens)
@@ -397,7 +313,6 @@ fn select_history_with_required_fallbacks(
             .estimated_prelude_tokens
             .saturating_add(budget.estimated_required_fallback_tokens),
         budget.estimated_protected_tokens,
-        budget.estimated_evidence_tokens,
     )?;
     Ok((frames, budget, protected_ceiling))
 }
@@ -588,8 +503,6 @@ pub(crate) struct PromptPlanBuildInput<'a> {
     pub selected_frames: &'a [ProtocolFrame],
     pub segment_order_offset: usize,
     pub protected_suffix_len: usize,
-    pub evidence_message: Option<&'a str>,
-    pub selected_evidence_ids: &'a [String],
 }
 
 #[derive(Debug, Clone)]
@@ -621,8 +534,6 @@ pub(crate) fn build_prompt_plan_suffix(
             selected_frames,
             segment_order_offset,
             protected_suffix_len: selected_frames.len(),
-            evidence_message: None,
-            selected_evidence_ids: &[],
         },
         false,
     );
@@ -727,14 +638,7 @@ fn build_prompt_plan_with_runtime_material(
         .len()
         .saturating_sub(protected_suffix_len);
 
-    let evidence_insert_index = input
-        .evidence_message
-        .and_then(|_| last_user_frame_index(input.selected_frames));
-
     for (index, frame) in input.selected_frames.iter().enumerate() {
-        if evidence_insert_index == Some(index) {
-            push_evidence_segment(&mut builder, evidence_message_segment(&input));
-        }
         let provenance = frame.source_provenance.clone().or_else(|| {
             frame.runtime_frame_id.and_then(|id| {
                 input
@@ -790,10 +694,6 @@ fn build_prompt_plan_with_runtime_material(
         });
     }
 
-    if input.evidence_message.is_some() && evidence_insert_index.is_none() {
-        push_evidence_segment(&mut builder, evidence_message_segment(&input));
-    }
-
     builder.finish()
 }
 
@@ -843,7 +743,6 @@ fn canonicalize_prompt_plan_preserving_offset(plan: &mut PromptPlan, order_offse
 pub(crate) fn canonicalize_prompt_plan(mut plan: PromptPlan) -> PromptPlan {
     let mut kernel = Vec::new();
     let mut envelope = Vec::new();
-    let mut evidence = Vec::new();
     let mut durable = Vec::new();
     let mut history = Vec::new();
     let mut current = Vec::new();
@@ -872,8 +771,6 @@ pub(crate) fn canonicalize_prompt_plan(mut plan: PromptPlan) -> PromptPlan {
             kernel.push(segment);
         } else if segment.source.source_label.as_deref() == Some("prelude") {
             envelope.push(segment);
-        } else if segment.source.contributor_kind == PromptContributorKind::Evidence {
-            evidence.push(segment);
         } else if matches!(
             segment.source.contributor_kind,
             PromptContributorKind::ContextMaterial | PromptContributorKind::ContextIndex
@@ -888,11 +785,10 @@ pub(crate) fn canonicalize_prompt_plan(mut plan: PromptPlan) -> PromptPlan {
         }
     }
     let kernel_end_exclusive = kernel.len();
-    // The envelope contains both prelude envelope material and leading
-    // evidence.  Both boundaries are exclusive segment counts.
-    let envelope_end_exclusive = kernel.len() + envelope.len() + evidence.len();
+    // The envelope contains prelude envelope material, which precedes kernel
+    // material in provider order.
+    let envelope_end_exclusive = kernel.len() + envelope.len();
     kernel.append(&mut envelope);
-    kernel.append(&mut evidence);
     kernel.append(&mut durable);
     kernel.append(&mut history);
     kernel.append(&mut current);
@@ -1102,8 +998,7 @@ fn composition_category(kind: PromptContributorKind) -> &'static str {
         PromptContributorKind::SkillMaterial => "skills",
         PromptContributorKind::RuntimeContext
         | PromptContributorKind::ContextMaterial
-        | PromptContributorKind::ContextIndex
-        | PromptContributorKind::Evidence => "context",
+        | PromptContributorKind::ContextIndex => "context",
         PromptContributorKind::TranscriptFrame
         | PromptContributorKind::CurrentTurn
         | PromptContributorKind::Other => "messages",
@@ -1370,48 +1265,6 @@ fn history_item_text(item: &HistoryItem) -> String {
 
 fn render_context_summary(text: &str) -> String {
     format!("以下是当前会话的结构化摘要：\n\n{text}")
-}
-
-fn push_evidence_segment(builder: &mut PromptPlanBuilder, segment: Option<NewPromptSegment>) {
-    if let Some(segment) = segment {
-        builder.push_segment(segment);
-    }
-}
-
-fn evidence_message_segment(input: &PromptPlanBuildInput<'_>) -> Option<NewPromptSegment> {
-    let evidence_message = input.evidence_message?;
-    let source_id = if input.selected_evidence_ids.is_empty() {
-        None
-    } else {
-        Some(input.selected_evidence_ids.join(","))
-    };
-    let mut provenance = RuntimeFrameProvenance::new(RuntimeSource::Derived);
-    if let Some(source_id) = source_id {
-        provenance = provenance.with_source_id(source_id);
-    }
-    Some(NewPromptSegment {
-        contributor_kind: PromptContributorKind::Evidence,
-        contributor_label: Some("selected_evidence".to_string()),
-        role: PromptSegmentRole::Developer,
-        stability: PromptSegmentStability::Volatile,
-        retention: PromptSegmentRetention::Droppable,
-        protection: PromptSegmentProtection {
-            retained: true,
-            ..PromptSegmentProtection::default()
-        },
-        provenance,
-        source_key: Some(stable_hash_input(&format!(
-            "evidence:{}:{}",
-            input.selected_evidence_ids.join(","),
-            evidence_message
-        ))),
-        source_label: Some("evidence_message".to_string()),
-        token_estimate: Some(estimate_text_tokens(evidence_message)),
-        text: evidence_message.to_string(),
-        content: PromptSegmentContent::Text {
-            text: evidence_message.to_string(),
-        },
-    })
 }
 
 fn history_item_content(item: &HistoryItem) -> PromptSegmentContent {

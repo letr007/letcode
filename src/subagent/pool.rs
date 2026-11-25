@@ -2486,11 +2486,6 @@ fn observed_changed_paths_from_child_transcript(
     let mut paths = Vec::new();
     for record in records {
         match record.event {
-            TranscriptEvent::Evidence {
-                evidence_kind: crate::evidence::EvidenceKind::Change,
-                source: crate::evidence::EvidenceSource::File { path, .. },
-                ..
-            } => push_unique_path(&mut paths, path),
             TranscriptEvent::ToolCallFinished { name, output, .. }
                 if matches!(
                     name.as_str(),

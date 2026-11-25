@@ -20,7 +20,6 @@ mod context_history;
 mod context_tree;
 mod context_view;
 mod delegation;
-mod evidence;
 mod fake;
 mod fast_mode;
 mod historian;

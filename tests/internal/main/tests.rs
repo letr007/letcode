@@ -168,7 +168,7 @@ mod integration_tests {
 
         let mut agent = test_agent();
         agent
-            .restore_session_context(Vec::new(), Vec::new(), 99)
+            .restore_session_context(Vec::new(), 99)
             .expect("seed old turn sequence");
 
         let prepared = session::prepare_resume_package(&base_dir, target_id.clone())
@@ -231,7 +231,7 @@ mod integration_tests {
 
         let mut agent = test_agent();
         agent
-            .restore_session_context(Vec::new(), Vec::new(), 99)
+            .restore_session_context(Vec::new(), 99)
             .expect("seed old turn sequence");
         let old_snapshot = agent.runtime_snapshot_for_test().clone();
 
@@ -264,7 +264,7 @@ mod integration_tests {
 
         let mut agent = test_agent();
         agent
-            .restore_session_context(Vec::new(), Vec::new(), 99)
+            .restore_session_context(Vec::new(), 99)
             .expect("seed old turn sequence");
         let old_snapshot = agent.runtime_snapshot_for_test().clone();
 

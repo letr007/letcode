@@ -10,14 +10,10 @@ use super::*;
 use crate::agent::{
     AutoContinueState, ContextCompactionEvent, LlmRequestTelemetry, LlmRequestTelemetryPhase,
     TodoItem, ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
-    subagent_evidence_parent_tool,
 };
 #[cfg(test)]
 use crate::context_tree::{
     ContextBlockRef, ContextNodeId, ContextNodeStatus, ContextSourceRef, ContextTreeOp,
-};
-use crate::evidence::{
-    EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
 };
 use crate::request_builder::HistoryToolCall;
 use crate::subagent::StructuredSubagentResult;
@@ -974,64 +970,16 @@ impl TranscriptRecorder {
         summary: impl Into<String>,
         structured_result: Option<StructuredSubagentResult>,
     ) -> Result<()> {
-        let run_id = run_id.into();
-        let parent_session_id = parent_session_id.into();
-        let parent_run_id = parent_run_id.into();
-        let child_session_id = child_session_id.into();
-        let agent_name = agent_name.into();
-        let result_event = TranscriptEvent::SubagentResult {
-            run_id: run_id.clone(),
-            parent_session_id: parent_session_id.clone(),
-            parent_run_id: parent_run_id.clone(),
-            child_session_id: child_session_id.clone(),
-            agent_name: agent_name.clone(),
+        self.append(TranscriptEvent::SubagentResult {
+            run_id: run_id.into(),
+            parent_session_id: parent_session_id.into(),
+            parent_run_id: parent_run_id.into(),
+            child_session_id: child_session_id.into(),
+            agent_name: agent_name.into(),
             status: status.into(),
             summary: summary.into(),
-        };
-        // Internal history work is audit/navigation data, not a project decision.
-        // Its actual facts are published through the typed history contract.
-        if agent_name == "historian" {
-            return self.append(result_event);
-        }
-        let Some(result) = structured_result else {
-            return self.append(result_event);
-        };
-        let parent_tool = subagent_evidence_parent_tool(agent_name.as_str()).ok_or_else(|| {
-            anyhow!("subagent result recorded with unknown agent name: {agent_name}")
-        })?;
-        let detail = serde_json::to_string(&result).ok();
-        let evidence = EvidenceDraft {
-            id: None,
-            evidence_kind: EvidenceKind::Decision,
-            title: format!("subagent {agent_name} result"),
-            summary: result.summary.clone(),
-            detail,
-            source: EvidenceSource::Subagent {
-                run_id,
-                child_session_id: child_session_id.clone(),
-                source_session_id: child_session_id,
-                parent_tool,
-                parent_turn_id: Some(parent_run_id),
-                parent_session_id: Some(parent_session_id),
-            },
-            tags: vec![agent_name, "subagent_result".into()],
-        };
-        evidence.validate()?;
-        let evidence_event = TranscriptEvent::Evidence {
-            id: evidence
-                .id
-                .unwrap_or_else(|| evidence_id_for_sequence(self.sequence.saturating_add(2))),
-            evidence_kind: evidence.evidence_kind,
-            title: evidence.title,
-            summary: evidence.summary,
-            detail: evidence.detail,
-            source: evidence.source,
-            tags: evidence.tags,
-        };
-        self.append_transaction(vec![
-            (result_event, self.current_context_branch_id.clone()),
-            (evidence_event, self.current_context_branch_id.clone()),
-        ])
+            structured_result,
+        })
     }
 
     pub fn record_user_message(&mut self, content: impl Into<String>) -> Result<()> {
@@ -1093,17 +1041,8 @@ impl TranscriptRecorder {
                 .estimated_unaddressable_protected_tokens,
             estimated_retained_history_tokens: telemetry.estimated_retained_history_tokens,
             estimated_tools_tokens: telemetry.estimated_tools_tokens,
-            estimated_evidence_tokens: telemetry.estimated_evidence_tokens,
             estimated_required_fallback_tokens: telemetry.estimated_required_fallback_tokens,
             dropped_history_items: telemetry.dropped_history_items,
-            selected_evidence_items: telemetry.selected_evidence_items,
-            dropped_evidence_items: telemetry.dropped_evidence_items,
-            selected_evidence_ids: telemetry
-                .selected_evidence_ids
-                .iter()
-                .map(|id| sanitize_opaque_identifier(id))
-                .collect(),
-            evidence_fingerprint: truncate_text(&telemetry.evidence_fingerprint, 128),
             truncated: telemetry.truncated,
             prompt_segment_count: telemetry.prompt_segment_count,
             prompt_contributor_count: telemetry.prompt_contributor_count,
@@ -1440,52 +1379,6 @@ impl TranscriptRecorder {
         })
     }
 
-    #[cfg(test)]
-    pub fn record_evidence(&mut self, draft: EvidenceDraft) -> Result<EvidenceRecord> {
-        draft.validate()?;
-        let sequence = self.sequence.saturating_add(1);
-        let timestamp_ms = unix_timestamp_ms();
-        let id = draft
-            .id
-            .clone()
-            .unwrap_or_else(|| evidence_id_for_sequence(sequence));
-        let event = TranscriptEvent::Evidence {
-            id: id.clone(),
-            evidence_kind: draft.evidence_kind,
-            title: draft.title.clone(),
-            summary: draft.summary.clone(),
-            detail: draft.detail.clone(),
-            source: draft.source.clone(),
-            tags: draft.tags.clone(),
-        };
-
-        let record = draft.into_record(id, sequence, timestamp_ms)?;
-        self.append_with_timestamp(event, timestamp_ms)?;
-        Ok(record)
-    }
-
-    pub fn record_evidence_record(&mut self, evidence: EvidenceRecord) -> Result<()> {
-        let draft = EvidenceDraft {
-            id: Some(evidence.id.clone()),
-            evidence_kind: evidence.evidence_kind,
-            title: evidence.title.clone(),
-            summary: evidence.summary.clone(),
-            detail: evidence.detail.clone(),
-            source: evidence.source.clone(),
-            tags: evidence.tags.clone(),
-        };
-        draft.validate()?;
-        self.append(TranscriptEvent::Evidence {
-            id: evidence.id,
-            evidence_kind: evidence.evidence_kind,
-            title: evidence.title,
-            summary: evidence.summary,
-            detail: evidence.detail,
-            source: evidence.source,
-            tags: evidence.tags,
-        })
-    }
-
     pub fn append(&mut self, event: TranscriptEvent) -> Result<()> {
         self.append_with_timestamp(event, unix_timestamp_ms())
     }
@@ -1810,7 +1703,6 @@ pub(crate) fn requires_durable_commit(event: &TranscriptEvent) -> bool {
             | TranscriptEvent::AutoContinuationScheduled { .. }
             | TranscriptEvent::InternalContinuation { .. }
             | TranscriptEvent::TurnInterrupted { .. }
-            | TranscriptEvent::Evidence { .. }
             | TranscriptEvent::HistorianExchange(_)
     ) || matches!(event, TranscriptEvent::ContextCompaction(_))
 }

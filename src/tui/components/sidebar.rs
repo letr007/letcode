@@ -695,7 +695,6 @@ fn composition_category(value: &str) -> &'static str {
         || value.starts_with("RuntimeContext:")
         || value.starts_with("ContextMaterial:")
         || value.starts_with("ContextIndex:")
-        || value.starts_with("Evidence:")
     {
         "context"
     } else if value == "messages"

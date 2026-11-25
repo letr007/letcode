@@ -796,7 +796,6 @@ fn present_transport_event(
         SessionTransportEvent::SessionResumed {
             session_id,
             messages,
-            evidence_count,
             model_id,
             ..
         } => {
@@ -808,17 +807,15 @@ fn present_transport_event(
             if matches!(output_mode, OutputMode::Streaming) {
                 match &view.model_id {
                     model if !model.is_empty() => println!(
-                        "resumed session {} ({} messages, {} evidence, model {})",
+                        "resumed session {} ({} messages, model {})",
                         session_id,
                         messages.len(),
-                        evidence_count,
                         model
                     ),
                     _ => println!(
-                        "resumed session {} ({} messages, {} evidence)",
+                        "resumed session {} ({} messages)",
                         session_id,
-                        messages.len(),
-                        evidence_count
+                        messages.len()
                     ),
                 }
             }

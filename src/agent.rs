@@ -11,7 +11,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{Instrument, debug, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, ModelRoute, ProviderConfig, RetryConfig};
-use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 use crate::model_runtime::{ResolvedModelRoute, ResolvedRuntimeCatalog};
 #[cfg(test)]
 use crate::permission::ToolScope;
@@ -53,8 +52,6 @@ mod catalog;
 pub(crate) mod compaction;
 #[path = "agent/events.rs"]
 mod events;
-#[path = "agent/evidence_memory.rs"]
-mod evidence_memory;
 #[path = "agent/history_compact.rs"]
 mod history_compact;
 mod history_runtime;
@@ -71,8 +68,7 @@ pub use crate::workflow_state::{AutoContinueState, TodoItem, TodoStatus};
 pub use catalog::{AgentFactory, AgentTemplate, SubagentCapabilityContract};
 pub(crate) use catalog::{
     SUBAGENT_CATALOG, agent_name_for_subagent_tool, is_subagent_tool_name,
-    subagent_catalog_entry_by_tool_name, subagent_evidence_parent_tool,
-    subagent_tool_name_for_agent_name,
+    subagent_catalog_entry_by_tool_name, subagent_tool_name_for_agent_name,
 };
 #[allow(unused_imports)]
 pub(crate) use catalog::{SubagentCatalogEntry, subagent_catalog_entry_by_agent_name};
@@ -122,7 +118,6 @@ pub(crate) struct ToolEffects {
 pub(crate) struct ToolExecutionRecord {
     pub call_id: String,
     pub tool_name: String,
-    pub arguments: Option<Value>,
     #[allow(dead_code)]
     pub permission_class: crate::permission::ToolPermissionClass,
     #[allow(dead_code)]
@@ -158,8 +153,6 @@ struct ActiveEpoch {
     protocol_append_generation: u64,
     projection_generation: u64,
     budget: crate::request_builder::BudgetReport,
-    selected_evidence_ids: Vec<String>,
-    selected_evidence_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +164,6 @@ pub(super) enum ColdRequiredReason {
     ToolDefinitionsChanged,
     ProtocolFrontierChanged,
     TruncatedOrReselected,
-    EvidenceChanged,
     UnsupportedAppendShape,
     SuffixValidationFailed,
     BudgetRequiresColdPlan,
@@ -1112,27 +1104,6 @@ impl Agent {
         self.clear_active_epoch();
     }
 
-    fn frozen_evidence(&self) -> Option<crate::request_builder::FrozenEvidence> {
-        self.turn
-            .frozen_evidence
-            .as_ref()
-            .map(|evidence| crate::request_builder::FrozenEvidence {
-                message: evidence.message.clone(),
-                selected_ids: evidence.selected_ids.clone(),
-            })
-    }
-
-    fn effective_frozen_evidence_for_preview(
-        &self,
-        preview: &ActiveEpochPreview,
-    ) -> crate::request_builder::FrozenEvidence {
-        self.frozen_evidence()
-            .unwrap_or_else(|| crate::request_builder::FrozenEvidence {
-                message: preview.build.selected_evidence_message.clone(),
-                selected_ids: preview.build.selected_evidence_ids.clone(),
-            })
-    }
-
     fn clear_provider_usage_anchor(&mut self) {
         self.provider_usage_anchor = None;
     }
@@ -1373,7 +1344,6 @@ impl Agent {
         tools: &[crate::request_builder::ToolSpec],
     ) -> Result<ActiveEpochPreview> {
         let model = self.active_model_metadata();
-        let frozen = self.frozen_evidence();
         let policy = ProtectedContextPolicy::from_configured_reserve(
             None,
             effective_input_budget_tokens(model.clone(), tools),
@@ -1389,7 +1359,6 @@ impl Agent {
                 snapshot,
                 tools,
             },
-            frozen.as_ref(),
             Some(policy),
         )?;
         self.active_epoch_preview_from_build(planned, tools, ActiveEpochTransition::Cold)
@@ -1452,8 +1421,6 @@ impl Agent {
         let rebuilt = build_request_from_selected_prompt(SelectedPromptRequestInput {
             prompt_plan: plan,
             budget,
-            selected_evidence_ids: previous.selected_evidence_ids.clone(),
-            selected_evidence_message: previous.selected_evidence_message.clone(),
         })?;
         let observation = observe_logical_request(&rebuilt);
         if self.resolved_model_route.is_none() {
@@ -1486,8 +1453,6 @@ impl Agent {
         let observation = observe_logical_request(&build);
         let committed_plan = build.prompt_plan.clone();
         let budget = build.budget;
-        let selected_evidence_ids = build.selected_evidence_ids.clone();
-        let selected_evidence_message = build.selected_evidence_message.clone();
         Ok(ActiveEpochPreview {
             build,
             epoch: ActiveEpoch {
@@ -1501,21 +1466,12 @@ impl Agent {
                 observation,
                 projection_generation: self.request_projection_generation,
                 budget,
-                selected_evidence_ids,
-                selected_evidence_message,
             },
             transition: _transition,
         })
     }
 
     fn commit_active_epoch(&mut self, preview: ActiveEpochPreview) {
-        if self.turn.frozen_evidence.is_none() {
-            let frozen = self.effective_frozen_evidence_for_preview(&preview);
-            self.turn.frozen_evidence = Some(FrozenTurnEvidence {
-                message: frozen.message,
-                selected_ids: frozen.selected_ids,
-            });
-        }
         self.active_epoch = Some(preview.epoch);
     }
 
@@ -2169,7 +2125,6 @@ impl Agent {
                 snapshot: runtime_snapshot,
                 tools: &tools,
             },
-            None,
             Some(policy),
         )?;
         Ok(build)
@@ -2368,19 +2323,10 @@ impl Agent {
         self.clear_resume_proc_local();
     }
 
-    #[allow(dead_code)]
-    pub fn restore_evidence(&mut self, evidence: Vec<EvidenceRecord>) -> Result<()> {
-        Self::validate_evidence_ids(&evidence)?;
-        self.runtime_snapshot.set_evidence(evidence);
-        self.invalidate_request_projection();
-        Ok(())
-    }
-
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn restore_session_context(
         &mut self,
         messages: Vec<ConversationMessage>,
-        evidence: Vec<EvidenceRecord>,
         max_turn_id: u64,
     ) -> Result<()> {
         let history = messages
@@ -2391,23 +2337,19 @@ impl Agent {
                 ConversationRole::Summary => HistoryItem::context_summary(message.content),
             })
             .collect();
-        self.restore_session_history(history, evidence, max_turn_id)
+        self.restore_session_history(history, max_turn_id)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn restore_session_history(
         &mut self,
         history: Vec<HistoryItem>,
-        evidence: Vec<EvidenceRecord>,
         max_turn_id: u64,
     ) -> Result<()> {
-        Self::validate_evidence_ids(&evidence)?;
-
         let transcript = crate::protocol_frames::analyze_history_items(&history, None)?;
         let mut runtime_snapshot =
             self.rebuilt_runtime_snapshot_from_protocol_frames(&transcript.frames, 0, &[])?;
         runtime_snapshot.current_turn_id = Some(max_turn_id);
-        runtime_snapshot.set_evidence(evidence);
         runtime_snapshot.workflow = crate::workflow_state::WorkflowState::default();
 
         self.runtime_snapshot = runtime_snapshot;
@@ -2449,7 +2391,6 @@ impl Agent {
         mut runtime_snapshot: RuntimeSnapshot,
     ) -> Result<RuntimeSnapshot> {
         reconcile_snapshot_skill_material(&mut runtime_snapshot)?;
-        Self::validate_evidence_ids(&runtime_snapshot.evidence)?;
         ensure_active_protocol_source_spans(&mut runtime_snapshot);
 
         let frames = runtime_snapshot.active_protocol_frames();
@@ -2533,15 +2474,6 @@ impl Agent {
         self.next_turn_id = max_turn_id;
     }
 
-    pub fn add_evidence(&mut self, evidence: EvidenceRecord) -> Result<()> {
-        require_unique_evidence_id(&self.runtime_snapshot.evidence, &evidence.id)?;
-        self.runtime_snapshot.evidence.push(evidence);
-        if self.turn.frozen_evidence.is_none() {
-            self.invalidate_request_projection();
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn install_provider_usage_anchor_for_test(&mut self, usage: TokenUsageEstimate) {
         self.install_provider_usage_anchor(usage);
@@ -2587,11 +2519,6 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn protocol_frames_for_test(&self) -> Vec<crate::protocol_frames::ProtocolFrame> {
         self.active_protocol_frames()
-    }
-
-    #[allow(dead_code)]
-    pub fn evidence(&self) -> &[EvidenceRecord] {
-        self.runtime_snapshot.evidence.as_slice()
     }
 
     #[allow(dead_code)]
@@ -2813,7 +2740,6 @@ impl Agent {
         })?;
         let mut snapshot = provider().context("failed to project runtime snapshot for reload")?;
         reconcile_snapshot_skill_material(&mut snapshot)?;
-        Self::validate_evidence_ids(&snapshot.evidence)?;
         ensure_active_protocol_source_spans(&mut snapshot);
         let protocol_frames = snapshot.active_protocol_frames();
         let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
@@ -2854,7 +2780,6 @@ impl Agent {
         // No multi-authority payload equality checks: provider is the new live
         // history for this path only.
 
-        Self::validate_evidence_ids(&snapshot.evidence)?;
         let restored_turn_id = snapshot.current_turn_id.unwrap_or_default();
 
         self.turn = TurnRuntimeState::default();
@@ -3038,15 +2963,6 @@ impl Agent {
 
     fn fresh_runtime_snapshot(model: &str) -> RuntimeSnapshot {
         RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID).with_latest_model(model.to_string())
-    }
-
-    fn validate_evidence_ids(evidence: &[EvidenceRecord]) -> Result<()> {
-        let mut candidate = Vec::with_capacity(evidence.len());
-        for record in evidence {
-            require_unique_evidence_id(&candidate, &record.id)?;
-            candidate.push(record.clone());
-        }
-        Ok(())
     }
 
     fn rebuilt_runtime_snapshot_from_protocol_frames(
@@ -3903,46 +3819,11 @@ impl Agent {
             "tool output appended to history"
         );
 
-        if !self.subagent_effects_are_already_recorded(&record) {
-            let evidence = self.remember_tool_evidence(&record)?;
-            on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
-        }
-
         if is_cancelled_subagent_record(&record) {
             return Ok(ToolCallRecordOutcome::Cancelled);
         }
 
         Ok(ToolCallRecordOutcome::Completed)
-    }
-
-    fn subagent_effects_are_already_recorded(&self, record: &ToolExecutionRecord) -> bool {
-        if !is_subagent_tool_name(&record.tool_name)
-            && record.tool_name != tool_names::TOOL_AGENT_WAIT
-        {
-            return false;
-        }
-        let Some(run_id) = record
-            .output
-            .data
-            .as_ref()
-            .and_then(|data| data.get("run_id"))
-            .and_then(Value::as_str)
-        else {
-            return false;
-        };
-        self.runtime_snapshot.evidence.iter().any(|evidence| {
-            matches!(
-                &evidence.source,
-                crate::evidence::EvidenceSource::Subagent {
-                    run_id: recorded,
-                    ..
-                } if recorded == run_id
-            )
-        })
-    }
-
-    fn remember_tool_evidence(&mut self, record: &ToolExecutionRecord) -> Result<EvidenceRecord> {
-        evidence_memory::remember_tool_evidence(self, record)
     }
 
     pub async fn run_stream<F, E, A>(
@@ -4417,24 +4298,12 @@ impl Agent {
     }
 
     fn record_background_subagent_effects(&mut self, result: &crate::subagent::SubagentRunSummary) {
-        if self.runtime_snapshot.evidence.iter().any(|evidence| {
-            matches!(
-                &evidence.source,
-                crate::evidence::EvidenceSource::Subagent {
-                    run_id: recorded,
-                    ..
-                } if recorded == &result.run_id
-            )
-        }) {
-            return;
-        }
         let parent_tool = subagent_tool_name_for_agent_name(&result.agent_name)
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("agent__{}", result.agent_name));
         let record = ToolExecutionRecord {
             call_id: format!("background-{}", result.run_id),
             tool_name: parent_tool.clone(),
-            arguments: Some(serde_json::json!({ "background": true })),
             permission_class: crate::permission::ToolPermissionClass::Preview,
             status: ToolExecutionStatus::Executed,
             rejection: None,
@@ -4471,7 +4340,17 @@ impl Agent {
     }
 
     fn record_subagent_effects(&mut self, record: &ToolExecutionRecord) {
-        if self.subagent_effects_are_already_recorded(record) {
+        let Some(run_id) = record
+            .output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("run_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        if !self.turn.counted_subagent_runs.insert(run_id) {
             return;
         }
         let Some(structured) = record
@@ -4745,7 +4624,6 @@ impl ToolExecutionRecord {
         Self {
             call_id: call.call_id.clone(),
             tool_name: call.name.clone(),
-            arguments,
             permission_class,
             status,
             rejection,
@@ -5140,7 +5018,6 @@ pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot
 fn merge_non_protocol_runtime_metadata(target: &mut RuntimeSnapshot, source: &RuntimeSnapshot) {
     target.child_sessions = source.child_sessions.clone();
     target.prompt_contributors = source.prompt_contributors.clone();
-    target.evidence = source.evidence.clone();
     target.context_view = source.context_view.clone();
     target.context_tree = source.context_tree.clone();
     target.active_context = source.active_context.clone();
@@ -5210,14 +5087,8 @@ struct TurnRuntimeState {
     // explicitly disable it and still receive one final response. This is
     // separate from the persisted setting, which records the LLM's last choice.
     auto_continue_active: bool,
-    frozen_evidence: Option<FrozenTurnEvidence>,
+    counted_subagent_runs: std::collections::BTreeSet<String>,
     pressure_compaction: PressureCompactionState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FrozenTurnEvidence {
-    message: Option<String>,
-    selected_ids: Vec<String>,
 }
 
 impl TurnRuntimeState {
@@ -5228,7 +5099,7 @@ impl TurnRuntimeState {
             current_turn_start_index: None,
             counters: TurnCounters::default(),
             auto_continue_active: false,
-            frozen_evidence: None,
+            counted_subagent_runs: std::collections::BTreeSet::new(),
             pressure_compaction: PressureCompactionState::default(),
         }
     }

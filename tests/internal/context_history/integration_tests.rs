@@ -91,7 +91,7 @@ fn history_publication_and_application_replay_separately() {
             .iter()
             .any(|e| e.id == "raw:2" && e.text.contains("UTF-8 boundary"))
     );
-    assert!(entries.iter().any(|e| e.id == "evidence:fact:f1"));
+    assert!(entries.iter().any(|e| e.id == "fact:f1"));
 }
 #[test]
 fn history_cannot_retire_uncovered_tail_or_publish_unknown_source() {
@@ -208,12 +208,6 @@ fn independent_facts_from_one_publication_are_not_deduplicated() {
     p.facts.push(second);
     records.push(record(4, E::HistoryPublished(p)));
     records.push(record(5, E::HistoryApplied(a)));
-    let facts = crate::evidence::restore_evidence_records(&records).unwrap();
-    let (message, ids, _) = crate::evidence::evidence_context_message(&facts, "Parser", 3000);
-    assert!(
-        message.is_none() && ids.is_empty(),
-        "facts are rendered by the frozen history slots, not injected twice"
-    );
     let rendered = restore_session_history(&records).unwrap();
     assert!(
         matches!(&rendered[0],HistoryItem::ContextSummary {text} if text.contains("Parser offsets are byte offsets") && text.contains("Parser input is UTF-8"))
@@ -249,11 +243,6 @@ fn legacy_bootstrap_cannot_be_dropped_by_an_application() {
 fn facts_revise_projection_without_deleting_original_observation() {
     let (mut records, p, a) = fixture();
     records.push(record(4, E::HistoryPublished(p.clone())));
-    assert!(
-        crate::evidence::restore_evidence_records(&records)
-            .unwrap()
-            .is_empty()
-    );
     records.push(record(5, E::HistoryApplied(a)));
     let mut next = p;
     next.id = "p2".into();
@@ -265,10 +254,6 @@ fn facts_revise_projection_without_deleting_original_observation() {
     next.facts[0].source_ids = next.source_ids.clone();
     next.facts[0].supersedes = vec!["f1".into()];
     records.push(record(6, E::HistoryPublished(next)));
-    assert_eq!(
-        crate::evidence::restore_evidence_records(&records).unwrap()[0].id,
-        "fact:f1"
-    );
     records.push(record(
         7,
         E::HistoryApplied(HistoryApplication {
@@ -284,14 +269,8 @@ fn facts_revise_projection_without_deleting_original_observation() {
     ));
     restore_session_history(&records).unwrap();
     let archived = source_entries(&records).unwrap();
-    let previous = archived
-        .iter()
-        .find(|e| e.id == "evidence:fact:f1")
-        .unwrap();
+    let previous = archived.iter().find(|e| e.id == "fact:f1").unwrap();
     assert_eq!(previous.source_ids, vec!["raw:1", "raw:2"]);
     assert!(previous.text.contains("false"));
-    let facts = crate::evidence::restore_evidence_records(&records).unwrap();
-    assert_eq!(facts.len(), 1);
-    assert_eq!(facts[0].id, "fact:f2");
     assert!(matches!(&records[3].event,E::HistoryPublished(p) if p.facts[0].id=="f1"));
 }

@@ -10,7 +10,6 @@ fn test_parallel_batch_record(call: &HistoryToolCall) -> ParallelBatchRecord {
         record: ToolExecutionRecord {
             call_id: call.call_id.clone(),
             tool_name: call.name.clone(),
-            arguments: Some(serde_json::json!({})),
             permission_class: crate::permission::ToolPermissionClass::Read,
             status: ToolExecutionStatus::Executed,
             rejection: None,

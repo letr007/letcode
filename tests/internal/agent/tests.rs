@@ -913,15 +913,6 @@ async fn active_epoch_cold_rebuilds_on_provider_identity_changes() {
     assert!(matches!(kernel.transition, ActiveEpochTransition::Cold));
     agent.commit_active_epoch(kernel);
 
-    agent.turn.frozen_evidence = Some(FrozenTurnEvidence {
-        message: Some("changed envelope evidence".into()),
-        selected_ids: vec!["active-epoch".into()],
-    });
-    let envelope = agent
-        .preview_active_epoch(ApiProtocol::Completions, &prelude, &changed_tools)
-        .expect("evidence change rebuilds cold");
-    assert!(matches!(envelope.transition, ActiveEpochTransition::Cold));
-
     for protocol in [
         ApiProtocol::Responses,
         ApiProtocol::Completions,
@@ -1125,42 +1116,6 @@ fn image_usage_matches_cold_warm_and_provider_anchored_projections() {
 }
 
 #[test]
-fn active_epoch_freezes_effective_evidence_and_allows_first_post_tool_warm_append() {
-    let tools = active_epoch_tools();
-    let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
-    install_active_epoch_route(&mut agent, ApiProtocol::Responses);
-    agent
-        .add_evidence(test_evidence("ev-before-request", 1))
-        .expect("seed evidence");
-    let preview = agent
-        .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
-        .expect("initial cold preview");
-    let selected_ids = preview.build.selected_evidence_ids.clone();
-    agent.commit_active_epoch(preview);
-    assert_eq!(
-        agent
-            .turn
-            .frozen_evidence
-            .as_ref()
-            .expect("effective evidence frozen")
-            .selected_ids,
-        selected_ids
-    );
-
-    agent
-        .add_evidence(test_evidence("ev-after-request", 2))
-        .expect("tool evidence after freeze");
-    append_active_epoch_history(&mut agent, active_epoch_history_with_complete_tool_group());
-    let warm = agent
-        .resolved_epoch_preview_for_test(ApiProtocol::Responses, &[], &tools)
-        .expect("first post-tool request remains warm");
-    assert!(matches!(
-        warm.transition,
-        ActiveEpochTransition::Append { added } if added > 0
-    ));
-}
-
-#[test]
 fn skill_tool_output_invalidates_warm_projection_and_cold_plan_includes_detached_material() {
     let tools = active_epoch_tools();
     let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
@@ -1286,20 +1241,6 @@ fn active_epoch_resets_at_lifecycle_boundaries() {
     ));
 }
 
-fn test_evidence(id: &str, sequence: u64) -> EvidenceRecord {
-    EvidenceRecord {
-        id: id.into(),
-        sequence,
-        timestamp_ms: 0,
-        evidence_kind: crate::evidence::EvidenceKind::Decision,
-        title: format!("evidence {id}"),
-        summary: format!("summary {id}"),
-        detail: None,
-        source: EvidenceSource::Transcript { sequence },
-        tags: Vec::new(),
-    }
-}
-
 fn runtime_frames_for_history(history: &[HistoryItem]) -> Vec<RuntimeFrame> {
     crate::protocol_frames::history_items_to_frames(history)
         .iter()
@@ -1315,70 +1256,6 @@ fn runtime_snapshot_for_history(
     let mut snapshot = RuntimeSnapshot::new(branch_id);
     snapshot.frames = runtime_frames_for_history(history);
     snapshot
-}
-
-#[test]
-fn evidence_has_one_runtime_snapshot_authority_and_failed_candidates_are_atomic() {
-    let mut agent = test_agent();
-    agent
-        .add_evidence(test_evidence("ev-live", 1))
-        .expect("add live evidence");
-    assert_eq!(agent.evidence(), agent.runtime_snapshot.evidence.as_slice());
-
-    let before = agent.runtime_snapshot.evidence.clone();
-    assert!(agent.add_evidence(test_evidence("ev-live", 2)).is_err());
-    assert_eq!(agent.runtime_snapshot.evidence, before);
-
-    assert!(
-        agent
-            .restore_evidence(vec![
-                test_evidence("ev-duplicate", 2),
-                test_evidence("ev-duplicate", 3)
-            ])
-            .is_err()
-    );
-    assert_eq!(agent.runtime_snapshot.evidence, before);
-
-    assert!(
-        agent
-            .restore_session_history(
-                Vec::new(),
-                vec![
-                    test_evidence("ev-duplicate", 2),
-                    test_evidence("ev-duplicate", 3),
-                ],
-                0,
-            )
-            .is_err()
-    );
-    assert_eq!(agent.runtime_snapshot.evidence, before);
-
-    let mut invalid_restore = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID);
-    invalid_restore.set_evidence(vec![
-        test_evidence("ev-duplicate", 2),
-        test_evidence("ev-duplicate", 3),
-    ]);
-    assert!(agent.restore_runtime_snapshot(invalid_restore).is_err());
-    assert_eq!(agent.runtime_snapshot.evidence, before);
-
-    let mut replacement = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID);
-    replacement.set_evidence(vec![test_evidence("ev-provider", 4)]);
-    agent.set_runtime_snapshot_provider(Arc::new(move || Ok(replacement.clone())));
-    agent
-        .replace_runtime_snapshot_from_provider()
-        .expect("replace provider snapshot");
-    assert_eq!(agent.evidence(), agent.runtime_snapshot.evidence.as_slice());
-    assert_eq!(agent.evidence()[0].id, "ev-provider");
-
-    let before = agent.runtime_snapshot.evidence.clone();
-    let mut invalid = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID);
-    invalid.set_evidence(vec![
-        test_evidence("ev-duplicate", 5),
-        test_evidence("ev-duplicate", 6),
-    ]);
-    agent.set_runtime_snapshot_provider(Arc::new(move || Ok(invalid.clone())));
-    assert!(agent.replace_runtime_snapshot_from_provider().is_err());
-    assert_eq!(agent.runtime_snapshot.evidence, before);
 }
 
 fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
@@ -1508,7 +1385,6 @@ fn test_execution_record(tool_name: &str, output: ToolResult) -> ToolExecutionRe
     ToolExecutionRecord {
         call_id: format!("call-{tool_name}"),
         tool_name: tool_name.into(),
-        arguments: Some(json!({})),
         permission_class: crate::permission::ToolPermissionClass::Read,
         status: ToolExecutionStatus::Executed,
         rejection: None,
@@ -1665,40 +1541,6 @@ impl ToolHandler for ReplayGuardTool {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(json!({"executed": true}))
     }
-}
-
-#[test]
-fn evidence_ids_remain_unique_after_restoring_older_evidence_snapshot() {
-    let mut agent = test_agent();
-    let first = agent
-        .remember_tool_evidence(&test_execution_record(
-            "fs__read",
-            ToolResult::ok("fs__read", json!({"content": "one"})),
-        ))
-        .expect("first evidence");
-    let older_snapshot = agent.runtime_snapshot.evidence.clone();
-
-    let second = agent
-        .remember_tool_evidence(&test_execution_record(
-            "fs__read",
-            ToolResult::ok("fs__read", json!({"content": "two"})),
-        ))
-        .expect("second evidence");
-    assert_ne!(first.id, second.id);
-
-    agent
-        .restore_session_history(agent.history_for_test(), older_snapshot, agent.next_turn_id)
-        .expect("restore older evidence snapshot");
-
-    let third = agent
-        .remember_tool_evidence(&test_execution_record(
-            "fs__read",
-            ToolResult::ok("fs__read", json!({"content": "three"})),
-        ))
-        .expect("third evidence after restore");
-
-    assert_ne!(first.id, third.id);
-    assert_ne!(second.id, third.id);
 }
 
 fn large_tool_output_json(field: &str) -> String {
@@ -1966,55 +1808,6 @@ fn capturing_delegate(
 }
 
 #[test]
-fn remembered_subagent_evidence_carries_parent_turn_provenance() {
-    let mut agent = test_agent();
-    agent.turn.turn_id = 42;
-    let record = ToolExecutionRecord {
-        call_id: "call-agent__explore".into(),
-        tool_name: "agent__explore".into(),
-        arguments: Some(json!({"task": "inspect"})),
-        permission_class: crate::permission::ToolPermissionClass::Preview,
-        status: ToolExecutionStatus::Executed,
-        rejection: None,
-        output: ToolResult::ok(
-            "agent__explore",
-            json!({
-                "run_id": "run-1",
-                "child_session_id": "child-1",
-                "status": "completed",
-                "summary": "done"
-            }),
-        ),
-        effects: ToolEffects {
-            kind: ToolEffectKind::Read,
-            primary_path: None,
-            edited_paths: vec![],
-            command: None,
-        },
-    };
-
-    let evidence = agent
-        .remember_tool_evidence(&record)
-        .expect("subagent evidence should be recorded");
-
-    match evidence.source {
-        EvidenceSource::Subagent {
-            run_id,
-            child_session_id,
-            parent_tool,
-            parent_turn_id,
-            ..
-        } => {
-            assert_eq!(run_id, "run-1");
-            assert_eq!(child_session_id, "child-1");
-            assert_eq!(parent_tool, "agent__explore");
-            assert_eq!(parent_turn_id.as_deref(), Some("turn-42"));
-        }
-        other => panic!("unexpected evidence source: {other:?}"),
-    }
-}
-
-#[test]
 fn model_switch_uses_new_metadata_for_next_request_build() {
     let mut agent = Agent::new("m1", 1, 1);
 
@@ -2053,7 +1846,6 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
         history: &history,
         protected_start_index: history.len().saturating_sub(1),
         tools: &[],
-        evidence: &[],
     })
     .expect("request builds");
     assert_eq!(b1.budget.context_window_tokens, 4096);
@@ -2068,7 +1860,6 @@ fn model_switch_uses_new_metadata_for_next_request_build() {
         history: &history,
         protected_start_index: history.len().saturating_sub(1),
         tools: &[],
-        evidence: &[],
     })
     .expect("request builds");
     assert!(b2.budget.context_window_tokens > b1.budget.context_window_tokens);
@@ -2192,7 +1983,7 @@ fn resume_clears_proc_local_identity_and_observation_state() {
     assert!(agent.has_set_logical_request_observation_for_test());
 
     agent
-        .restore_session_history(vec![HistoryItem::user("seeded")], Vec::new(), 4)
+        .restore_session_history(vec![HistoryItem::user("seeded")], 4)
         .expect("restore session history");
     assert!(agent.active_epoch.is_none(), "resume wipes active epoch");
     assert!(
@@ -2247,7 +2038,7 @@ fn restore_session_context_seeds_next_turn_id() {
     let mut agent = test_agent();
 
     agent
-        .restore_session_context(Vec::new(), Vec::new(), 7)
+        .restore_session_context(Vec::new(), 7)
         .expect("restore session context");
     agent.prepare_turn_prelude();
 
@@ -2258,7 +2049,7 @@ fn restore_session_context_seeds_next_turn_id() {
 fn candidate_session_usage_failure_leaves_live_agent_unchanged() {
     let mut agent = test_agent();
     agent
-        .restore_session_history(vec![HistoryItem::user("old session")], Vec::new(), 7)
+        .restore_session_history(vec![HistoryItem::user("old session")], 7)
         .expect("restore old session");
     agent.prepare_turn_prelude();
     let invalid_metadata = ModelRequestMetadata {
@@ -2331,17 +2122,6 @@ fn restore_runtime_snapshot_keeps_projected_runtime_state_authoritative() {
         .with_leaf_sequence(12)
         .with_current_turn_id(7);
     snapshot.frames = runtime_frames_for_history(&history);
-    snapshot.set_evidence(vec![EvidenceRecord {
-        id: "evidence-1".into(),
-        sequence: 1,
-        timestamp_ms: 1,
-        evidence_kind: crate::evidence::EvidenceKind::Decision,
-        title: "Restored evidence".into(),
-        summary: "restored evidence".into(),
-        detail: None,
-        source: EvidenceSource::Transcript { sequence: 1 },
-        tags: Vec::new(),
-    }]);
 
     agent
         .restore_runtime_snapshot(snapshot.clone())
@@ -2356,7 +2136,6 @@ fn restore_runtime_snapshot_keeps_projected_runtime_state_authoritative() {
         crate::protocol_frames::history_items_from_frames(&frames).as_slice()
     );
     assert_eq!(agent.runtime_snapshot_for_test(), &snapshot);
-    assert_eq!(agent.evidence(), snapshot.evidence.as_slice());
     agent.prepare_turn_prelude();
     assert_eq!(agent.current_turn_id(), 8);
 }
@@ -2379,7 +2158,6 @@ fn new_session_reset_discards_restored_runtime_metadata() {
 
     assert!(agent.history_for_test().is_empty());
     assert!(agent.protocol_frames_for_test().is_empty());
-    assert!(agent.evidence().is_empty());
     assert_eq!(
         agent.runtime_snapshot_for_test(),
         &RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID).with_latest_model("m1")
@@ -2690,7 +2468,7 @@ fn legacy_session_history_restore_clears_runtime_workflow_state() {
     agent.runtime_snapshot.workflow.auto_continue.enabled = true;
 
     agent
-        .restore_session_history(vec![HistoryItem::user("restored session")], Vec::new(), 4)
+        .restore_session_history(vec![HistoryItem::user("restored session")], 4)
         .expect("legacy history restore");
 
     assert!(agent.runtime_snapshot.workflow.is_empty());
@@ -2804,7 +2582,6 @@ base_url = "https://example.invalid/v1"
                 history: &history,
                 protected_start_index: 0,
                 tools: &[],
-                evidence: &[],
             })
             .unwrap();
             let input = crate::model_runtime::projection::model_request_from_prompt_plan(
@@ -3477,7 +3254,6 @@ mod integration_tests {
             .expect("append tool calls");
 
         let mut finished = Vec::new();
-        let mut evidence_count = 0;
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
             agent.execute_tool_calls_and_record(
@@ -3485,12 +3261,10 @@ mod integration_tests {
                 &mut |event| {
                     if let AgentEvent::ToolCallFinished { call_id, ok, .. } = event {
                         finished.push((call_id, ok));
-                    } else if matches!(event, AgentEvent::EvidenceRecorded(_)) {
-                        evidence_count += 1;
-                        if evidence_count == 2 {
-                            assert_eq!(finished.len(), 2);
-                            assert!(finished.contains(&("call-agent__fixer".into(), true)));
-                            assert!(finished.contains(&("call-agent__oracle".into(), false)));
+                        if finished.len() == 2
+                            && finished.contains(&("call-agent__fixer".into(), true))
+                            && finished.contains(&("call-agent__oracle".into(), false))
+                        {
                             completion_gate.notify_one();
                         }
                     }
@@ -3504,7 +3278,6 @@ mod integration_tests {
         .expect("batch executes");
 
         assert_eq!(max_active.load(Ordering::SeqCst), 3);
-        assert_eq!(evidence_count, 3);
         assert_eq!(
             *started.lock().expect("started lock"),
             vec!["explorer", "fixer", "oracle"]
@@ -3729,7 +3502,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn delegated_structured_subagent_results_are_recorded_as_evidence() {
+    async fn delegated_structured_subagent_results_keep_parent_task_prompt_bounds() {
         for (tool, name) in [("agent__fixer", "fixer"), ("agent__general", "general")] {
             let mut agent = test_agent();
             agent.prepare_turn_prelude();
@@ -3771,20 +3544,12 @@ mod integration_tests {
             agent
                 .append_assistant_tool_calls("", std::slice::from_ref(&call))
                 .expect("assistant tool calls should append");
-            let mut events = Vec::new();
             let mut approvals = 0usize;
             let record = agent
-                .execute_tool_call(
-                    &call,
-                    &mut |event| {
-                        events.push(event);
-                        std::future::ready(Ok(()))
-                    },
-                    &mut |_| {
-                        approvals += 1;
-                        std::future::ready(Ok(PermissionApproval::AllowOnce))
-                    },
-                )
+                .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                    approvals += 1;
+                    std::future::ready(Ok(PermissionApproval::AllowOnce))
+                })
                 .await
                 .expect("subagent tool execution should succeed");
             assert_eq!(approvals, 1);
@@ -3794,10 +3559,7 @@ mod integration_tests {
             );
             assert_eq!(record.effects.kind, ToolEffectKind::Write);
             agent
-                .record_tool_call_result(&call, record, &mut |event| {
-                    events.push(event);
-                    std::future::ready(Ok(()))
-                })
+                .record_tool_call_result(&call, record, &mut |_| std::future::ready(Ok(())))
                 .await
                 .expect("subagent tool result records");
 
@@ -3805,11 +3567,6 @@ mod integration_tests {
             assert!(prompt.contains("implement bounded fix"));
             assert!(!prompt.contains(crate::subagent::REPORT_PROMPT));
             assert!(!prompt.contains("委派约定"));
-            assert!(events.iter().any(|event| matches!(
-                event,
-                AgentEvent::EvidenceRecorded(record)
-                    if record.tags.iter().any(|tag| tag == "subagent_result")
-            )));
         }
     }
 
@@ -3841,7 +3598,6 @@ mod integration_tests {
         let wait_record = ToolExecutionRecord {
             call_id: "wait-dedupe-1".into(),
             tool_name: tool_names::TOOL_AGENT_WAIT.into(),
-            arguments: Some(json!({"run_id": "run-dedupe-1"})),
             permission_class: crate::permission::ToolPermissionClass::Preview,
             status: ToolExecutionStatus::Executed,
             rejection: None,
@@ -3855,9 +3611,6 @@ mod integration_tests {
         };
         agent.record_tool_effects(&wait_record);
         assert_eq!(agent.child_effect_counts_for_test(), (1, 1, 0));
-        let _ = agent
-            .remember_tool_evidence(&wait_record)
-            .expect("remember wait evidence");
 
         let summary = crate::subagent::SubagentRunSummary {
             run_id: "run-dedupe-1".into(),
@@ -3873,6 +3626,28 @@ mod integration_tests {
             .install_background_subagent_result(&summary)
             .expect("background result installs");
         assert_eq!(agent.child_effect_counts_for_test(), (1, 1, 0));
+
+        let mut delivered = result.clone();
+        delivered["run_id"] = "run-dedupe-2".into();
+        delivered["child_session_id"] = "child-dedupe-2".into();
+        delivered["structured_result"]["run_id"] = "run-dedupe-2".into();
+        delivered["structured_result"]["child_session_id"] = "child-dedupe-2".into();
+        let mut background = summary;
+        background.run_id = "run-dedupe-2".into();
+        background.child_session_id = "child-dedupe-2".into();
+        background.structured_result =
+            serde_json::from_value(delivered["structured_result"].clone())
+                .expect("structured result");
+        agent
+            .install_background_subagent_result(&background)
+            .expect("background result installs");
+        assert_eq!(agent.child_effect_counts_for_test(), (2, 2, 0));
+
+        let mut wait_again = wait_record;
+        wait_again.call_id = "wait-dedupe-2".into();
+        wait_again.output = ToolResult::ok("agent__wait", delivered);
+        agent.record_tool_effects(&wait_again);
+        assert_eq!(agent.child_effect_counts_for_test(), (2, 2, 0));
     }
 
     #[test]
@@ -5916,7 +5691,6 @@ mod integration_tests {
             Some(ToolExecutionRejection::InvalidJsonArguments)
         );
         assert!(!record.output.ok);
-        assert_eq!(record.arguments, None);
         assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
         assert!(matches!(
             events.as_slice(),

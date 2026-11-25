@@ -7,7 +7,6 @@ use crate::context_view::{
     ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewOperation,
     ContextViewProjection, ContextViewState, ProtectedReason,
 };
-use crate::evidence::{EvidenceKind, EvidenceSource};
 use crate::protocol_frames::history_items_from_frames;
 use crate::request_builder::HistoryToolCall;
 use crate::runtime_context::{FrameVisibility, RuntimeFrameId, RuntimeFrameKind, SourceSpan};
@@ -770,49 +769,6 @@ fn max_turn_id_is_global_across_restored_leaf_cuts() {
     .expect("root runtime snapshot before sibling turn");
     assert_eq!(runtime.max_turn_id, 7);
     assert_eq!(runtime.snapshot.current_turn_id, Some(1));
-}
-
-#[test]
-fn evidence_respects_leaf_cut() {
-    let records = vec![
-        record_at(
-            1,
-            TranscriptEvent::Evidence {
-                id: "ev-1".into(),
-                evidence_kind: EvidenceKind::Decision,
-                title: "one".into(),
-                summary: "visible".into(),
-                detail: None,
-                source: EvidenceSource::Transcript { sequence: 1 },
-                tags: vec![],
-            },
-        ),
-        record_at(
-            2,
-            TranscriptEvent::Evidence {
-                id: "ev-2".into(),
-                evidence_kind: EvidenceKind::Decision,
-                title: "two".into(),
-                summary: "hidden".into(),
-                detail: None,
-                source: EvidenceSource::Transcript { sequence: 2 },
-                tags: vec![],
-            },
-        ),
-    ];
-
-    let snapshot = build_session_context_snapshot(
-        "s".into(),
-        records,
-        SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: Some(1),
-        },
-    )
-    .expect("snapshot with evidence leaf");
-
-    assert_eq!(snapshot.evidence.len(), 1);
-    assert_eq!(snapshot.evidence[0].summary, "visible");
 }
 
 #[test]
@@ -2371,24 +2327,12 @@ fn checkpoint_and_compaction_preserve_active_frames_and_retire_closed_artifacts(
 }
 
 #[test]
-fn replay_derived_compaction_retires_context_and_evidence_without_persisted_spans() {
+fn replay_derived_compaction_retires_context_without_persisted_spans() {
     let records = vec![
         record_at(
             1,
             TranscriptEvent::UserMessage {
                 content: UserMessageContent::from("old request"),
-            },
-        ),
-        record_at(
-            2,
-            TranscriptEvent::Evidence {
-                id: "old-evidence".into(),
-                evidence_kind: EvidenceKind::Decision,
-                title: "old evidence".into(),
-                summary: "old evidence summary".into(),
-                detail: None,
-                source: EvidenceSource::Transcript { sequence: 1 },
-                tags: Vec::new(),
             },
         ),
         record_at(
@@ -2420,14 +2364,6 @@ fn replay_derived_compaction_retires_context_and_evidence_without_persisted_span
     )
     .expect("runtime projection");
 
-    assert!(runtime.snapshot.evidence.is_empty());
-    assert!(
-        !runtime
-            .snapshot
-            .prompt_contributors
-            .iter()
-            .any(|contributor| contributor.contributor_id == "evidence")
-    );
     assert!(runtime.snapshot.frames.iter().any(|frame| {
         frame.kind == RuntimeFrameKind::ContextBlock
             && frame.visibility == crate::runtime_context::FrameVisibility::Retired

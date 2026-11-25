@@ -1,5 +1,4 @@
 use crate::context_view::{ContextViewProjection, project_context_view_unvalidated};
-use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::analyze_history_items;
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::{
@@ -23,7 +22,6 @@ pub(super) struct RuntimeContextProjection {
     pub context_tree: crate::context_tree::ContextTreeState,
     pub context_view: ContextViewProjection,
     pub history_entries: Vec<HistoryProjectionEntry>,
-    pub retired_source_spans: Vec<SourceSpan>,
     pub active_context: ActiveContextMetadata,
 }
 
@@ -52,7 +50,6 @@ impl RuntimeContextProjection {
             context_tree,
             context_view,
             history_entries,
-            retired_source_spans,
             active_context,
         })
     }
@@ -81,29 +78,19 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
     }
 
     let context = RuntimeContextProjection::build(all_records, resolved)?;
-    let evidence = crate::evidence::restore_evidence_records(&resolved.records)?
-        .into_iter()
-        .filter(|record| !evidence_is_retired(record, &context.retired_source_spans))
-        .collect::<Vec<_>>();
 
     snapshot.active_context = context.active_context.clone();
     snapshot.set_context_tree(context.context_tree.clone());
     snapshot.set_context_view(context.context_view.clone());
-    snapshot.set_evidence(evidence.clone());
+
     snapshot.history_archive =
         crate::context_history::HistoryArchive::from_records(&resolved.records)?;
 
     let history_frame_ids = append_history_frames(&mut snapshot, &context.history_entries);
     append_context_frames(&mut snapshot, &context.context_view)?;
-    append_evidence_frames(&mut snapshot, &evidence)?;
     append_summary_artifact_frames(&mut snapshot, &context.context_view)?;
     append_child_sessions(&mut snapshot, child_sessions)?;
-    append_prompt_contributors(
-        &mut snapshot,
-        &context.context_view,
-        &evidence,
-        child_sessions,
-    )?;
+    append_prompt_contributors(&mut snapshot, &context.context_view, child_sessions)?;
     snapshot.compaction.compacted_frame_ids = snapshot
         .frames
         .iter()
@@ -119,23 +106,6 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
         snapshot.current_segment_id,
     )?);
     Ok(snapshot)
-}
-
-fn evidence_is_retired(record: &EvidenceRecord, retired_spans: &[SourceSpan]) -> bool {
-    if record.tags.iter().any(|tag| tag == "historian_fact") {
-        // Fact lifetime is governed by explicit history revisions, not raw-tail retirement.
-        return false;
-    }
-    let source_sequence = match &record.source {
-        crate::evidence::EvidenceSource::Transcript { sequence } => Some(*sequence),
-        _ => None,
-    };
-    retired_spans.iter().any(|span| {
-        span.start_sequence <= record.sequence && record.sequence <= span.end_sequence
-            || source_sequence.is_some_and(|sequence| {
-                span.start_sequence <= sequence && sequence <= span.end_sequence
-            })
-    })
 }
 
 pub(super) fn runtime_projection_records(
@@ -367,36 +337,6 @@ fn append_context_frames(
     Ok(())
 }
 
-fn append_evidence_frames(
-    snapshot: &mut RuntimeSnapshot,
-    evidence: &[EvidenceRecord],
-) -> anyhow::Result<()> {
-    for (ordinal, record) in evidence.iter().enumerate() {
-        let source_span = Some(SourceSpan::new(record.sequence, record.sequence)?);
-        let provenance = runtime_provenance(
-            RuntimeSource::Transcript,
-            source_span,
-            Some(record.id.clone()),
-        );
-        snapshot.push_frame(
-            RuntimeFrame::new(
-                RuntimeFrameKind::Metadata,
-                FrameVisibility::Active,
-                provenance,
-                RuntimeFrameIdSeed {
-                    frame_kind: RuntimeFrameKind::Metadata,
-                    source: RuntimeSource::Transcript,
-                    ordinal: ordinal as u32,
-                    stable_key: &record.id,
-                    source_span,
-                },
-            )
-            .with_summary(format!("evidence {}: {}", record.id, record.summary)),
-        );
-    }
-    Ok(())
-}
-
 fn append_summary_artifact_frames(
     snapshot: &mut RuntimeSnapshot,
     context_view: &ContextViewProjection,
@@ -473,7 +413,6 @@ fn append_child_sessions(
 fn append_prompt_contributors(
     snapshot: &mut RuntimeSnapshot,
     context_view: &ContextViewProjection,
-    evidence: &[EvidenceRecord],
     child_sessions: &[ChildSessionSummary],
 ) -> anyhow::Result<()> {
     if !context_view.provider_active_blocks().is_empty() {
@@ -545,32 +484,6 @@ fn append_prompt_contributors(
                 source_frame_ids: Vec::new(),
             });
         }
-    }
-    if !evidence.is_empty() {
-        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
-            contributor_id: "evidence".into(),
-            kind: PromptContributorKind::Evidence,
-            label: Some("Evidence".into()),
-            provenance: RuntimeFrameProvenance::new(RuntimeSource::Transcript),
-            // Historical evidence may co-retire only when compaction emits a
-            // deterministic coverage item for its exact source span.
-            retains_raw_sources: false,
-            frame_ids: snapshot
-                .frames
-                .iter()
-                .filter(|frame| {
-                    frame.kind == RuntimeFrameKind::Metadata
-                        && frame.provenance.source == RuntimeSource::Transcript
-                        && frame
-                            .provenance
-                            .source_id
-                            .as_deref()
-                            .is_some_and(|id| evidence.iter().any(|record| record.id == id))
-                })
-                .map(|frame| frame.id)
-                .collect(),
-            source_frame_ids: Vec::new(),
-        });
     }
     if !context_view.summary_artifacts.is_empty() {
         snapshot.push_prompt_contributor(PromptContributorPlaceholder {
@@ -761,6 +674,6 @@ pub(super) fn snapshot_for_context_view_for_test(
     let mut snapshot = RuntimeSnapshot::new("main");
     snapshot.active_context.visible_block_ids = context_view.provider_visible_block_ids();
     append_context_frames(&mut snapshot, context_view).expect("context frames");
-    append_prompt_contributors(&mut snapshot, context_view, &[], &[]).expect("prompt contributors");
+    append_prompt_contributors(&mut snapshot, context_view, &[]).expect("prompt contributors");
     snapshot
 }

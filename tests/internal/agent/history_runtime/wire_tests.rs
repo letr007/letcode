@@ -267,7 +267,6 @@ max_output_tokens=128
                     history: &history,
                     protected_start_index: 2,
                     tools: &[],
-                    evidence: &[],
                 },
             )
             .unwrap();

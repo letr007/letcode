@@ -57,10 +57,6 @@ pub fn persist_agent_event(
             recorder.record_llm_request_telemetry(telemetry.clone())?;
             JournalEffect::persisted(ContextProjection::None)
         }
-        AgentEvent::EvidenceRecorded(evidence) => {
-            recorder.record_evidence_record(evidence.clone())?;
-            JournalEffect::persisted(ContextProjection::Advance)
-        }
         AgentEvent::ReasoningDone { item_id, text } => {
             recorder.record_reasoning_message(item_id, text.clone())?;
             JournalEffect::persisted(ContextProjection::Advance)

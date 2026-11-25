@@ -18,10 +18,6 @@ use crate::context_tree::{
     ContextBlockRef, ContextNodeId, ContextNodeStatus, ContextSourceRef, ContextTreeOp,
 };
 #[cfg(test)]
-use crate::evidence::{
-    EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, restore_evidence_records,
-};
-#[cfg(test)]
 use crate::request_builder::{HistoryItem, HistoryToolCall};
 #[cfg(test)]
 use crate::tool::ToolResult;
@@ -166,8 +162,8 @@ pub(crate) use restore::{
 #[cfg(test)]
 pub(crate) use restore::{
     restore_compacted_conversation_messages, restore_conversation_messages, restore_job_board,
-    restore_max_turn_id, restore_runtime_snapshot, restore_session_evidence,
-    restore_session_history, restore_session_protocol_frames,
+    restore_max_turn_id, restore_runtime_snapshot, restore_session_history,
+    restore_session_protocol_frames,
 };
 pub use restore::{
     restore_latest_auto_continue_state, restore_latest_fake_client, restore_latest_model,
@@ -496,7 +492,6 @@ impl TranscriptEvent {
                 | Self::TodoSnapshot { .. }
                 | Self::AutoContinueChanged { .. }
                 | Self::Error { .. }
-                | Self::Evidence { .. }
                 | Self::ContextCompaction(..)
                 | Self::ContextExperimentReturned { .. }
         )

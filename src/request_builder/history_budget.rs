@@ -3,24 +3,21 @@ use anyhow::Result;
 use crate::protocol_frames::{ProtocolTranscript, canonical_compaction_boundary_with_transcript};
 
 use super::{
-    BudgetReport, EvidenceBudgetReport, HistoryItem, ModelRequestMetadata, PromptMessage,
-    ProtocolFrame, ToolSpec, effective_input_budget_tokens_for_tool_tokens,
-    estimate_history_item_tokens, estimate_prelude_tokens, estimate_tools_tokens,
-    history_items_from_frames, validate_history_items_complete,
+    BudgetReport, ModelRequestMetadata, PromptMessage, ProtocolFrame, ToolSpec,
+    effective_input_budget_tokens_for_tool_tokens, estimate_history_item_tokens,
+    estimate_prelude_tokens, estimate_tools_tokens, history_items_from_frames,
+    validate_history_items_complete,
 };
 
 pub(super) fn ensure_protected_context_within_budget(
     input_budget: u64,
     prelude_tokens: u64,
     protected_tokens: u64,
-    evidence_tokens: u64,
 ) -> Result<()> {
-    let fixed_tokens = prelude_tokens
-        .saturating_add(protected_tokens)
-        .saturating_add(evidence_tokens);
+    let fixed_tokens = prelude_tokens.saturating_add(protected_tokens);
     if fixed_tokens > input_budget {
         anyhow::bail!(
-            "protected current context exceeds input budget: protected/current context tokens ({fixed_tokens}) exceed budget ({input_budget}); prelude={prelude_tokens}, protected={protected_tokens}, evidence={evidence_tokens}"
+            "protected current context exceeds input budget: protected/current context tokens ({fixed_tokens}) exceed budget ({input_budget}); prelude={prelude_tokens}, protected={protected_tokens}"
         );
     }
     Ok(())
@@ -60,7 +57,6 @@ pub(super) fn retain_history(
     protected_tokens: u64,
     model: ModelRequestMetadata,
     tools: &[ToolSpec],
-    evidence_budget: EvidenceBudgetReport,
     required_fallback_tokens: u64,
 ) -> (Vec<ProtocolFrame>, BudgetReport) {
     let history_len = history.len();
@@ -81,7 +77,6 @@ pub(super) fn retain_history(
 
     let fixed_tokens = prelude_tokens
         .saturating_add(protected_tokens)
-        .saturating_add(evidence_budget.estimated_evidence_tokens)
         .saturating_add(required_fallback_tokens);
 
     if fixed_tokens < input_budget {
@@ -106,7 +101,6 @@ pub(super) fn retain_history(
     let dropped_history_items = history_len.saturating_sub(retained_history_items);
     let retained_tokens = estimate_protocol_frame_tokens(&retained);
     let estimated_request_tokens = prelude_tokens
-        .saturating_add(evidence_budget.estimated_evidence_tokens)
         .saturating_add(required_fallback_tokens)
         .saturating_add(retained_tokens)
         .saturating_add(tools_tokens);
@@ -124,13 +118,10 @@ pub(super) fn retain_history(
             estimated_unaddressable_protected_tokens: 0,
             estimated_retained_history_tokens: retained_tokens,
             estimated_tools_tokens: tools_tokens,
-            estimated_evidence_tokens: evidence_budget.estimated_evidence_tokens,
             estimated_required_fallback_tokens: required_fallback_tokens,
             original_history_items: history_len,
             retained_history_items,
             dropped_history_items,
-            selected_evidence_items: evidence_budget.selected_evidence_items,
-            dropped_evidence_items: evidence_budget.dropped_evidence_items,
             truncated: dropped_history_items > 0,
             plan_total_prompt_tokens: 0,
             plan_stable_prompt_tokens: 0,
@@ -179,20 +170,7 @@ fn estimate_protocol_frame_tokens(frames: &[ProtocolFrame]) -> u64 {
         .sum()
 }
 
-pub(super) fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> String {
-    latest_user_message(&history[protected_start_index.min(history.len())..])
-        .or_else(|| latest_user_message(history))
-        .unwrap_or_default()
-}
-
-fn latest_user_message(history: &[HistoryItem]) -> Option<String> {
-    history.iter().rev().find_map(|item| match item {
-        HistoryItem::UserMessage { content } => Some(content.text.clone()),
-        _ => None,
-    })
-}
-
-pub(super) fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
+pub(super) fn fact_budget_tokens(context_window_tokens: u64) -> u64 {
     context_window_tokens
         .saturating_mul(15)
         .saturating_div(100)

@@ -154,8 +154,7 @@ pub async fn run_child_prompt(
                             | AgentEvent::FastModeChanged { .. }
                             | AgentEvent::LlmRetryScheduled(_)
                             | AgentEvent::LlmRetryStarted(_)
-                            | AgentEvent::TurnStarted(_)
-                            | AgentEvent::EvidenceRecorded(_) => {}
+                            | AgentEvent::TurnStarted(_) => {}
                             AgentEvent::ModelStreamIssue { .. }
                             | AgentEvent::AssistantMessage { .. }
                             | AgentEvent::AssistantToolCallBatch { .. }

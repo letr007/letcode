@@ -290,15 +290,6 @@ pub(crate) fn subagent_tool_name_for_agent_name(agent_name: &str) -> Option<&'st
     subagent_catalog_entry_by_agent_name(agent_name).map(|entry| entry.tool_name)
 }
 
-/// Parent-tool label for subagent evidence. Delegation experts map to `agent__*`;
-/// system experts (e.g. reviewer) use `system__{name}` because they have no tool.
-pub(crate) fn subagent_evidence_parent_tool(agent_name: &str) -> Option<String> {
-    if let Some(tool) = subagent_tool_name_for_agent_name(agent_name) {
-        return Some(tool.to_string());
-    }
-    AgentTemplate::from_name(agent_name).map(|template| format!("system__{}", template.name))
-}
-
 pub(crate) fn subagent_catalog_entry_by_tool_name(
     tool_name: &str,
 ) -> Option<&'static SubagentCatalogEntry> {

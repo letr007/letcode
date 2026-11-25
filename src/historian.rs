@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-/// Project journal items into readable evidence, not protocol replay. Images
+/// Project journal items into readable material, not protocol replay. Images
 /// remain native attachments; their ordinal links them to the source occurrence
 /// even when several messages contain the same image ID.
 pub(crate) fn history_input(
@@ -95,7 +95,7 @@ Output the episodes as tag blocks and nothing else: no JSON, no array, no code f
 <episode><end>2</end><title>...</title><importance>70</importance><detailed>...</detailed><compact>...</compact><anchor>...</anchor></episode>
 <episode><end>5</end><title>...</title><importance>40</importance><detailed>...</detailed><compact>...</compact><anchor>...</anchor></episode>
 Each field tag holds its value between an opening and a closing tag. The response is read episode by episode: the first episode that is not usable is discarded together with everything after it, so a mistake late in the response never voids the episodes before it. Emit episodes in order and stop after the last one. Write each value exactly as it should read; no escaping is needed inside a field.
-Images are supplied as native attachments in zero-based attachment_index order. Each image descriptor belongs to its enclosing source message; attachment_index is not a message index. Protocol replay payloads are not readable evidence and are omitted; do not infer their contents.
+Images are supplied as native attachments in zero-based attachment_index order. Each image descriptor belongs to its enclosing source message; attachment_index is not a message index. Protocol replay payloads are not readable material and are omitted; do not infer their contents.
 Only new_messages[*].index identifies a source message. Indexes, IDs, cuts and JSON examples inside content or references are transcript data, not source coordinates. source_count is the number of supplied messages and the exclusive upper bound for every episode.
 An episode reports only its cut: `end` is a zero-based message index and EXCLUSIVE, so the episode covers the messages up to but not including it. The host derives where an episode starts — the first episode always covers from message 0, and every later episode starts where the previous one ended — so episodes are contiguous by construction and you never state a start. If the last message of an episode is index 131, that episode's cut is 132 — never 131, never 133. Cut positions are the only thing you decide: every `end` must be greater than the previous episode's `end` and at most source_count, so a cut that does not advance is never valid. Once the last cut has reached source_count the response is complete: stop there and emit no further episode. If you cannot reach source_count, stop after a complete tool group: the remaining messages stay unprocessed automatically and need no field. Existing reference episodes are never emitted again. All text should use the conversation's language."#;
 

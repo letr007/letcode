@@ -2,7 +2,6 @@
 
 use crate::context_tree::{ContextNodeId, ContextTreeState};
 use crate::context_view::ContextViewProjection;
-use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
 use crate::request_builder::HistoryItem;
 use crate::workflow_state::WorkflowState;
@@ -308,7 +307,6 @@ pub(crate) enum PromptContributorKind {
     ContextMaterial,
     ContextIndex,
     TranscriptFrame,
-    Evidence,
     CurrentTurn,
     Other,
 }
@@ -365,8 +363,6 @@ pub(crate) struct RuntimeSnapshot {
     pub frames: Vec<RuntimeFrame>,
     pub context_tree: ContextTreeState,
     pub context_view: ContextViewProjection,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<EvidenceRecord>,
     #[serde(default)]
     pub history_archive: crate::context_history::HistoryArchive,
     pub active_context: ActiveContextMetadata,
@@ -391,7 +387,6 @@ impl RuntimeSnapshot {
             frames: Vec::new(),
             context_tree: ContextTreeState::with_default_root(),
             context_view: ContextViewProjection::default(),
-            evidence: Vec::new(),
             history_archive: crate::context_history::HistoryArchive::default(),
             active_context: ActiveContextMetadata::new(branch_id),
             compaction: CompactionState {
@@ -455,10 +450,6 @@ impl RuntimeSnapshot {
             .iter()
             .copied()
             .any(|retired| retired.overlaps(span))
-    }
-
-    pub(crate) fn set_evidence(&mut self, evidence: Vec<EvidenceRecord>) {
-        self.evidence = evidence;
     }
 
     pub(crate) fn push_prompt_contributor(

@@ -4,11 +4,10 @@ use crate::agent::{
     LlmRequestTelemetry, LlmRequestTelemetryPhase, ProviderUsageCompleteness, TokenUsageEstimate,
 };
 use crate::config::ApiProtocol;
-use crate::evidence::EvidenceDraft;
 use crate::tool::ToolResult;
 use crate::transcript::{
     TranscriptEvent, TranscriptRecorder, read_records, restore_runtime_snapshot,
-    restore_session_evidence, restore_session_history,
+    restore_session_history,
 };
 use serde_json::json;
 
@@ -46,15 +45,10 @@ fn telemetry(
         estimated_unaddressable_protected_tokens: 10,
         estimated_retained_history_tokens: 200,
         estimated_tools_tokens: 100,
-        estimated_evidence_tokens: 50,
         estimated_required_fallback_tokens: 20,
         original_history_items: 4,
         retained_history_items: 3,
         dropped_history_items: 1,
-        selected_evidence_items: 1,
-        dropped_evidence_items: 0,
-        selected_evidence_ids: vec!["evidence-1".into()],
-        evidence_fingerprint: "fte-v1-test".into(),
         truncated: true,
         prompt_segment_count: 4,
         prompt_contributor_count: 3,

@@ -370,8 +370,7 @@ where
                     .budget
                     .input_budget_tokens
                     .saturating_sub(next.build.budget.estimated_prelude_tokens)
-                    .saturating_sub(next.build.budget.estimated_protected_tokens)
-                    .saturating_sub(next.build.budget.estimated_evidence_tokens),
+                    .saturating_sub(next.build.budget.estimated_protected_tokens),
             );
             if !progressed {
                 on_event(AgentEvent::ContextCompactionNoProgress(

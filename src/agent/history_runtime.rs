@@ -107,15 +107,10 @@ pub(super) fn work(
     let mut facts = Vec::new();
     let mut fact_tokens = 0;
     let external_fact_ids = Vec::new();
-    for evidence in snapshot
-        .evidence
-        .iter()
-        .rev()
-        .filter(|e| e.tags.iter().any(|t| t == "historian_fact"))
-    {
-        let item = serde_json::json!({"id":evidence.id.strip_prefix("fact:").unwrap_or(&evidence.id),"text":evidence.summary});
+    for fact in snapshot.history_archive.facts_recent_first() {
+        let item = serde_json::json!({"id":fact.id,"text":fact.text});
         let cost = (item.to_string().len() as u64).div_ceil(3);
-        if fact_tokens + cost <= crate::request_builder::evidence_budget_tokens(budget) {
+        if fact_tokens + cost <= crate::request_builder::fact_budget_tokens(budget) {
             facts.push(item);
             fact_tokens += cost;
         }
@@ -309,7 +304,7 @@ fn pending_application(agent: &Agent, hard: bool) -> Result<Option<HistoryApplic
         for id in archive.effective_fact_ids(&publication_ids) {
             let cost = (archive.render_facts(std::slice::from_ref(&id)).len() as u64).div_ceil(3);
             if fact_cost + cost
-                <= crate::request_builder::evidence_budget_tokens(input_budget).min(history_budget)
+                <= crate::request_builder::fact_budget_tokens(input_budget).min(history_budget)
             {
                 fact_cost += cost;
                 baseline_fact_ids.push(id);
