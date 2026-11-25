@@ -316,6 +316,39 @@ pub fn render_tool_card_document(
             translator,
         );
     }
+    if !matches!(
+        tool.status,
+        ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+    ) {
+        let diff = match tool.name.as_str() {
+            "fs__write" => Some(render_write_diff_document(
+                tool,
+                theme,
+                width,
+                expanded_output,
+            )),
+            "fs__append" => Some(render_append_diff_document(
+                tool,
+                theme,
+                width,
+                expanded_output,
+            )),
+            "edit__apply_patch" => Some(render_edit_diff_document(
+                tool,
+                theme,
+                width,
+                expanded_output,
+            )),
+            _ => None,
+        };
+        if let Some(mut diff) = diff
+            && !diff.lines.is_empty()
+        {
+            diff.finish();
+            debug_assert!(diff.validate());
+            return diff;
+        }
+    }
     let lines = if is_subagent_tool(&tool.name) || tool.name == crate::tool_names::TOOL_AGENT_WAIT {
         render_subagent_lines(tool, theme, width, frame, expanded_output, translator)
     } else {
@@ -591,10 +624,8 @@ fn render_tool_body_lines(
                 Vec::new()
             }
         }
-        "fs__write" => render_write_diff_lines(tool, theme, width, expanded_output),
-        "fs__append" => render_append_diff_lines(tool, theme, width, expanded_output),
+        "fs__write" | "fs__append" | "edit__apply_patch" => Vec::new(),
         "shell__exec" => render_shell_output_lines(tool, theme, width, frame, expanded_output),
-        "edit__apply_patch" => render_edit_diff_lines(tool, theme, width, expanded_output),
         _ => {
             if tool.status == ToolExecutionStatus::Failed {
                 render_generic_output_lines(tool, theme, width, expanded_output)

@@ -1,26 +1,55 @@
-//! Diff-style tool card rendering (write/append/edit/patch).
-
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
+use similar::{ChangeTag, TextDiff};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::semantic_spans::*;
 use crate::tui::{
-    measure::{display_width, wrap_text_to_width},
+    measure::display_width,
     theme::Theme,
     timeline::ToolView,
-    transcript_render::{Break, SemanticLine, SemanticSpan},
+    transcript_render::{Break, CopyMode, Document, Line, SourceRange, Span},
 };
 
-pub(super) const DIFF_CARD_HEADER_ARROW: &str = "←";
+const DIFF_CARD_HEADER_ARROW: &str = "←";
 const DIFF_EXPAND_HINT: &str = "… click to expand for details";
+pub(super) const DIFF_SIDE_BY_SIDE_SEPARATOR: &str = " │ ";
+const DIFF_SIDE_BY_SIDE_MIN_PANEL_WIDTH: usize = 20;
+const DIFF_TAB_SIZE: usize = 4;
 
-pub(super) fn render_write_diff_lines(
+struct DiffLine {
+    kind: ChangeTag,
+    text: String,
+    old_number: Option<usize>,
+    new_number: Option<usize>,
+}
+
+pub(super) fn render_write_diff_document(
     tool: &ToolView,
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<SemanticLine<Style>> {
+) -> Document<Style> {
+    render_content_document(tool, "Write", theme, width, expanded_output)
+}
+
+pub(super) fn render_append_diff_document(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    expanded_output: bool,
+) -> Document<Style> {
+    render_content_document(tool, "Append", theme, width, expanded_output)
+}
+
+fn render_content_document(
+    tool: &ToolView,
+    label: &str,
+    theme: Theme,
+    width: usize,
+    expanded_output: bool,
+) -> Document<Style> {
     let Some(args) = tool_arguments(tool) else {
-        return Vec::new();
+        return Document::default();
     };
     let path = args
         .get("path")
@@ -30,668 +59,468 @@ pub(super) fn render_write_diff_lines(
         .get("content")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-
-    let mut diff = String::new();
-    if content.is_empty() {
-        diff.push_str("+\n");
+    let lines = if content.is_empty() {
+        vec![""]
     } else {
-        for line in content.lines() {
-            diff.push('+');
-            diff.push_str(line);
-            diff.push('\n');
-        }
-    }
-
-    render_diff_block(
-        diff_card_header_title("Write", &[path.to_string()]),
-        &diff,
-        None,
-        theme,
-        width,
-        expanded_output,
-    )
-}
-
-pub(super) fn render_append_diff_lines(
-    tool: &ToolView,
-    theme: Theme,
-    width: usize,
-    expanded_output: bool,
-) -> Vec<SemanticLine<Style>> {
-    let Some(args) = tool_arguments(tool) else {
-        return Vec::new();
+        content.lines().collect()
     };
-    let path = args
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("file");
-    let content = args
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-
-    let mut diff = String::new();
-    if content.is_empty() {
-        diff.push_str("+\n");
-    } else {
-        for line in content.lines() {
-            diff.push('+');
-            diff.push_str(line);
-            diff.push('\n');
-        }
-    }
-
-    render_diff_block(
-        diff_card_header_title("Append", &[path.to_string()]),
-        &diff,
-        None,
+    let body = lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| DiffLine {
+            kind: ChangeTag::Insert,
+            text: text.to_string(),
+            old_number: None,
+            new_number: Some(index + 1),
+        })
+        .collect();
+    render_diff_document(
+        &format!("{label} {path}"),
+        &[body],
+        false,
         theme,
         width,
         expanded_output,
     )
 }
 
-pub(super) fn render_edit_diff_lines(
+pub(super) fn render_edit_diff_document(
     tool: &ToolView,
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<SemanticLine<Style>> {
+) -> Document<Style> {
     let Some(args) = tool_arguments(tool) else {
-        return Vec::new();
+        return Document::default();
     };
     let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) else {
-        return Vec::new();
+        return Document::default();
     };
-
-    let mut file_diffs = Vec::<(String, String)>::new();
+    let mut files = Vec::<(String, Vec<Vec<DiffLine>>)>::new();
     for edit in edits {
         let path = edit
             .get("path")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("file");
-        let find = edit
+        let old = edit
             .get("find")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let replace = edit
+        let new = edit
             .get("replace")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-
-        if find.is_empty() && replace.is_empty() {
+        if old.is_empty() && new.is_empty() {
             continue;
         }
-
-        let diff = match file_diffs.iter_mut().find(|(file, _)| file == path) {
-            Some((_, diff)) => diff,
-            None => {
-                file_diffs.push((path.to_string(), String::new()));
-                &mut file_diffs.last_mut().expect("just pushed file diff").1
-            }
-        };
-        for line in find.lines() {
-            diff.push('-');
-            diff.push_str(&terminal_safe_text(line));
-            diff.push('\n');
-        }
-        for line in replace.lines() {
-            diff.push('+');
-            diff.push_str(&terminal_safe_text(line));
-            diff.push('\n');
+        let diff = TextDiff::from_lines(old, new);
+        let lines = diff
+            .iter_all_changes()
+            .map(|change| DiffLine {
+                kind: change.tag(),
+                text: change.value().lines().next().unwrap_or("").to_string(),
+                old_number: change.old_index().map(|index| index + 1),
+                new_number: change.new_index().map(|index| index + 1),
+            })
+            .collect();
+        match files.iter_mut().find(|(file, _)| file == path) {
+            Some((_, groups)) => groups.push(lines),
+            None => files.push((path.to_string(), vec![lines])),
         }
     }
-
-    file_diffs
-        .into_iter()
-        .flat_map(|(path, diff)| {
-            render_diff_block(
-                diff_card_header_title("Patch", &[path]),
-                &diff,
-                None,
-                theme,
-                width,
-                expanded_output,
-            )
-        })
-        .collect()
+    let mut document = Document::default();
+    for (path, groups) in files {
+        document.append(render_diff_document(
+            &format!("Patch {path}"),
+            &groups,
+            true,
+            theme,
+            width,
+            expanded_output,
+        ));
+    }
+    document
 }
 
-pub(super) fn render_diff_block(
-    title: String,
-    diff: &str,
-    truncated: Option<&serde_json::Value>,
+fn render_diff_document(
+    title: &str,
+    groups: &[Vec<DiffLine>],
+    compare: bool,
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<SemanticLine<Style>> {
+) -> Document<Style> {
+    let mut document = Document::default();
     if width == 0 {
-        return Vec::new();
+        return document;
     }
-
-    // Title carries user-controlled paths/labels; keep it display-safe too.
-    let title = terminal_safe_text(&title);
-    let mut lines = Vec::new();
-    let header = if truncated
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        format!("{title} · truncated")
+    let fill = Style::default().bg(theme.card_bg());
+    let meta = Style::default().fg(theme.muted_text).bg(theme.card_bg());
+    document.push_semantic_line(render_card_line(&[], fill, theme, width));
+    document.push_semantic_line(render_card_line(
+        &[(
+            format!(" {DIFF_CARD_HEADER_ARROW} {}", terminal_safe_text(title)),
+            meta,
+        )],
+        fill,
+        theme,
+        width,
+    ));
+    document.push_semantic_line(render_card_line(&[], fill, theme, width));
+    let content_width = width.saturating_sub(display_width(TOOL_GUIDE_GLYPH) + 2);
+    let side_by_side = compare
+        && content_width
+            >= DIFF_SIDE_BY_SIDE_MIN_PANEL_WIDTH * 2 + display_width(DIFF_SIDE_BY_SIDE_SEPARATOR);
+    let total = groups.iter().map(Vec::len).sum::<usize>();
+    let mut remaining = if expanded_output {
+        total
     } else {
-        title
+        max_body_lines()
     };
-    lines.push(render_diff_card_spacer_line(theme, width));
-    lines.push(render_diff_card_header_line(&header, theme, width));
-    lines.push(render_diff_card_spacer_line(theme, width));
-
-    let mut body = diff
-        .lines()
-        .filter(|line| !is_diff_file_header_line(line))
-        .take(if expanded_output {
-            usize::MAX
+    let number_width = groups
+        .iter()
+        .flatten()
+        .flat_map(|line| [line.old_number, line.new_number])
+        .flatten()
+        .max()
+        .unwrap_or(1)
+        .to_string()
+        .len()
+        .max(3);
+    for group in groups {
+        let body = &group[..group.len().min(remaining)];
+        remaining = remaining.saturating_sub(body.len());
+        if side_by_side {
+            render_comparison(&mut document, body, number_width, theme, width);
         } else {
-            max_body_lines().saturating_add(1)
-        })
-        .collect::<Vec<_>>();
-    if !expanded_output && body.len() > max_body_lines() {
-        body.pop();
-        body.push(DIFF_EXPAND_HINT);
-    }
-
-    if diff_uses_side_by_side_layout(width)
-        && body.iter().any(|line| {
-            (line.starts_with('+') || line.starts_with('-')) && !is_diff_file_header_line(line)
-        })
-    {
-        lines.extend(render_side_by_side_diff_body(&body, theme, width));
-    } else {
-        let mut state = DiffLineNumbers::default();
-        for line in body {
-            let (old_no, new_no) = state.next(line);
-            lines.extend(render_diff_card_body_line(
-                old_no,
-                new_no,
-                line,
-                diff_line_style(line, theme),
-                theme,
-                width,
-            ));
+            for line in body {
+                let rows = render_diff_side(
+                    &mut document,
+                    Some(line),
+                    false,
+                    content_width,
+                    number_width,
+                    theme,
+                );
+                push_diff_rows(
+                    &mut document,
+                    rows,
+                    if line.text.is_empty() {
+                        Break::SoftWrap
+                    } else {
+                        Break::HardBreak
+                    },
+                    theme,
+                    width,
+                );
+            }
         }
     }
-    lines.push(render_diff_card_spacer_line(theme, width));
-    lines
+    if !expanded_output && total > max_body_lines() {
+        document.push_semantic_line(render_card_line(
+            &[(DIFF_EXPAND_HINT.to_string(), meta)],
+            fill,
+            theme,
+            width,
+        ));
+    }
+    document.push_semantic_line(render_card_line(&[], fill, theme, width));
+    document.finish();
+    document
 }
 
-fn semantic_width(spans: &[SemanticSpan<Style>]) -> usize {
-    spans.iter().map(|span| display_width(&span.text)).sum()
-}
-
-fn wrap_body_chunks(span: &SemanticSpan<Style>, body_width: usize) -> Vec<SemanticSpan<Style>> {
-    wrap_text_to_width(&span.text, body_width.max(1))
-        .into_iter()
-        .map(|chunk| {
-            if span.copy {
-                SemanticSpan::source_with_mode(
-                    chunk,
-                    span.style,
-                    span.copy_mode,
-                    span.copy_join,
-                    span.interaction.clone(),
-                )
-            } else {
-                SemanticSpan::decoration(chunk, span.style)
-            }
-        })
-        .collect()
-}
-
-pub(super) const DIFF_SIDE_BY_SIDE_SEPARATOR: &str = " │ ";
-
-pub(super) const DIFF_SIDE_BY_SIDE_MIN_PANEL_WIDTH: usize = 20;
-
-pub(super) fn diff_uses_side_by_side_layout(width: usize) -> bool {
-    let content_width = shell_card_content_width(width);
-    content_width
-        >= DIFF_SIDE_BY_SIDE_MIN_PANEL_WIDTH * 2 + display_width(DIFF_SIDE_BY_SIDE_SEPARATOR)
-}
-
-pub(super) fn render_side_by_side_diff_body(
-    body: &[&str],
+fn render_comparison(
+    document: &mut Document<Style>,
+    body: &[DiffLine],
+    number_width: usize,
     theme: Theme,
     width: usize,
-) -> Vec<SemanticLine<Style>> {
-    let content_width = shell_card_content_width(width);
-    let panel_width = content_width.saturating_sub(display_width(DIFF_SIDE_BY_SIDE_SEPARATOR)) / 2;
-    let mut lines = Vec::new();
-    let mut state = DiffLineNumbers::default();
+) {
     let mut index = 0;
-
     while index < body.len() {
-        let line = body[index];
-        if line.starts_with('-') && !is_diff_file_header_line(line) {
-            let mut removed = Vec::new();
-            while index < body.len()
-                && body[index].starts_with('-')
-                && !is_diff_file_header_line(body[index])
-            {
-                let (old_no, _) = state.next(body[index]);
-                removed.push((old_no, body[index]));
-                index += 1;
-            }
-
-            let mut added = Vec::new();
-            while index < body.len()
-                && body[index].starts_with('+')
-                && !is_diff_file_header_line(body[index])
-            {
-                let (_, new_no) = state.next(body[index]);
-                added.push((new_no, body[index]));
-                index += 1;
-            }
-
-            for row in 0..removed.len().max(added.len()) {
-                lines.extend(render_side_by_side_diff_line(
-                    removed.get(row).copied(),
-                    added.get(row).copied(),
-                    panel_width,
-                    theme,
-                    width,
-                ));
-            }
-            continue;
-        }
-
-        if line.starts_with('+') && !is_diff_file_header_line(line) {
-            let mut added = Vec::new();
-            while index < body.len()
-                && body[index].starts_with('+')
-                && !is_diff_file_header_line(body[index])
-            {
-                let (_, new_no) = state.next(body[index]);
-                added.push((new_no, body[index]));
-                index += 1;
-            }
-            for added in added {
-                lines.extend(render_side_by_side_diff_line(
-                    None,
-                    Some(added),
-                    panel_width,
-                    theme,
-                    width,
-                ));
-            }
-            continue;
-        }
-
-        let (old_no, new_no) = state.next(line);
-        if line.starts_with(' ') {
-            lines.extend(render_side_by_side_diff_line(
-                Some((old_no, line)),
-                Some((new_no, line)),
-                panel_width,
+        if body[index].kind == ChangeTag::Equal {
+            render_diff_pair(
+                document,
+                Some(&body[index]),
+                Some(&body[index]),
+                number_width,
                 theme,
                 width,
-            ));
-        } else {
-            lines.extend(render_diff_card_body_line(
-                old_no,
-                new_no,
-                line,
-                diff_line_style(line, theme),
+            );
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < body.len() && body[index].kind != ChangeTag::Equal {
+            index += 1;
+        }
+        let removed = body[start..index]
+            .iter()
+            .filter(|line| line.kind == ChangeTag::Delete)
+            .collect::<Vec<_>>();
+        let added = body[start..index]
+            .iter()
+            .filter(|line| line.kind == ChangeTag::Insert)
+            .collect::<Vec<_>>();
+        for row in 0..removed.len().max(added.len()) {
+            render_diff_pair(
+                document,
+                removed.get(row).copied(),
+                added.get(row).copied(),
+                number_width,
                 theme,
                 width,
-            ));
+            );
         }
-        index += 1;
     }
-
-    lines
 }
 
-pub(super) fn render_side_by_side_diff_line(
-    removed: Option<(Option<usize>, &str)>,
-    added: Option<(Option<usize>, &str)>,
-    panel_width: usize,
+fn render_diff_pair(
+    document: &mut Document<Style>,
+    old: Option<&DiffLine>,
+    new: Option<&DiffLine>,
+    number_width: usize,
     theme: Theme,
     width: usize,
-) -> Vec<SemanticLine<Style>> {
-    let left = render_diff_side(removed, panel_width, theme);
-    let right = render_diff_side(added, panel_width, theme);
-    let rows = left.len().max(right.len());
-    let blank = || {
-        vec![SemanticSpan::decoration(
-            " ".repeat(panel_width),
-            diff_header_fill_style(theme),
-        )]
-    };
-
-    (0..rows)
+) {
+    let panel_width = shell_card_content_width(width)
+        .saturating_sub(display_width(DIFF_SIDE_BY_SIDE_SEPARATOR))
+        / 2;
+    let left = render_diff_side(document, old, true, panel_width, number_width, theme);
+    let right = render_diff_side(document, new, false, panel_width, number_width, theme);
+    let fill = Style::default().bg(theme.card_bg());
+    let blank = || vec![Span::decoration(" ".repeat(panel_width), fill)];
+    let rows = (0..left.len().max(right.len()))
         .map(|row| {
-            let mut segments = left.get(row).cloned().unwrap_or_else(blank);
-            segments.push(SemanticSpan::decoration(
+            let mut spans = left.get(row).cloned().unwrap_or_else(blank);
+            spans.push(Span::decoration(
                 DIFF_SIDE_BY_SIDE_SEPARATOR,
-                diff_meta_style(theme),
+                fill.fg(theme.muted_text),
             ));
-            segments.extend(right.get(row).cloned().unwrap_or_else(blank));
-            render_card_line_with_guide(
-                &segments,
-                diff_header_fill_style(theme),
-                theme.card_guide(),
-                theme,
-                width,
-                if row + 1 == rows {
-                    Break::HardBreak
-                } else {
-                    Break::SoftWrap
-                },
-            )
+            spans.extend(right.get(row).cloned().unwrap_or_else(blank));
+            spans
         })
-        .collect()
+        .collect();
+    let boundary = if old.is_none_or(|line| line.text.is_empty())
+        && new.is_none_or(|line| line.text.is_empty())
+    {
+        Break::SoftWrap
+    } else {
+        Break::HardBreak
+    };
+    push_diff_rows(document, rows, boundary, theme, width);
 }
 
-pub(super) fn render_diff_side(
-    entry: Option<(Option<usize>, &str)>,
+fn render_diff_side(
+    document: &mut Document<Style>,
+    entry: Option<&DiffLine>,
+    old: bool,
     width: usize,
+    number_width: usize,
     theme: Theme,
-) -> Vec<Vec<SemanticSpan<Style>>> {
-    let Some((number, content)) = entry else {
-        return vec![vec![SemanticSpan::decoration(
-            " ".repeat(width),
-            diff_header_fill_style(theme),
-        )]];
+) -> Vec<Vec<Span<Style>>> {
+    let fill = Style::default().bg(theme.card_bg());
+    let Some(line) = entry else {
+        return vec![vec![Span::decoration(" ".repeat(width), fill)]];
     };
-
-    let gutter_style = Style::default().fg(theme.muted_text).bg(theme.card_bg());
-    let gutter_pad_style = Style::default().bg(theme.card_bg());
-    let content_style = diff_line_style(content, theme);
-    let pad_style = Style::default().bg(content_style.bg.unwrap_or(theme.card_bg()));
-    let (marker, body, marker_style) = diff_marker_and_body(content, theme);
-    // Strip control/ANSI from the diff body before it reaches display cells; the
-    // on-disk content itself stays untouched — filtering is presentation-only.
-    let body = terminal_safe_text(&body);
-    let clipped_notice = content == DIFF_EXPAND_HINT;
-    let marker_span = if clipped_notice {
-        SemanticSpan::decoration(marker, marker_style)
+    let (marker, marker_color, bg) = match line.kind {
+        ChangeTag::Insert => ("+", theme.success, theme.diff_add_bg),
+        ChangeTag::Delete => ("-", theme.error, theme.diff_delete_bg),
+        ChangeTag::Equal => (" ", theme.muted_text, theme.card_bg()),
+    };
+    let style = Style::default().fg(theme.text).bg(bg);
+    let number = if old {
+        line.old_number
     } else {
-        SemanticSpan::source(marker, marker_style)
+        line.new_number.or(line.old_number)
     };
-    let body_span = if clipped_notice {
-        SemanticSpan::decoration(body, content_style)
-    } else {
-        SemanticSpan::source(body, content_style)
-    };
-    let number = diff_line_number(number);
-    let number_width = display_width(&number);
-    let prefix = vec![
-        SemanticSpan::decoration(number, gutter_style),
-        SemanticSpan::decoration(" ", gutter_pad_style),
-        marker_span,
-        SemanticSpan::decoration(" ", pad_style),
-    ];
-    let continuation = vec![
-        SemanticSpan::decoration(" ".repeat(number_width), gutter_style),
-        SemanticSpan::decoration(" ", gutter_pad_style),
-        SemanticSpan::decoration(" ", gutter_pad_style),
-        SemanticSpan::decoration(" ", pad_style),
-    ];
-    let prefix_width = semantic_width(&prefix);
-    let chunks = wrap_body_chunks(&body_span, width.saturating_sub(prefix_width));
-
+    let number = number
+        .map(|number| format!("{number:>number_width$}"))
+        .unwrap_or_else(|| " ".repeat(number_width));
+    let prefix_width = number_width + 3;
+    let chunks = wrap_code_line(
+        document,
+        &line.text,
+        style,
+        width.saturating_sub(prefix_width),
+    );
     chunks
         .into_iter()
         .enumerate()
         .map(|(index, chunk)| {
-            let mut spans = if index == 0 {
-                prefix.clone()
-            } else {
-                continuation.clone()
-            };
-            spans.push(chunk);
-            let used = semantic_width(&spans);
+            let mut spans = vec![
+                Span::decoration(
+                    if index == 0 {
+                        number.clone()
+                    } else {
+                        " ".repeat(number_width)
+                    },
+                    fill.fg(theme.muted_text),
+                ),
+                Span::decoration(" ", fill),
+                Span::decoration(if index == 0 { marker } else { " " }, fill.fg(marker_color)),
+                Span::decoration(" ", style),
+            ];
+            spans.extend(chunk);
+            let used = spans
+                .iter()
+                .map(|span| display_width(&span.text))
+                .sum::<usize>();
             if used < width {
-                spans.push(SemanticSpan::decoration(
-                    " ".repeat(width - used),
-                    pad_style,
-                ));
+                spans.push(Span::decoration(" ".repeat(width - used), style));
             }
             spans
         })
         .collect()
 }
 
-pub(super) fn diff_line_style(line: &str, theme: Theme) -> Style {
-    if line.starts_with("diff --git") || line.starts_with("index ") {
-        diff_meta_style(theme).add_modifier(Modifier::BOLD)
-    } else if line.starts_with("+++") || line.starts_with("---") {
-        diff_meta_style(theme)
-    } else if line.starts_with('+') {
-        Style::default().fg(theme.text).bg(theme.diff_add_bg)
-    } else if line.starts_with('-') {
-        Style::default().fg(theme.text).bg(theme.diff_delete_bg)
-    } else if line.starts_with("@@") {
-        Style::default().fg(theme.user).bg(theme.diff_hunk_bg)
-    } else {
-        Style::default().fg(theme.text).bg(theme.card_bg())
+fn code_text(text: &str) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    consume_csi_sequence(&mut chars);
+                }
+                Some(']') => {
+                    consume_osc_sequence(&mut chars);
+                }
+                _ => {}
+            }
+        } else if ch == '\t' || !ch.is_control() {
+            result.push(ch);
+        }
     }
+    result
 }
 
-pub(super) fn is_diff_file_header_line(line: &str) -> bool {
-    line.starts_with("---") || line.starts_with("+++")
-}
-
-pub(super) fn diff_meta_style(theme: Theme) -> Style {
-    Style::default().fg(theme.muted_text).bg(theme.card_bg())
-}
-
-pub(super) fn render_diff_card_header_line(
-    title: &str,
-    theme: Theme,
+fn wrap_code_line(
+    document: &mut Document<Style>,
+    text: &str,
+    style: Style,
     width: usize,
-) -> SemanticLine<Style> {
-    let text = format!(" {DIFF_CARD_HEADER_ARROW} {title}");
-    render_card_line(
-        &[(text, diff_header_style(theme))],
-        diff_header_fill_style(theme),
-        theme,
-        width,
-    )
-}
-
-pub(super) fn render_diff_card_spacer_line(theme: Theme, width: usize) -> SemanticLine<Style> {
-    render_card_line(&[], diff_header_fill_style(theme), theme, width)
-}
-
-pub(super) fn render_diff_card_body_line(
-    old_no: Option<usize>,
-    new_no: Option<usize>,
-    content: &str,
-    content_style: Style,
-    theme: Theme,
-    width: usize,
-) -> Vec<SemanticLine<Style>> {
-    let gutter_style = Style::default().fg(theme.muted_text).bg(theme.card_bg());
-    let number = diff_line_number(new_no.or(old_no));
-    let bg = content_style.bg.unwrap_or(theme.card_bg());
-    let pad_style = Style::default().bg(bg);
-    let gutter_pad_style = Style::default().bg(theme.card_bg());
-    let (marker, body, marker_style) = diff_marker_and_body(content, theme);
-    // Strip control/ANSI from the diff body before it reaches display cells; the
-    // on-disk content itself stays untouched — filtering is presentation-only.
-    let body = terminal_safe_text(&body);
-    let clipped_notice = content == DIFF_EXPAND_HINT;
-    let marker_span = if clipped_notice {
-        SemanticSpan::decoration(marker, marker_style)
-    } else {
-        SemanticSpan::source(marker, marker_style)
-    };
-    let body_span = if clipped_notice {
-        SemanticSpan::decoration(body, content_style)
-    } else {
-        SemanticSpan::source(body, content_style)
-    };
-    let number_width = display_width(&number);
-    let prefix = vec![
-        SemanticSpan::decoration("", gutter_pad_style),
-        SemanticSpan::decoration(number, gutter_style),
-        SemanticSpan::decoration(" ", gutter_pad_style),
-        marker_span,
-        SemanticSpan::decoration(" ", pad_style),
-    ];
-    let continuation = vec![
-        SemanticSpan::decoration(" ".repeat(number_width), gutter_style),
-        SemanticSpan::decoration(" ", gutter_pad_style),
-        SemanticSpan::decoration(" ", gutter_pad_style),
-        SemanticSpan::decoration(" ", pad_style),
-    ];
-    let prefix_width = semantic_width(&prefix);
-    let chunks = wrap_body_chunks(
-        &body_span,
-        shell_card_content_width(width).saturating_sub(prefix_width),
-    );
-    let last = chunks.len().saturating_sub(1);
-
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(index, chunk)| {
-            let mut segments = if index == 0 {
-                prefix.clone()
-            } else {
-                continuation.clone()
-            };
-            segments.push(chunk);
-            render_card_line_with_guide(
-                &segments,
-                content_style,
-                theme.card_guide(),
-                theme,
-                width,
-                if index == last {
-                    Break::HardBreak
+) -> Vec<Vec<Span<Style>>> {
+    if text.is_empty() && width > 0 {
+        let block = document.add_source("\n");
+        return vec![vec![Span::source_atomic(
+            " ",
+            style,
+            SourceRange::new(block, 0, 1),
+        )]];
+    }
+    let text = code_text(text);
+    let block = document.add_source(text.clone());
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut row_width = 0;
+    let mut column = 0;
+    let mut offset = 0;
+    if width == 0 {
+        return vec![row];
+    }
+    for grapheme in text.graphemes(true) {
+        let end = offset + grapheme.chars().count();
+        let range = SourceRange::new(block, offset, end);
+        if grapheme == "\t" {
+            let tab_width = DIFF_TAB_SIZE - column % DIFF_TAB_SIZE;
+            let mut spaces = tab_width;
+            while spaces > 0 {
+                if row_width == width {
+                    rows.push(std::mem::take(&mut row));
+                    row_width = 0;
+                }
+                let count = spaces.min(width - row_width);
+                row.push(Span::source_atomic(" ".repeat(count), style, range));
+                row_width += count;
+                spaces -= count;
+            }
+            column += tab_width;
+        } else {
+            let cells = display_width(grapheme);
+            if cells <= width {
+                if row_width + cells > width {
+                    rows.push(std::mem::take(&mut row));
+                    row_width = 0;
+                }
+                if let Some(last) = row.last_mut()
+                    && last.copy_mode == CopyMode::Exact
+                    && last.source.is_some_and(|source| source.end == offset)
+                {
+                    last.text.push_str(grapheme);
+                    last.source.as_mut().unwrap().end = end;
                 } else {
-                    Break::SoftWrap
-                },
-            )
-        })
-        .collect()
-}
-
-pub(super) fn diff_marker_and_body(content: &str, theme: Theme) -> (String, String, Style) {
-    match content.chars().next() {
-        Some('+') if !content.starts_with("+++") => (
-            "+".to_string(),
-            content.chars().skip(1).collect(),
-            Style::default().fg(theme.success).bg(theme.card_bg()),
-        ),
-        Some('-') if !content.starts_with("---") => (
-            "-".to_string(),
-            content.chars().skip(1).collect(),
-            Style::default().fg(theme.error).bg(theme.card_bg()),
-        ),
-        _ => (
-            " ".to_string(),
-            content.to_string(),
-            Style::default().fg(theme.muted_text).bg(theme.card_bg()),
-        ),
-    }
-}
-
-pub(super) fn diff_header_style(theme: Theme) -> Style {
-    Style::default().fg(theme.muted_text).bg(theme.card_bg())
-}
-
-pub(super) fn diff_header_fill_style(theme: Theme) -> Style {
-    Style::default().bg(theme.card_bg())
-}
-
-pub(super) fn diff_line_number(number: Option<usize>) -> String {
-    match number {
-        Some(value) => format!("{:>3}", value),
-        None => "   ".to_string(),
-    }
-}
-
-#[derive(Default)]
-pub(super) struct DiffLineNumbers {
-    old_next: Option<usize>,
-    new_next: Option<usize>,
-}
-
-impl DiffLineNumbers {
-    fn next(&mut self, line: &str) -> (Option<usize>, Option<usize>) {
-        if let Some((old_start, new_start)) = parse_hunk_header(line) {
-            self.old_next = Some(old_start);
-            self.new_next = Some(new_start);
-            return (None, None);
-        }
-
-        if line.starts_with("diff --git")
-            || line.starts_with("index ")
-            || line.starts_with("---")
-            || line.starts_with("+++")
-        {
-            self.old_next = None;
-            self.new_next = None;
-            return (None, None);
-        }
-
-        match line.chars().next() {
-            Some('+') => {
-                let next = self.new_next.get_or_insert(1);
-                let current = *next;
-                *next += 1;
-                (None, Some(current))
+                    row.push(Span::source(grapheme, style, range));
+                }
+                row_width += cells;
             }
-            Some('-') => {
-                let next = self.old_next.get_or_insert(1);
-                let current = *next;
-                *next += 1;
-                (Some(current), None)
-            }
-            Some(' ') => {
-                let old = {
-                    let next = self.old_next.get_or_insert(1);
-                    let current = *next;
-                    *next += 1;
-                    current
-                };
-                let new = {
-                    let next = self.new_next.get_or_insert(1);
-                    let current = *next;
-                    *next += 1;
-                    current
-                };
-                (Some(old), Some(new))
-            }
-            _ => (None, None),
+            column += cells;
         }
+        offset = end;
     }
+    rows.push(row);
+    rows
 }
 
-pub(super) fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
-    if !line.starts_with("@@") {
-        return None;
-    }
-
-    let mut parts = line.split_whitespace();
-    let _ = parts.next()?;
-    let old = parts.next()?;
-    let new = parts.next()?;
-    Some((parse_hunk_range_start(old)?, parse_hunk_range_start(new)?))
-}
-
-pub(super) fn parse_hunk_range_start(part: &str) -> Option<usize> {
-    let trimmed = part.strip_prefix(['-', '+'])?;
-    trimmed
-        .split(',')
-        .next()
-        .and_then(|value| value.parse::<usize>().ok())
-}
-
-pub(super) fn diff_card_header_title(label: &str, paths: &[String]) -> String {
-    match paths.first() {
-        Some(first) if paths.len() > 1 => format!("{label} {} +{}", first, paths.len() - 1),
-        Some(first) => format!("{label} {first}"),
-        None => label.to_string(),
+fn push_diff_rows(
+    document: &mut Document<Style>,
+    rows: Vec<Vec<Span<Style>>>,
+    boundary: Break,
+    theme: Theme,
+    width: usize,
+) {
+    let last = rows.len().saturating_sub(1);
+    for (index, body) in rows.into_iter().enumerate() {
+        let fill = Style::default().bg(theme.card_bg());
+        let mut spans = vec![
+            Span::decoration(
+                TOOL_GUIDE_GLYPH,
+                fill.fg(theme.card_guide()).bg(theme.root_bg),
+            ),
+            Span::decoration("  ", fill),
+        ];
+        spans.extend(body);
+        let mut remaining = width;
+        let mut clipped = Vec::new();
+        for mut span in spans {
+            if remaining == 0 {
+                break;
+            }
+            let mut used = 0;
+            let text = span
+                .text
+                .graphemes(true)
+                .take_while(|grapheme| {
+                    let cells = display_width(grapheme);
+                    if used + cells > remaining {
+                        return false;
+                    }
+                    used += cells;
+                    true
+                })
+                .collect::<String>();
+            if text.is_empty() {
+                continue;
+            }
+            if let Some(range) = &mut span.source
+                && span.copy_mode == CopyMode::Exact
+            {
+                range.end = range.start + text.chars().count();
+            }
+            span.text = text;
+            clipped.push(span);
+            remaining -= used;
+        }
+        if remaining > 0 {
+            clipped.push(Span::decoration(" ".repeat(remaining), fill));
+        }
+        document.push_line(
+            Line { spans: clipped },
+            if index == last {
+                boundary
+            } else {
+                Break::SoftWrap
+            },
+        );
     }
 }

@@ -13,6 +13,34 @@ fn question_tool(arguments: Option<serde_json::Value>, data: serde_json::Value) 
     }
 }
 
+fn copy_card_document(document: Document<Style>) -> String {
+    use crate::tui::{
+        components::transcript::TranscriptRenderCacheEntry,
+        state::{SelectionAnchor, TextSelection, TuiState},
+    };
+    let last = document.lines.len().saturating_sub(1);
+    let mut state = TuiState::default();
+    state
+        .transcript_render_cache
+        .set_entries_for_test(vec![TranscriptRenderCacheEntry {
+            revision: None,
+            document,
+        }]);
+    state.text_selection = Some(TextSelection {
+        start: SelectionAnchor {
+            item_index: 0,
+            rendered_line_offset: 0,
+            char_offset: 0,
+        },
+        end: SelectionAnchor {
+            item_index: 0,
+            rendered_line_offset: last,
+            char_offset: usize::MAX,
+        },
+    });
+    crate::tui::selection::extract_selected_text(&state)
+}
+
 fn rendered_question(tool: &ToolView, width: usize) -> Vec<String> {
     render_tool_card_lines(tool, Theme::dark(), width)
         .into_iter()
@@ -160,6 +188,102 @@ fn question_card_is_safe_at_extremely_narrow_widths() {
     for width in 0..=2 {
         assert!(rendered_question(&tool, width).len() <= 1);
     }
+}
+
+#[test]
+fn question_card_preserves_complete_responses_across_widths() {
+    let cases = [
+        (
+            "Implementation preferences",
+            "Which changes should be included in the implementation?".to_string(),
+            vec![
+                (1..=16)
+                    .map(|index| {
+                        format!(
+                            "Step {index}: review the changes and verify the observable behavior."
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "Keep unrelated code unchanged.".to_string(),
+            ],
+        ),
+        (
+            "验证范围",
+            "是否需要在不同终端宽度下核对完整内容和复制结果？".to_string(),
+            vec!["需要。\n保留原始换行和空格。".to_string()],
+        ),
+    ];
+    let questions = cases
+        .iter()
+        .map(|(header, question, _)| {
+            json!({
+                "header": header, "question": question, "options": [], "multiple": false
+            })
+        })
+        .collect::<Vec<_>>();
+    let answers = cases
+        .iter()
+        .map(|(_, _, answers)| answers)
+        .collect::<Vec<_>>();
+    let expected = cases
+        .iter()
+        .map(|(header, question, answers)| format!("{header}\n{question}\n{}", answers.join(" · ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tool = question_tool(
+        Some(json!({"questions": questions})),
+        json!({"answers": answers}),
+    );
+    let translator = crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En);
+    for width in [18, 40, 100] {
+        for expanded in [false, true] {
+            let document =
+                render_tool_card_document(&tool, Theme::dark(), width, 0, expanded, &translator);
+            assert!(document.validate());
+            let lines = crate::tui::transcript_ratatui::document_to_ratatui(&document);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| display_width(&line.to_string()) <= width)
+            );
+            assert_eq!(
+                copy_card_document(document),
+                expected,
+                "{width}, expanded={expanded}"
+            );
+        }
+    }
+}
+
+#[test]
+fn question_card_styles_questions_muted_and_answers_as_body_text() {
+    let tool = question_tool(
+        Some(
+            json!({"questions": [{"header": "Mode", "question": "Which mode should we use?", "options": [], "multiple": false}]}),
+        ),
+        json!({"answers": [["Fast mode"]]}),
+    );
+    let theme = Theme::dark();
+    let lines = render_tool_card_lines(&tool, theme, 80);
+    let style_of = |needle: &str| {
+        lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains(needle))
+            .map(|span| span.style)
+            .unwrap_or_else(|| panic!("missing {needle}"))
+    };
+
+    let question = style_of("Which mode should we use?");
+    assert_eq!(question.fg, Some(theme.muted_text));
+    assert!(
+        !question
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
+    assert_eq!(style_of("Fast mode").fg, Some(theme.text));
+    assert_eq!(style_of("# User response").fg, Some(theme.accent));
 }
 
 #[test]
@@ -827,6 +951,126 @@ fn file_diff_cards_respect_output_expansion() {
             }
         }
     }
+}
+
+#[test]
+fn content_cards_preserve_code_columns_and_copy_source() {
+    let content = "start\r\n\tfirst\r\n\r\na\tb\r\n中文\tx\r\n123456789012345678901234567890\tz\r\n++counter\r\n---\r\n@@ -1 +1 @@";
+    let translator = crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En);
+    for name in ["fs__write", "fs__append"] {
+        let tool = ToolView {
+            call_id: "code-content".into(),
+            name: name.into(),
+            summary: "written".into(),
+            arguments: Some(json!({"path": "file.rs", "content": content}).to_string()),
+            output: None,
+            status: ToolExecutionStatus::Succeeded,
+        };
+        for width in [12, 40, 100] {
+            let document =
+                render_tool_card_document(&tool, Theme::dark(), width, 0, false, &translator);
+            assert!(document.validate());
+            let lines = crate::tui::transcript_ratatui::document_to_ratatui(&document);
+            let text = lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!text.contains(DIFF_SIDE_BY_SIDE_SEPARATOR), "{text}");
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| display_width(&line.to_string()) <= width)
+            );
+            if width >= 40 {
+                for expected in [
+                    "+     first",
+                    "+ a   b",
+                    "+ 中文    x",
+                    "+ ++counter",
+                    "+ ---",
+                    "+ @@ -1 +1 @@",
+                ] {
+                    assert!(text.contains(expected), "missing {expected:?}: {text}");
+                }
+                let column_of = |needle: &str| {
+                    let line = lines
+                        .iter()
+                        .map(Line::to_string)
+                        .find(|line| line.contains(needle))
+                        .unwrap();
+                    display_width(&line[..line.find(needle).unwrap()])
+                };
+                assert_eq!(column_of("first") - column_of("start"), 4);
+            }
+            assert_eq!(
+                copy_card_document(document),
+                content.replace("\r\n", "\n"),
+                "{width}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn patch_cards_render_context_and_changes() {
+    let mut tool = ToolView {
+        call_id: "code-patch".into(), name: "edit__apply_patch".into(), summary: "patched".into(),
+        arguments: Some(json!({"edits": [{"path": "file.rs", "find": "    keep\n--old\n    tail", "replace": "    keep\n++new\n    tail"}]}).to_string()),
+        output: None, status: ToolExecutionStatus::Succeeded,
+    };
+    for width in [40, 100] {
+        let document = render_tool_card_document(
+            &tool,
+            Theme::dark(),
+            width,
+            0,
+            false,
+            &crate::tui::i18n::Translator::new(crate::tui::i18n::Language::En),
+        );
+        assert!(document.validate());
+        let lines = crate::tui::transcript_ratatui::document_to_ratatui(&document);
+        let text = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("- --old"), "{text}");
+        assert!(text.contains("+ ++new"), "{text}");
+        let unchanged = document
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.text.contains("keep"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text.matches("keep").count(),
+            if width == 40 { 1 } else { 2 }
+        );
+        assert!(
+            unchanged
+                .iter()
+                .all(|span| span.style.bg == Some(Theme::dark().card_bg()))
+        );
+        assert_eq!(text.contains(DIFF_SIDE_BY_SIDE_SEPARATOR), width == 100);
+        if width == 40 {
+            assert_eq!(
+                copy_card_document(document),
+                "    keep\n--old\n++new\n    tail"
+            );
+        }
+    }
+    tool.arguments = Some(
+        json!({"edits": [{"path": "file.rs", "find": "line", "replace": "line\n"}]}).to_string(),
+    );
+    let lines = render_tool_card_lines(&tool, Theme::dark(), 40);
+    let text = lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("- line"), "{text}");
+    assert!(text.contains("+ line"), "{text}");
 }
 
 #[test]

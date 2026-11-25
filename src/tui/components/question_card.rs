@@ -19,15 +19,9 @@ pub(super) struct QuestionResponseCard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-
 pub(super) struct QuestionResponseCards {
     cards: Vec<QuestionResponseCard>,
-    truncated: bool,
 }
-
-pub(super) const QUESTION_CARD_MAX_LINES: usize = 24;
-
-pub(super) const QUESTION_CARD_TEXT_MAX_CHARS: usize = 512;
 
 pub(super) fn render_question_response_lines(
     tool: &ToolView,
@@ -54,16 +48,14 @@ pub(super) fn render_question_response_lines(
     };
 
     let mut lines = question_card_header_lines(theme, width);
-    let remaining = question_card_content_limit().saturating_sub(lines.len());
-    let truncated = append_question_card_text(
+    append_question_card_text(
         &mut lines,
         message,
         question_answer_style(theme),
         theme,
         width,
-        remaining,
     );
-    finish_question_card(lines, truncated, theme, width)
+    finish_question_card(lines, theme, width)
 }
 
 pub(super) fn question_response_cards(tool: &ToolView) -> Option<QuestionResponseCards> {
@@ -74,11 +66,9 @@ pub(super) fn question_response_cards(tool: &ToolView) -> Option<QuestionRespons
     if questions.len() != answers.len() || questions.is_empty() {
         return None;
     }
-    let truncated = questions.len() > question_card_line_limit();
     let cards = questions
         .iter()
         .zip(answers)
-        .take(question_card_line_limit())
         .map(|(question_value, answers)| {
             let question = question_value.get("question")?.as_str()?.trim();
             if question.is_empty() {
@@ -96,7 +86,7 @@ pub(super) fn question_response_cards(tool: &ToolView) -> Option<QuestionRespons
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(QuestionResponseCards { cards, truncated })
+    Some(QuestionResponseCards { cards })
 }
 
 pub(super) fn question_answer_strings(value: &Value) -> Option<Vec<String>> {
@@ -119,66 +109,43 @@ pub(super) fn render_question_cards(
     width: usize,
 ) -> Vec<SemanticLine<Style>> {
     let mut lines = question_card_header_lines(theme, width);
-    let content_limit = question_card_content_limit();
-    let mut truncated = responses.truncated;
     for (index, card) in responses.cards.iter().enumerate() {
-        if lines.len() >= content_limit {
-            truncated = true;
-            break;
-        }
         if let Some(header) = card.header.as_deref() {
-            if lines.len() >= content_limit {
-                truncated = true;
-                break;
-            }
-            lines.push(question_card_line(
+            append_question_card_text(
+                &mut lines,
                 header,
                 question_header_style(theme),
                 theme,
                 width,
-            ));
+            );
         }
-        let remaining = content_limit.saturating_sub(lines.len());
-        let question_truncated = append_question_card_text(
+        append_question_card_text(
             &mut lines,
             &card.question,
             question_text_style(theme),
             theme,
             width,
-            remaining,
         );
-        truncated |= question_truncated;
-        if lines.len() >= content_limit {
-            truncated = true;
-            break;
-        }
-        let answer = if card.answers.is_empty() {
-            "(no answer)".to_string()
-        } else {
-            card.answers.join(" · ")
-        };
-        if lines.len() >= content_limit {
-            truncated = true;
-            break;
-        }
-        lines.push(question_card_line(
+        lines.push(question_card_decoration_line(
             "",
             question_answer_style(theme),
             theme,
             width,
         ));
-        let remaining = content_limit.saturating_sub(lines.len());
-        let answer_truncated = append_question_card_text(
+        let answer = if card.answers.is_empty() {
+            "(no answer)".to_string()
+        } else {
+            card.answers.join(" · ")
+        };
+        append_question_card_text(
             &mut lines,
             &answer,
             question_answer_style(theme),
             theme,
             width,
-            remaining,
         );
-        truncated |= answer_truncated;
-        if index + 1 < responses.cards.len() && lines.len() < content_limit {
-            lines.push(question_card_line(
+        if index + 1 < responses.cards.len() {
+            lines.push(question_card_decoration_line(
                 "",
                 question_text_style(theme),
                 theme,
@@ -186,27 +153,14 @@ pub(super) fn render_question_cards(
             ));
         }
     }
-    finish_question_card(lines, truncated, theme, width)
+    finish_question_card(lines, theme, width)
 }
 
 pub(super) fn finish_question_card(
     mut lines: Vec<SemanticLine<Style>>,
-    truncated: bool,
     theme: Theme,
     width: usize,
 ) -> Vec<SemanticLine<Style>> {
-    let content_limit = question_card_content_limit();
-    if truncated {
-        if lines.len() >= content_limit {
-            lines.pop();
-        }
-        lines.push(question_card_decoration_line(
-            "… response truncated",
-            question_header_style(theme),
-            theme,
-            width,
-        ));
-    }
     lines.push(question_card_decoration_line(
         "",
         question_text_style(theme),
@@ -230,45 +184,25 @@ pub(super) fn append_question_card_text(
     style: Style,
     theme: Theme,
     width: usize,
-    limit: usize,
-) -> bool {
-    if width <= 2 || limit == 0 {
-        return true;
-    }
+) {
     let content_width = shell_card_content_width(width);
-    let (text, text_truncated) = question_card_text(text);
-    let wrapped = wrap_text_to_width(&text, content_width);
-    let wrapped_truncated = wrapped.len() > limit;
-    let visible_count = wrapped.len().min(limit);
-    lines.extend(
-        wrapped
-            .into_iter()
-            .take(limit)
-            .enumerate()
-            .map(|(index, line)| {
-                question_card_line_with_boundary(
-                    &line,
-                    style,
-                    theme,
-                    width,
-                    if index + 1 == visible_count {
-                        Break::HardBreak
-                    } else {
-                        Break::SoftWrap
-                    },
-                )
-            }),
-    );
-    text_truncated || wrapped_truncated
-}
-
-pub(super) fn question_card_line(
-    text: &str,
-    style: Style,
-    theme: Theme,
-    width: usize,
-) -> SemanticLine<Style> {
-    question_card_line_with_boundary(text, style, theme, width, Break::HardBreak)
+    for source_line in text.split('\n') {
+        let wrapped = wrap_text_to_width(source_line, content_width);
+        let last = wrapped.len().saturating_sub(1);
+        lines.extend(wrapped.into_iter().enumerate().map(|(index, line)| {
+            question_card_line_with_boundary(
+                &line,
+                style,
+                theme,
+                width,
+                if index == last {
+                    Break::HardBreak
+                } else {
+                    Break::SoftWrap
+                },
+            )
+        }));
+    }
 }
 
 pub(super) fn question_card_line_with_boundary(
@@ -302,10 +236,7 @@ pub(super) fn question_card_decoration_line(
 }
 
 pub(super) fn question_text_style(theme: Theme) -> Style {
-    Style::default()
-        .fg(theme.text)
-        .bg(theme.element_bg)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(theme.muted_text).bg(theme.element_bg)
 }
 
 pub(super) fn question_header_style(theme: Theme) -> Style {
@@ -320,26 +251,5 @@ pub(super) fn question_title_style(theme: Theme) -> Style {
 }
 
 pub(super) fn question_answer_style(theme: Theme) -> Style {
-    Style::default().fg(theme.user).bg(theme.element_bg)
-}
-
-pub(super) fn question_card_line_limit() -> usize {
-    max_body_lines().min(QUESTION_CARD_MAX_LINES)
-}
-
-pub(super) fn question_card_content_limit() -> usize {
-    question_card_line_limit().saturating_sub(1)
-}
-
-pub(super) fn question_card_text(text: &str) -> (String, bool) {
-    let mut chars = text.chars();
-    let visible = chars
-        .by_ref()
-        .take(QUESTION_CARD_TEXT_MAX_CHARS)
-        .collect::<String>();
-    if chars.next().is_some() {
-        (format!("{visible}…"), true)
-    } else {
-        (visible, false)
-    }
+    Style::default().fg(theme.text).bg(theme.element_bg)
 }
