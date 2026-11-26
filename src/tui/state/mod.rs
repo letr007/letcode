@@ -166,7 +166,7 @@ pub struct ToastState {
 }
 
 impl ToastState {
-    pub const DEFAULT_TICKS: u8 = 54;
+    pub const DEFAULT_TICKS: u8 = 152;
 
     pub fn new(message: impl Into<String>, kind: ToastKind, ticks_remaining: u8) -> Self {
         Self {

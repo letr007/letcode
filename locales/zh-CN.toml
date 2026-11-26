@@ -684,6 +684,10 @@ fake = "开启 /fake 时模拟的客户端请求特征。未声明字段由运�
 
 # 引擎提示的英文原文在代码中，这里只维护译文。
 [notice]
+mcp_tools_unavailable = "无法加载 MCP 服务“{server}”的工具。\n{error}"
+mcp_server_not_configured = "找不到 MCP 服务“{server}”的配置，请检查 MCP 设置。"
+mcp_settings_save_failed = "无法保存 MCP 服务“{server}”的设置，更改未生效。\n{error}"
+mcp_tool_registration_failed = "MCP 工具“{tool}”加载失败，暂时无法调用。\n{error}"
 background_memory_unavailable = "后台记忆处理不可用，详见应用日志"
 change_queued = "更改已排队，将在当前回合后生效"
 fast_mode_auto_disabled = "快速模式已自动关闭：当前模型不可用"

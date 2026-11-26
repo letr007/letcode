@@ -921,6 +921,9 @@ impl TuiRuntime {
             SessionTransportEvent::Notice(notice) => {
                 SessionTransportEvent::Notice(self.state.localized_notice(notice))
             }
+            SessionTransportEvent::McpDiagnostic(notice) => {
+                SessionTransportEvent::McpDiagnostic(self.state.localized_notice(notice))
+            }
             SessionTransportEvent::ChildSessionEvent {
                 child_session_id,
                 agent_name,
@@ -1514,8 +1517,8 @@ impl TuiRuntime {
                 self.state.mark_mcp_discovery_unavailable(error.clone());
                 self.refresh_open_mcp_dialog();
             }
-            SessionTransportEvent::McpDiagnostic(message) => {
-                self.show_toast(message.clone(), ToastKind::Error);
+            SessionTransportEvent::McpDiagnostic(notice) => {
+                self.show_toast(notice.message.clone(), ToastKind::Error);
             }
             SessionTransportEvent::ChildSessionEvent {
                 child_session_id,

@@ -31,7 +31,7 @@ use crate::mcp;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::session::runner::{ModelCatalogEntry, ModelCatalogReasoning, ModelCatalogUpdatedEvent};
 use crate::session::{
-    AgentRunner, ErrorEvent, ErrorId, NoticeEvent, NoticeId, RuntimeContextDisposition,
+    AgentRunner, ErrorEvent, ErrorId, NoticeEvent, NoticeId, NoticeKind, RuntimeContextDisposition,
     RuntimeContextUpdatedEvent, SessionCommand, SessionEvent, SessionTransportEvent,
     TokenUsageEvent, TurnOutcome,
 };
@@ -1867,9 +1867,14 @@ async fn run_engine_loop(
                                 name: server_name.clone(),
                                 updating: false,
                             });
-                            let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
-                                "MCP server '{server_name}' is no longer configured"
-                            )));
+                            let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(
+                                NoticeEvent::new(
+                                    format!("No configuration found for MCP server '{server_name}'. Check the MCP settings."),
+                                    NoticeKind::RecoverableError,
+                                )
+                                .with_message_id(NoticeId::McpServerNotConfigured)
+                                .with_args([("server", server_name)]),
+                            ));
                             continue;
                         };
                         let enabled = !server_config.enabled;
@@ -1884,9 +1889,14 @@ async fn run_engine_loop(
                                     name: server_name.clone(),
                                     updating: false,
                                 });
-                                let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
-                                    "failed to persist MCP server '{server_name}': {error}"
-                                )));
+                                let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(
+                                    NoticeEvent::new(
+                                        format!("Could not save settings for MCP server '{server_name}'. The change was not applied.\n{error:#}"),
+                                        NoticeKind::RecoverableError,
+                                    )
+                                    .with_message_id(NoticeId::McpSettingsSaveFailed)
+                                    .with_args([("server", server_name), ("error", format!("{error:#}"))]),
+                                ));
                                 continue;
                             }
                         };
@@ -1934,9 +1944,14 @@ async fn run_engine_loop(
                                     let tool_name = tool.name().to_string();
                                     let catalog_entry = tool.catalog_entry();
                                     if let Err(error) = agent.try_register_tool(tool) {
-                                        let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
-                                            "failed to register MCP tool '{tool_name}': {error}"
-                                        )));
+                                        let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(
+                                            NoticeEvent::new(
+                                                format!("MCP tool '{tool_name}' could not be loaded and is unavailable.\n{error:#}"),
+                                                NoticeKind::RecoverableError,
+                                            )
+                                            .with_message_id(NoticeId::McpToolRegistrationFailed)
+                                            .with_args([("tool", tool_name), ("error", format!("{error:#}"))]),
+                                        ));
                                     } else {
                                         registered.push(tool_name);
                                         catalog_tools.push(catalog_entry);
@@ -1948,10 +1963,14 @@ async fn run_engine_loop(
                                 mcp_registered_tools.insert(server_name, registered);
                             }
                             mcp::McpServerStatus::Offline { ref message } => {
-                                let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
-                                    "MCP server '{}' is offline: {message}",
-                                    server.name
-                                )));
+                                let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(
+                                    NoticeEvent::new(
+                                        format!("Could not load tools from MCP server '{}'.\n{message}", server.name),
+                                        NoticeKind::RecoverableError,
+                                    )
+                                    .with_message_id(NoticeId::McpToolsUnavailable)
+                                    .with_args([("server", server.name.clone()), ("error", message.clone())]),
+                                ));
                             }
                             mcp::McpServerStatus::Disabled => unreachable!("enabled server was discovered"),
                         }
@@ -3088,19 +3107,28 @@ async fn run_engine_loop(
                     } = server_discovery;
                     let mut catalog_tools = Vec::new();
                     if let mcp::McpServerStatus::Offline { message } = &server.status {
-                        let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
-                            "MCP server '{}' is offline: {message}",
-                            server.name
-                        )));
+                        let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(
+                            NoticeEvent::new(
+                                format!("Could not load tools from MCP server '{}'.\n{message}", server.name),
+                                NoticeKind::RecoverableError,
+                            )
+                            .with_message_id(NoticeId::McpToolsUnavailable)
+                            .with_args([("server", server.name.clone()), ("error", message.clone())]),
+                        ));
                     }
                     let mut registered = Vec::new();
                     for tool in tools {
                         let tool_name = tool.name().to_string();
                         let catalog_entry = tool.catalog_entry();
                         if let Err(error) = agent.try_register_tool(tool) {
-                            let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
-                                "failed to register MCP tool '{tool_name}': {error}"
-                            )));
+                            let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(
+                                NoticeEvent::new(
+                                    format!("MCP tool '{tool_name}' could not be loaded and is unavailable.\n{error:#}"),
+                                    NoticeKind::RecoverableError,
+                                )
+                                .with_message_id(NoticeId::McpToolRegistrationFailed)
+                                .with_args([("tool", tool_name), ("error", format!("{error:#}"))]),
+                            ));
                         } else {
                             registered.push(tool_name);
                             catalog_tools.push(catalog_entry);

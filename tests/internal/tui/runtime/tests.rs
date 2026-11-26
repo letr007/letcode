@@ -1600,6 +1600,52 @@ fn notice_messages_follow_the_active_language() {
 }
 
 #[test]
+fn mcp_diagnostics_follow_the_active_language() {
+    use crate::tui::i18n::Language;
+
+    let cases = [
+        (
+            NoticeId::McpToolsUnavailable,
+            "Could not load tools from MCP server 'search'.\nconnection refused",
+            "无法加载 MCP 服务“search”的工具。\nconnection refused",
+        ),
+        (
+            NoticeId::McpServerNotConfigured,
+            "No configuration found for MCP server 'search'. Check the MCP settings.",
+            "找不到 MCP 服务“search”的配置，请检查 MCP 设置。",
+        ),
+        (
+            NoticeId::McpSettingsSaveFailed,
+            "Could not save settings for MCP server 'search'. The change was not applied.\nconnection refused",
+            "无法保存 MCP 服务“search”的设置，更改未生效。\nconnection refused",
+        ),
+        (
+            NoticeId::McpToolRegistrationFailed,
+            "MCP tool 'search__query' could not be loaded and is unavailable.\nconnection refused",
+            "MCP 工具“search__query”加载失败，暂时无法调用。\nconnection refused",
+        ),
+    ];
+    let mut runtime = runtime();
+    for (message_id, english, chinese) in cases {
+        for (language, expected) in [(Language::En, english), (Language::ZhCn, chinese)] {
+            runtime.state_mut().set_language(Some(language));
+            runtime.apply_session_transport_event(SessionTransportEvent::McpDiagnostic(
+                NoticeEvent::new(english, crate::session::NoticeKind::RecoverableError)
+                    .with_message_id(message_id)
+                    .with_args([
+                        ("server", "search"),
+                        ("tool", "search__query"),
+                        ("error", "connection refused"),
+                    ]),
+            ));
+            let toast = runtime.state().toast().expect("MCP error notification");
+            assert_eq!(toast.kind, ToastKind::Error);
+            assert_eq!(toast.message, expected);
+        }
+    }
+}
+
+#[test]
 fn error_and_process_issue_messages_follow_the_active_language() {
     fn error_event() -> ErrorEvent {
         let mut error = ErrorEvent::new("raw error")

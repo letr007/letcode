@@ -102,7 +102,7 @@ pub async fn discover_servers(
                 ),
                 Err(error) => (
                     McpServerStatus::Offline {
-                        message: error.to_string(),
+                        message: format!("{error:#}"),
                     },
                     None,
                     Vec::new(),

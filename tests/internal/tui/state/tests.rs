@@ -10,6 +10,20 @@ use crate::tui::events::{
 };
 
 #[test]
+fn toast_expires_after_its_default_display_duration() {
+    let mut state = TuiState::default();
+    state.show_toast("notice", ToastKind::Error);
+    assert_eq!(state.toast().unwrap().ticks_remaining(), 152);
+
+    for _ in 0..151 {
+        state.tick_frame();
+        assert!(state.toast().is_some());
+    }
+    state.tick_frame();
+    assert!(state.toast().is_none());
+}
+
+#[test]
 fn explicit_and_system_following_language_resolution_are_distinct() {
     let mut state = TuiState::default();
     assert_eq!(

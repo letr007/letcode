@@ -282,7 +282,7 @@ pub(crate) enum SessionTransportEvent {
     #[allow(dead_code)]
     // Retained so frontends can distinguish discovery failure from diagnostics.
     McpDiscoveryUnavailable(String),
-    McpDiagnostic(String),
+    McpDiagnostic(NoticeEvent),
     SessionTitleUpdated {
         session_id: String,
         title: String,

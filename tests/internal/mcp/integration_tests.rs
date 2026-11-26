@@ -8,6 +8,34 @@ use std::os::unix::fs::PermissionsExt;
 use tokio::time::sleep;
 
 #[tokio::test]
+async fn discovery_reports_the_server_startup_error() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let command = dir.path().join("missing-mcp-server").display().to_string();
+    let config = IndexMap::from([(
+        "search".into(),
+        McpServerConfig {
+            enabled: true,
+            timeout_ms: 1_000,
+            transport: McpTransportConfig::Local(McpLocalServerConfig {
+                command: vec![command.clone()],
+                environment: IndexMap::new(),
+            }),
+        },
+    )]);
+
+    let discovered = discover_servers(&config).await;
+    let McpServerStatus::Offline { message } = &discovered[0].server.status else {
+        panic!("a missing server command must be reported as offline");
+    };
+    assert!(
+        message.contains("failed to start MCP server command"),
+        "{message}"
+    );
+    assert!(message.contains(&command), "{message}");
+    assert!(discovered[0].tools.is_empty());
+}
+
+#[tokio::test]
 async fn mcp_tools_cannot_claim_reserved_context_tool_names() {
     let server = McpLocalServerConfig {
         command: vec!["server".into()],

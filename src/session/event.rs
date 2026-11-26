@@ -376,6 +376,10 @@ pub enum NoticeId {
     StreamRecovering,
     OutputLengthLimit,
     ModelMissingFromCatalog,
+    McpToolsUnavailable,
+    McpServerNotConfigured,
+    McpSettingsSaveFailed,
+    McpToolRegistrationFailed,
     NoChildTranscripts,
     ProjectMemoryUnavailable,
     TurnRunning,
@@ -399,6 +403,10 @@ impl NoticeId {
         Self::StreamRecovering,
         Self::OutputLengthLimit,
         Self::ModelMissingFromCatalog,
+        Self::McpToolsUnavailable,
+        Self::McpServerNotConfigured,
+        Self::McpSettingsSaveFailed,
+        Self::McpToolRegistrationFailed,
         Self::NoChildTranscripts,
         Self::ProjectMemoryUnavailable,
         Self::TurnRunning,
@@ -421,6 +429,10 @@ impl NoticeId {
             Self::StreamRecovering => "notice.stream_recovering",
             Self::OutputLengthLimit => "notice.output_length_limit",
             Self::ModelMissingFromCatalog => "notice.model_missing_from_catalog",
+            Self::McpToolsUnavailable => "notice.mcp_tools_unavailable",
+            Self::McpServerNotConfigured => "notice.mcp_server_not_configured",
+            Self::McpSettingsSaveFailed => "notice.mcp_settings_save_failed",
+            Self::McpToolRegistrationFailed => "notice.mcp_tool_registration_failed",
             Self::NoChildTranscripts => "notice.no_child_transcripts",
             Self::ProjectMemoryUnavailable => "notice.project_memory_unavailable",
             Self::TurnRunning => "notice.turn_running",
@@ -435,8 +447,6 @@ pub enum NoticeKind {
     #[allow(dead_code)]
     // Retained for frontend event compatibility; current production notices use Info.
     Success,
-    #[allow(dead_code)]
-    // Retained for frontend event compatibility; current production notices use Info.
     RecoverableError,
 }
 
