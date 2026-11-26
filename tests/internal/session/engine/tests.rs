@@ -41,6 +41,61 @@ fn toml_path(path: &std::path::Path) -> String {
     path.display().to_string().replace('\\', "\\\\")
 }
 
+#[cfg(unix)]
+async fn assert_background_shell_notifications(
+    session_id: &str,
+    events: &mut mpsc::UnboundedReceiver<SessionTransportEvent>,
+) {
+    let tools = crate::tool::ToolRegistry::default_tools();
+    let mut context = crate::tool::ToolExecutionContext::default();
+    context.session_id = Some(session_id.to_string());
+    context.can_background_shell = true;
+    let result = tools
+        .call_with_context(
+            "shell__exec",
+            serde_json::json!({"command": "sleep 5", "background": true, "timeout_secs": 10}),
+            context.clone(),
+        )
+        .await;
+    assert!(result.ok, "{result:?}");
+    let task_id = result.data.as_ref().unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cancelled = tools
+        .call_with_context(
+            "shell__cancel",
+            serde_json::json!({"task_id": task_id}),
+            context,
+        )
+        .await;
+    assert!(cancelled.ok, "{cancelled:?}");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut started = false;
+        loop {
+            match events.recv().await.expect("engine events") {
+                SessionTransportEvent::BackgroundShellStarted {
+                    task_id: id,
+                    session_id: owner,
+                    ..
+                } if id == task_id => {
+                    assert_eq!(owner.as_deref(), Some(session_id));
+                    started = true;
+                }
+                SessionTransportEvent::BackgroundShellCompleted { task_id: id }
+                    if id == task_id =>
+                {
+                    assert!(started);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("background shell notifications");
+}
+
 fn run_summary(
     run_id: &str,
     child_session_id: &str,
@@ -766,6 +821,11 @@ max_depth = 4
                 crate::transcript::restore_latest_reasoning_effort(&records, "test/current",),
                 Some(ModelReasoningEffort::High)
             );
+            #[cfg(unix)]
+            {
+                let session_id = transcript.lock().unwrap().session_id().to_string();
+                assert_background_shell_notifications(&session_id, &mut events).await;
+            }
             ingress.shutdown().unwrap();
             engine.join().await.unwrap();
         })
@@ -986,6 +1046,8 @@ base_url = "http://127.0.0.1:1"
                 "the restored mode must precede SessionResumed: mode at {mode_index}, resumed at {resumed_index}"
             );
 
+            #[cfg(unix)]
+            assert_background_shell_notifications(&resumed_session_id, &mut events).await;
             ingress.shutdown().unwrap();
             engine.join().await.unwrap();
         })

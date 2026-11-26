@@ -21,6 +21,7 @@ use crate::session::runner::{
 use crate::subagent::{SubagentPool, SubagentRunGovernance, SubagentRunSummary, SubagentStatus};
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{TranscriptEvent, TranscriptRecorder, read_records_allow_partial_tail};
+use crate::user_content::UserMessageContent;
 use futures_util::FutureExt;
 
 const REVIEWER_AGENT_NAME: &str = "reviewer";
@@ -253,7 +254,7 @@ impl AutoReviewService for StickyAutoReviewer {
                     Some(Arc::clone(&self.parent_transcript)),
                     event_sender,
                     takeover,
-                    move |agent,
+                    move |mut agent,
                           prompt,
                           transcript,
                           _event_sender,
@@ -261,12 +262,8 @@ impl AutoReviewService for StickyAutoReviewer {
                           _agent_name| {
                         let full_output = Arc::clone(&full_output_for_executor);
                         async move {
-                            {
-                                let mut recorder = transcript
-                                    .lock()
-                                    .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-                                recorder.record_user_message(prompt.clone())?;
-                            }
+                            let prompt =
+                                prepare_review_prompt(&mut agent, prompt, &transcript).await?;
                             let output = agent
                                 .run_resolved_text_oneshot(&prompt)
                                 .await
@@ -348,6 +345,23 @@ impl StickyAutoReviewer {
             (!child_session_id.is_empty()).then_some(child_session_id),
         );
     }
+}
+
+async fn prepare_review_prompt(
+    agent: &mut Agent,
+    prompt: String,
+    transcript: &Mutex<TranscriptRecorder>,
+) -> Result<String> {
+    let prompt = agent
+        .prepare_user_content(UserMessageContent::from(prompt))
+        .await?
+        .text;
+    let mut recorder = transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+    recorder.record_session_redaction(agent.pending_redaction_enabled())?;
+    recorder.record_user_message(prompt.clone())?;
+    Ok(prompt)
 }
 
 /// Records a decided outcome in the parent transcript.

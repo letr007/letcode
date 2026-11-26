@@ -243,35 +243,10 @@ impl SessionEngine {
         };
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        crate::tool::background::set_notifier(
+        register_background_shell_notifier(
             Some(projection.session_id.as_str()),
-            Arc::new({
-                let control_tx = control_tx.clone();
-                let event_tx = event_tx.clone();
-                move |event| match event {
-                    crate::tool::background::BackgroundEvent::Started {
-                        task_id,
-                        session_id,
-                        command,
-                        title,
-                    } => {
-                        let _ = event_tx.send(SessionTransportEvent::BackgroundShellStarted {
-                            task_id,
-                            session_id,
-                            command,
-                            title,
-                        });
-                    }
-                    crate::tool::background::BackgroundEvent::Completed(outcome) => {
-                        let _ = event_tx.send(SessionTransportEvent::BackgroundShellCompleted {
-                            task_id: outcome.task_id.clone(),
-                        });
-                        let _ = control_tx.send(SessionEngineControl::Command(
-                            SessionEngineCommand::BackgroundShellCompleted { outcome },
-                        ));
-                    }
-                }
-            }),
+            &control_tx,
+            &event_tx,
         );
         let title_event_tx = event_tx.clone();
         let ingress = SessionEngineIngress {
@@ -2268,6 +2243,11 @@ async fn run_engine_loop(
                             }
                             prepared_install.commit(&mut agent, &transcript).1
                         };
+                        register_background_shell_notifier(
+                            agent.session_id(),
+                            &control_tx,
+                            &session_transport_tx,
+                        );
                         if agent.subagents_policy().mode == crate::config::SubagentMode::Swarm {
                             if let Err(error) = subagent_runtime.resume_swarm(&config.sessions_dir, &resumed_event_records) {
                                 let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!("failed to open resumed swarm: {error}"))));
@@ -2425,6 +2405,11 @@ async fn run_engine_loop(
                         }
                         let new_session_fake_client = agent.fake_client();
                         prepared_install.commit(&mut agent, &transcript);
+                        register_background_shell_notifier(
+                            agent.session_id(),
+                            &control_tx,
+                            &session_transport_tx,
+                        );
                         agent.set_fake_client(new_session_fake_client);
                         let inherited_reasoning_effort = agent.reasoning_effort();
                         if let Err(error) = transcript
@@ -2759,11 +2744,17 @@ async fn run_engine_loop(
                                             crate::agent::PendingTurnContinuation { result: None },
                                         ),
                                     };
-                                    match transcript
-                                        .lock()
-                                        .map_err(|_| anyhow!("transcript recorder poisoned"))
-                                        .and_then(|mut recorder| {
-                                            recorder.record_internal_continuation(
+                                    let text = match crate::redact::active() {
+                                        Some(redactor) => crate::redact::mask_text(
+                                            &redactor, Some(&parent_session_id), &text,
+                                        ),
+                                        None => Ok(text),
+                                    };
+                                    match text.and_then(|text| {
+                                        transcript
+                                            .lock()
+                                            .map_err(|_| anyhow!("transcript recorder poisoned"))?
+                                            .record_internal_continuation(
                                                 text,
                                                 crate::transcript::InternalContinuationSource::SubagentCompletion,
                                             )
@@ -2796,12 +2787,19 @@ async fn run_engine_loop(
                                     ) {
                                         continue;
                                     }
-                                    match transcript
-                                        .lock()
-                                        .map_err(|_| anyhow!("transcript recorder poisoned"))
-                                        .and_then(|mut recorder| {
-                                            recorder.record_internal_continuation(
-                                                format_background_shell_completion(&outcome),
+                                    let text = format_background_shell_completion(&outcome);
+                                    let text = match crate::redact::active() {
+                                        Some(redactor) => crate::redact::mask_text(
+                                            &redactor, outcome.session_id.as_deref(), &text,
+                                        ),
+                                        None => Ok(text),
+                                    };
+                                    match text.and_then(|text| {
+                                        transcript
+                                            .lock()
+                                            .map_err(|_| anyhow!("transcript recorder poisoned"))?
+                                            .record_internal_continuation(
+                                                text,
                                                 crate::transcript::InternalContinuationSource::ShellCompletion,
                                             )
                                         })
@@ -3266,6 +3264,41 @@ fn cancel_active_subagents(
             &Ok(summary),
         );
     }
+}
+
+fn register_background_shell_notifier(
+    session_id: Option<&str>,
+    control_tx: &mpsc::UnboundedSender<SessionEngineControl>,
+    event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+) {
+    let control_tx = control_tx.clone();
+    let event_tx = event_tx.clone();
+    crate::tool::background::set_notifier(
+        session_id,
+        Arc::new(move |event| match event {
+            crate::tool::background::BackgroundEvent::Started {
+                task_id,
+                session_id,
+                command,
+                title,
+            } => {
+                let _ = event_tx.send(SessionTransportEvent::BackgroundShellStarted {
+                    task_id,
+                    session_id,
+                    command,
+                    title,
+                });
+            }
+            crate::tool::background::BackgroundEvent::Completed(outcome) => {
+                let _ = event_tx.send(SessionTransportEvent::BackgroundShellCompleted {
+                    task_id: outcome.task_id.clone(),
+                });
+                let _ = control_tx.send(SessionEngineControl::Command(
+                    SessionEngineCommand::BackgroundShellCompleted { outcome },
+                ));
+            }
+        }),
+    );
 }
 
 /// Claim a terminal background shell task once; returns whether it is deliverable.

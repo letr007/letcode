@@ -166,6 +166,96 @@ fn full_reviewer_output_is_parsed_before_truncation_fallbacks() {
     assert_eq!(parsed.rationale, rationale);
 }
 
+static REVIEW_REDACT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct ReviewRedactGlobals {
+    active: Option<(bool, std::path::PathBuf, Arc<crate::redact::Redactor>)>,
+}
+
+impl Drop for ReviewRedactGlobals {
+    fn drop(&mut self) {
+        crate::redact::restore_active(self.active.clone());
+    }
+}
+
+#[test]
+#[ignore = "requires LETCODE_PII_MODEL_DIR pointing to the local PII model"]
+fn review_prompt_is_masked_once_for_journal_and_oneshot_input() {
+    let model_dir =
+        std::env::var("LETCODE_PII_MODEL_DIR").expect("LETCODE_PII_MODEL_DIR is required");
+    let _lock = REVIEW_REDACT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let config = tempfile::tempdir().expect("config dir");
+    let model_target = config.path().join("models").join("astrlink-guard");
+    std::fs::create_dir_all(&model_target).expect("model dir is created");
+    for name in ["model_int8.onnx", "model_int8.onnx_data", "tokenizer.json"] {
+        std::fs::copy(
+            std::path::Path::new(&model_dir).join(name),
+            model_target.join(name),
+        )
+        .expect("the model is copied");
+    }
+    let sessions = config.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir is created");
+    let _globals = ReviewRedactGlobals {
+        active: crate::redact::active_snapshot(),
+    };
+    crate::redact::install(true, config.path(), &sessions);
+
+    let transcript = Arc::new(Mutex::new(
+        TranscriptRecorder::create(&sessions).expect("transcript"),
+    ));
+    let session_id = transcript
+        .lock()
+        .expect("transcript")
+        .session_id()
+        .to_string();
+    let restore = crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+        session_id,
+        read_records_allow_partial_tail(transcript.lock().expect("transcript").path())
+            .expect("transcript records"),
+        crate::transcript::transcript_projection::SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("the child session restore snapshot is projected");
+    let mut agent = Agent::new("reviewer-model", 1, 1);
+    agent
+        .restore_runtime_snapshot(restore.snapshot)
+        .expect("the agent is bound to the child session");
+    let raw = "Contact person@example.com before running the command";
+
+    let prepared = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(prepare_review_prompt(
+            &mut agent,
+            raw.to_string(),
+            &transcript,
+        ))
+        .expect("the review prompt is prepared");
+
+    assert!(prepared.contains("{|>EMAIL:"), "{prepared}");
+    assert!(!prepared.contains("person@example.com"), "{prepared}");
+    let records = read_records_allow_partial_tail(transcript.lock().expect("transcript").path())
+        .expect("transcript records");
+    let journal_prompt = records
+        .iter()
+        .rev()
+        .find_map(|record| match &record.event {
+            TranscriptEvent::UserMessage { content } => Some(content.text.clone()),
+            _ => None,
+        })
+        .expect("the prompt is journaled");
+    assert_eq!(journal_prompt, prepared);
+    assert!(records.iter().any(|record| matches!(
+        &record.event,
+        TranscriptEvent::SessionRedaction { enabled: true }
+    )));
+}
+
 mod integration_tests {
     use super::*;
 

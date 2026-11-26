@@ -508,11 +508,16 @@ impl SubagentDelegate for RunnerSubagentDelegate {
             if self.runtime.is_foregrounded(&result.run_id) {
                 continue;
             }
+            let text = crate::session::engine::format_background_subagent_completion(&result);
+            let text = match crate::redact::active() {
+                Some(redactor) => crate::redact::mask_text(&redactor, Some(&caller), &text)?,
+                None => text,
+            };
             self.transcript
                 .lock()
                 .map_err(|_| anyhow!("transcript recorder poisoned"))?
                 .record_internal_continuation(
-                    crate::session::engine::format_background_subagent_completion(&result),
+                    text,
                     crate::transcript::InternalContinuationSource::SubagentCompletion,
                 )?;
             completed.push(result);
