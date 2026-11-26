@@ -2504,11 +2504,6 @@ impl TuiRuntime {
         if self.state.pending_permission.is_some() || self.state.pending_question.is_some() {
             return Ok(None);
         }
-        if crate::redact::active().is_some() && crate::redact::preparing().is_some() {
-            let message = self.state.t("runtime.redact_not_ready");
-            self.state.show_toast(message, ToastKind::Info);
-            return Ok(None);
-        }
 
         if self.state.slash_panel_is_open()
             && let Some(selected) = self.selected_slash_command()
@@ -2549,6 +2544,14 @@ impl TuiRuntime {
         {
             self.state
                 .show_toast(self.state.t("runtime.remove_attachments"), ToastKind::Info);
+            return Ok(None);
+        }
+        if redaction_blocks_prompt(
+            crate::redact::active().is_some() && crate::redact::preparing().is_some(),
+            &parsed_command,
+        ) {
+            let message = self.state.t("runtime.redact_not_ready");
+            self.state.show_toast(message, ToastKind::Info);
             return Ok(None);
         }
         self.reset_history_navigation();
@@ -4174,6 +4177,13 @@ fn reasoning_dialog_selected_index(
         .iter()
         .position(|effort| *effort == current)
         .unwrap_or(0)
+}
+
+fn redaction_blocks_prompt(
+    preparing: bool,
+    parsed: &Result<CommandIntent, crate::command::CommandParseError>,
+) -> bool {
+    preparing && matches!(parsed, Ok(CommandIntent::Prompt(_)))
 }
 
 fn child_view_allows_prompt(prompt: &str) -> bool {

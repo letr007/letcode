@@ -72,6 +72,12 @@ fn restore_event(values: &crate::redact::RestoreMap, event: &mut TranscriptEvent
         TranscriptEvent::ReasoningMessage { content, .. } => {
             *content = restore_text(values, content);
         }
+        TranscriptEvent::ContextCompaction(event) => {
+            event.summary = restore_text(values, &event.summary);
+        }
+        TranscriptEvent::ToolCallStarted { args, .. } => {
+            crate::redact::restore_value(values, args);
+        }
         TranscriptEvent::ToolCallFinished { output, .. } => {
             if let Some(data) = output.data.as_mut() {
                 crate::redact::restore_value(values, data);

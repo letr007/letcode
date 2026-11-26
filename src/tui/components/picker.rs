@@ -488,7 +488,7 @@ fn render_picker_body(
                         theme,
                         item,
                         selected,
-                        state.fast_mode_tier.as_deref() == Some(item.id.as_str()),
+                        item.id == state.fast_mode_tier.as_deref().unwrap_or("off"),
                     ),
                     DialogKind::LanguagePicker => render_permission_row(
                         frame,

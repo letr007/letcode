@@ -240,6 +240,36 @@ fn restored_compaction_keeps_summary_in_durable_block() {
 }
 
 #[test]
+fn restored_tool_arguments_and_compaction_summary_come_from_the_restore_map() {
+    let values = crate::redact::RestoreMap::from([(
+        "EMAIL:abcd1234".to_string(),
+        "user@example.com".to_string(),
+    )]);
+
+    let mut started = TranscriptEvent::ToolCallStarted {
+        call_id: "call-1".into(),
+        name: "fs__read".into(),
+        args: json!({"path": "{|>EMAIL:abcd1234<|}"}),
+    };
+    restore_event(&values, &mut started);
+    assert!(matches!(
+        started,
+        TranscriptEvent::ToolCallStarted { args, .. }
+            if args["path"] == "user@example.com"
+    ));
+
+    let mut compaction = TranscriptEvent::ContextCompaction(ContextCompactionEvent::succeeded(
+        "{|>EMAIL:abcd1234<|}",
+        1,
+    ));
+    restore_event(&values, &mut compaction);
+    assert!(matches!(
+        compaction,
+        TranscriptEvent::ContextCompaction(event) if event.summary == "user@example.com"
+    ));
+}
+
+#[test]
 fn restored_legacy_reconcile_tool_is_preserved_as_an_ordinary_tool_record() {
     let timeline = timeline_from_transcript_records(&[
         record(

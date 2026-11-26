@@ -1989,6 +1989,18 @@ fn running_turn_blocks_exit_and_quit_commands() {
 }
 
 #[test]
+fn redaction_preparation_only_blocks_prompt_submission() {
+    for command in ["/help", "/exit", "/redact"] {
+        assert!(
+            !redaction_blocks_prompt(true, &parse_command(command)),
+            "{command}"
+        );
+    }
+    assert!(redaction_blocks_prompt(true, &parse_command("hello")));
+    assert!(!redaction_blocks_prompt(false, &parse_command("hello")));
+}
+
+#[test]
 fn double_escape_confirms_running_turn_interrupt() {
     let mut runtime = runtime();
     runtime.apply_session_transport_event(SessionTransportEvent::TurnFinished {

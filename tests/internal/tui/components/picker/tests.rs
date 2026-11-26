@@ -36,6 +36,39 @@ fn mcp_tools_picker_hides_raw_offline_diagnostics() {
 }
 
 #[test]
+fn fast_picker_marks_off_as_current_when_no_tier_is_selected() {
+    let theme = Theme::dark();
+    let area = Rect::new(0, 0, 100, 20);
+    let dialog = DialogState::new(
+        DialogKind::FastPicker,
+        "Fast",
+        None,
+        vec![
+            DialogItem::new("off", "Off", None),
+            DialogItem::new("fast", "Fast", None),
+        ],
+    );
+    let mut state = TuiState::default();
+    state.set_language(Some(crate::tui::i18n::Language::En));
+    assert!(state.fast_mode_tier.is_none());
+    let backend = TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+
+    terminal
+        .draw(|frame| render_picker(frame, &mut state, area, theme, &dialog))
+        .expect("draw");
+
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("● Off"), "{rendered}");
+}
+
+#[test]
 fn visible_entries_keep_the_selected_expert_inside_a_height_limited_window() {
     let items = (0..6)
         .map(|index| {
