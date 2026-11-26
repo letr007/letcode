@@ -1458,23 +1458,238 @@ tools = true
     }
 }
 
-#[test]
-fn accumulator_restores_placeholders_from_the_request_map() {
-    let restore = std::sync::Arc::new(std::collections::HashMap::from([(
-        "EMAIL:test1234".to_string(),
-        "person@example.com".to_string(),
-    )]));
+#[tokio::test]
+async fn streamed_links_and_literal_text_are_independent_of_chunk_boundaries() {
+    let route = route("responses");
+    let key = "URL:test1234";
+    let token = format!("{{|>{key}<|}}");
+    let unknown = concat!("{|>", "URL:unknown1", "<|}");
+    let url = concat!("https:", "//example.org/run");
+    let restore = Arc::new(HashMap::from([(key.into(), url.into())]));
+    for suffix in ["", "{", "{|", "{|>URL:unfinished"] {
+        let input = format!("中文 [CI]({token})，{token}，{unknown}，{{value}}{suffix}");
+        let expected = input.replace(&token, url);
+        let mut partitions = input
+            .char_indices()
+            .map(|(at, _)| vec![&input[..at], &input[at..]])
+            .collect::<Vec<_>>();
+        partitions.push(
+            input
+                .char_indices()
+                .map(|(at, ch)| &input[at..at + ch.len_utf8()])
+                .collect(),
+        );
+        for chunks in partitions {
+            let mut events = chunks
+                .into_iter()
+                .map(|text| {
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"type":"response.output_text.delta", "delta":text})
+                    )
+                })
+                .collect::<Vec<_>>();
+            events.push("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n".into());
+            let runtime = ModelRuntime::new(Arc::new(QueueTransport {
+                responses: Mutex::new(VecDeque::from([Ok(response(200, events))])),
+            }));
+            let mut driver = TestDriver::default();
+            let result = runtime
+                .execute_attempt_with_restore(
+                    &route,
+                    &ModelRequestInput::new("model", Vec::new()),
+                    &mut DriverObserver {
+                        driver: &mut driver,
+                    },
+                    Some(restore.clone()),
+                )
+                .await
+                .unwrap();
+            let displayed: String = driver
+                .observed
+                .iter()
+                .filter_map(|event| match event {
+                    ModelEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(displayed, expected);
+            assert!(
+                matches!(result.snapshot.assistant.content.as_slice(), [ContentPart::Text(text)] if *text == expected)
+            );
+            let document = crate::tui::markdown::render_markdown_document(
+                &displayed,
+                crate::tui::theme::Theme::dark(),
+                crate::tui::markdown::MarkdownRenderOptions::new(40),
+            );
+            assert!(document.lines.iter().flat_map(|line| &line.spans).any(|span| matches!(
+                &span.interaction,
+                Some(crate::tui::transcript_render::Interaction::OpenUrl(target))
+                    if target == url && crate::tui::transcript_ratatui::safe_hyperlink_url(target)
+            )));
+        }
+    }
+}
+
+#[tokio::test]
+async fn restoration_keeps_interleaved_text_and_reasoning_streams_separate() {
+    let key = "URL:test1234";
+    let token = format!("{{|>{key}<|}}");
+    let url = concat!("https:", "//example.org/run");
+    let restore = Arc::new(HashMap::from([(key.into(), url.into())]));
     let mut accumulator = AttemptAccumulator {
         restore: Some(restore),
         ..Default::default()
     };
-    let mut event = ModelEvent::TextDelta {
-        text: "mail {|>EMAIL:test1234<|}".into(),
-    };
-    accumulator.restore_event(&mut event);
-    accumulator.consume_observed(event).unwrap();
-    assert!(matches!(
-        accumulator.snapshot().assistant.content.as_slice(),
-        [ContentPart::Text(text)] if text == "mail person@example.com"
-    ));
+    let mut driver = TestDriver::default();
+    let events = vec![
+        ModelEvent::ReasoningDelta {
+            item_id: "r1".into(),
+            text: token[..1].into(),
+        },
+        ModelEvent::TextDelta {
+            text: token[..2].into(),
+        },
+        ModelEvent::ReasoningSummaryDelta {
+            item_id: "r1".into(),
+            summary_index: 0,
+            text: token[..3].into(),
+        },
+        ModelEvent::ReasoningDelta {
+            item_id: "r2".into(),
+            text: "literal {".into(),
+        },
+        ModelEvent::ReasoningSummaryDelta {
+            item_id: "r1".into(),
+            summary_index: 1,
+            text: "summary {|".into(),
+        },
+        ModelEvent::ReasoningSummaryDone {
+            item_id: "r1".into(),
+            summary_index: 1,
+            text: "summary {|".into(),
+        },
+        ModelEvent::ReasoningDelta {
+            item_id: "r1".into(),
+            text: token[1..].into(),
+        },
+        ModelEvent::TextDelta {
+            text: format!("{}{{", &token[2..]),
+        },
+        ModelEvent::ReasoningSummaryDelta {
+            item_id: "r1".into(),
+            summary_index: 0,
+            text: token[3..].into(),
+        },
+        ModelEvent::ReasoningDone {
+            item_id: "r1".into(),
+            text: token.clone(),
+            replay: None,
+        },
+        ModelEvent::ReasoningDone {
+            item_id: "r2".into(),
+            text: "literal {".into(),
+            replay: None,
+        },
+        ModelEvent::Terminal {
+            status: TerminalStatus::Completed,
+        },
+    ];
+    observe_events(
+        &mut DriverObserver {
+            driver: &mut driver,
+        },
+        &mut accumulator,
+        events,
+    )
+    .await
+    .unwrap();
+    let mut text = String::new();
+    let mut reasoning = BTreeMap::<String, String>::new();
+    let mut summaries = BTreeMap::<(String, u64), String>::new();
+    for event in &driver.observed {
+        match event {
+            ModelEvent::TextDelta { text: delta } => text.push_str(delta),
+            ModelEvent::ReasoningDelta { item_id, text } => {
+                reasoning.entry(item_id.clone()).or_default().push_str(text)
+            }
+            ModelEvent::ReasoningSummaryDelta {
+                item_id,
+                summary_index,
+                text,
+            } => summaries
+                .entry((item_id.clone(), *summary_index))
+                .or_default()
+                .push_str(text),
+            ModelEvent::ReasoningDone { item_id, text, .. } => {
+                assert_eq!(reasoning[item_id], *text)
+            }
+            ModelEvent::ReasoningSummaryDone {
+                item_id,
+                summary_index,
+                text,
+            } => assert_eq!(summaries[&(item_id.clone(), *summary_index)], *text),
+            _ => {}
+        }
+    }
+    assert_eq!(text, format!("{url}{{"));
+    assert_eq!(reasoning["r1"], url);
+    assert_eq!(reasoning["r2"], "literal {");
+    assert_eq!(summaries[&("r1".into(), 0)], url);
+    assert_eq!(summaries[&("r1".into(), 1)], "summary {|");
+    assert_eq!(accumulator.snapshot().events, driver.observed);
+}
+
+#[tokio::test]
+async fn interrupted_streams_preserve_the_text_already_received() {
+    let route = route("responses");
+    let restore = Arc::new(HashMap::from([(
+        "URL:test1234".into(),
+        concat!("https:", "//example.org/run").into(),
+    )]));
+    for suffix in ["{", "{|", "{|>URL:unfinished"] {
+        let text = format!("received {suffix}");
+        for failure in [Some(oneshot_stream_failure()), None] {
+            let delta = format!(
+                "data: {}\n\n",
+                serde_json::json!({"type":"response.output_text.delta", "delta":text})
+            )
+            .into_bytes();
+            let chunks = match failure {
+                Some(failure) => vec![Ok(delta), Err(failure)],
+                None => vec![Ok(delta)],
+            };
+            let runtime = ModelRuntime::new(Arc::new(QueueTransport {
+                responses: Mutex::new(VecDeque::from([Ok(TransportResponse::from_results(
+                    200,
+                    BTreeMap::new(),
+                    chunks,
+                ))])),
+            }));
+            let mut driver = TestDriver::default();
+            let failure = runtime
+                .execute_attempt_with_restore(
+                    &route,
+                    &ModelRequestInput::new("model", Vec::new()),
+                    &mut DriverObserver {
+                        driver: &mut driver,
+                    },
+                    Some(restore.clone()),
+                )
+                .await
+                .unwrap_err();
+            let displayed: String = driver
+                .observed
+                .iter()
+                .filter_map(|event| match event {
+                    ModelEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(displayed, text);
+            assert!(
+                matches!(failure.partial.assistant.content.as_slice(), [ContentPart::Text(content)] if *content == text)
+            );
+        }
+    }
 }

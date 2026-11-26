@@ -695,18 +695,20 @@ impl ModelRuntime {
                             observe_events(observer, &mut accumulator, events).await?;
                             accumulator.finish()
                         }
-                        Err(_) => Err(accumulator.failed(failure)),
+                        Err(_) => fail_attempt(observer, accumulator, failure).await,
                     };
                 }
             };
-            let events = decoder
-                .push(&chunk)
-                .map_err(|failure| accumulator.failed(failure))?;
+            let events = match decoder.push(&chunk) {
+                Ok(events) => events,
+                Err(failure) => return fail_attempt(observer, accumulator, failure).await,
+            };
             observe_events(observer, &mut accumulator, events).await?;
         }
-        let events = decoder
-            .finish()
-            .map_err(|failure| accumulator.failed(failure))?;
+        let events = match decoder.finish() {
+            Ok(events) => events,
+            Err(failure) => return fail_attempt(observer, accumulator, failure).await,
+        };
         observe_events(observer, &mut accumulator, events).await?;
         accumulator.finish()
     }
@@ -777,19 +779,42 @@ async fn observe_events(
     events: Vec<ModelEvent>,
 ) -> Result<(), ModelAttemptFailure> {
     for mut event in events {
-        accumulator.restore_event(&mut event);
-        observer
-            .observe(&event)
-            .await
-            .map_err(|failure| accumulator.failed(failure))?;
-        accumulator
-            .consume_observed(event)
-            .map_err(|failure| accumulator.failed(failure))?;
-        if let Some(failure) = accumulator.failure.clone() {
-            return Err(accumulator.failed(failure));
+        for tail in accumulator.flush_restore(Some(&event)) {
+            observe_event(observer, accumulator, tail).await?;
         }
+        accumulator.restore_event(&mut event);
+        observe_event(observer, accumulator, event).await?;
     }
     Ok(())
+}
+
+async fn observe_event(
+    observer: &mut dyn ModelEventObserver,
+    accumulator: &mut AttemptAccumulator,
+    event: ModelEvent,
+) -> Result<(), ModelAttemptFailure> {
+    observer
+        .observe(&event)
+        .await
+        .map_err(|failure| accumulator.failed(failure))?;
+    accumulator
+        .consume_observed(event)
+        .map_err(|failure| accumulator.failed(failure))?;
+    if let Some(failure) = accumulator.failure.clone() {
+        return Err(accumulator.failed(failure));
+    }
+    Ok(())
+}
+
+async fn fail_attempt(
+    observer: &mut dyn ModelEventObserver,
+    mut accumulator: AttemptAccumulator,
+    failure: ModelFailure,
+) -> Result<ModelAttemptResult, ModelAttemptFailure> {
+    for tail in accumulator.flush_restore(None) {
+        observe_event(observer, &mut accumulator, tail).await?;
+    }
+    Err(accumulator.failed(failure))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -799,10 +824,17 @@ enum AssistantPartKey {
     Tool(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RestoreStream {
+    Text,
+    Reasoning(String),
+    Summary(String, u64),
+}
+
 #[derive(Default)]
 struct AttemptAccumulator {
     restore: Option<Arc<crate::redact::RestoreMap>>,
-    restore_carry: String,
+    restore_carry: BTreeMap<RestoreStream, String>,
     events: Vec<ModelEvent>,
     order: Vec<AssistantPartKey>,
     text: String,
@@ -824,10 +856,22 @@ impl AttemptAccumulator {
         };
         let values = values.as_ref();
         match event {
-            ModelEvent::TextDelta { text }
-            | ModelEvent::ReasoningDelta { text, .. }
-            | ModelEvent::ReasoningSummaryDelta { text, .. } => {
-                *text = self.restore_text(values, text);
+            ModelEvent::TextDelta { text } => {
+                *text = self.restore_text(values, RestoreStream::Text, text);
+            }
+            ModelEvent::ReasoningDelta { item_id, text } => {
+                *text = self.restore_text(values, RestoreStream::Reasoning(item_id.clone()), text);
+            }
+            ModelEvent::ReasoningSummaryDelta {
+                item_id,
+                summary_index,
+                text,
+            } => {
+                *text = self.restore_text(
+                    values,
+                    RestoreStream::Summary(item_id.clone(), *summary_index),
+                    text,
+                );
             }
             ModelEvent::ReasoningDone { text, .. }
             | ModelEvent::ReasoningSummaryDone { text, .. } => {
@@ -840,26 +884,61 @@ impl AttemptAccumulator {
         }
     }
 
-    fn restore_text(&mut self, values: &crate::redact::RestoreMap, delta: &str) -> String {
-        let mut buffer = std::mem::take(&mut self.restore_carry);
+    fn restore_text(
+        &mut self,
+        values: &crate::redact::RestoreMap,
+        stream: RestoreStream,
+        delta: &str,
+    ) -> String {
+        let mut buffer = self.restore_carry.remove(&stream).unwrap_or_default();
         buffer.push_str(delta);
-        // A placeholder can arrive in two deltas; hold its tail until the
-        // closing delimiter shows up, since the value must not reach the session.
         let (head, tail) = crate::redact::split_placeholder(&buffer);
         let restored = crate::redact::restore_text(values, head);
-        self.restore_carry = tail.to_string();
+        if !tail.is_empty() {
+            self.restore_carry.insert(stream, tail.to_string());
+        }
         restored
     }
 
-    fn flush_restore(&mut self) {
-        let carry = std::mem::take(&mut self.restore_carry);
-        if carry.is_empty() {
-            return;
-        }
-        if let Some(values) = self.restore.as_deref() {
-            self.text
-                .push_str(&crate::redact::restore_text(values, &carry));
-        }
+    fn flush_restore(&mut self, before: Option<&ModelEvent>) -> Vec<ModelEvent> {
+        let mut events = Vec::new();
+        self.restore_carry.retain(|stream, text| {
+            let finished = match (stream, before) {
+                (_, None | Some(ModelEvent::Terminal { .. } | ModelEvent::Failure(_))) => true,
+                (RestoreStream::Reasoning(id), Some(ModelEvent::ReasoningDone { item_id, .. }))
+                | (
+                    RestoreStream::Summary(id, _),
+                    Some(ModelEvent::ReasoningDone { item_id, .. }),
+                ) => id == item_id,
+                (
+                    RestoreStream::Summary(id, index),
+                    Some(ModelEvent::ReasoningSummaryDone {
+                        item_id,
+                        summary_index,
+                        ..
+                    }),
+                ) => id == item_id && index == summary_index,
+                _ => false,
+            };
+            if finished {
+                events.push(match stream {
+                    RestoreStream::Text => ModelEvent::TextDelta { text: text.clone() },
+                    RestoreStream::Reasoning(item_id) => ModelEvent::ReasoningDelta {
+                        item_id: item_id.clone(),
+                        text: text.clone(),
+                    },
+                    RestoreStream::Summary(item_id, summary_index) => {
+                        ModelEvent::ReasoningSummaryDelta {
+                            item_id: item_id.clone(),
+                            summary_index: *summary_index,
+                            text: text.clone(),
+                        }
+                    }
+                });
+            }
+            !finished
+        });
+        events
     }
 
     fn consume_observed(&mut self, event: ModelEvent) -> Result<(), ModelFailure> {
@@ -962,10 +1041,7 @@ impl AttemptAccumulator {
                 }
                 self.response_id = Some(response_id.clone());
             }
-            ModelEvent::Terminal { status } => {
-                self.flush_restore();
-                self.terminal = Some(*status);
-            }
+            ModelEvent::Terminal { status } => self.terminal = Some(*status),
             ModelEvent::Failure(failure) => self.failure = Some(failure.clone()),
             ModelEvent::Usage { .. } | ModelEvent::Cache { .. } => {}
         }

@@ -126,10 +126,16 @@ pub(crate) fn is_placeholder(body: &str) -> bool {
 }
 
 pub(crate) fn split_placeholder(delta: &str) -> (&str, &str) {
-    match delta.rfind(OPEN) {
-        Some(open) if !delta[open..].contains(CLOSE) => delta.split_at(open),
-        _ => (delta, ""),
+    if let Some(open) = delta.rfind(OPEN)
+        && !delta[open..].contains(CLOSE)
+    {
+        return delta.split_at(open);
     }
+    let suffix = (1..OPEN.len())
+        .rev()
+        .find(|&length| delta.ends_with(&OPEN[..length]))
+        .unwrap_or(0);
+    delta.split_at(delta.len() - suffix)
 }
 
 pub(crate) fn restore_values(values: &HashMap<String, String>, text: &str) -> String {
